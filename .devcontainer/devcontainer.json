@@ -1,0 +1,51 @@
+{
+    "name": "coxswain",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "remoteUser": "vscode",
+
+    // USB passthrough for debug probes and desk-attached serial (GNSS etc).
+    // Off by default: --device=/dev/bus/usb stops the container from starting
+    // when nothing is attached. Uncomment for hardware sessions, rebuild, and
+    // on WSL2 attach the device on the Windows side first:
+    //   usbipd list
+    //   usbipd bind --busid <id>        (once, elevated)
+    //   usbipd attach --wsl --busid <id>
+    // It then appears under /dev/bus/usb in WSL and this mount picks it up.
+    // If probe enumeration is flaky, swap this for "--privileged" during
+    // hardware sessions and switch back after. See DEVSETUP.md.
+    // "runArgs": [
+    //     "--device=/dev/bus/usb"
+    // ],
+
+    "mounts": [
+        // Persistent cargo registry cache: Embassy dependency graphs are large
+        // and cold builds in ephemeral containers get old fast.
+        "source=coxswain-cargo-cache,target=/usr/local/cargo/registry,type=volume",
+        // Persistent build artifacts (matches CARGO_TARGET_DIR in Dockerfile).
+        "source=coxswain-target-cache,target=/workspaces/target-cache,type=volume"
+    ],
+
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "probe-rs.probe-rs-debugger",
+                "tamasfe.even-better-toml"
+            ],
+            "settings": {
+                // rust-analyzer checks the workspace for the host by default;
+                // the CI cross-build gate is what enforces no_std cleanliness.
+                "rust-analyzer.check.command": "clippy"
+            }
+        }
+    },
+
+    // Named volumes are created root-owned regardless of the image's ownership
+    // of the mountpoint, so repair them before anything tries to build. Then
+    // sanity check: both targets present, probe tooling responds, and a real
+    // build works, because --version calls pass in a container that cannot
+    // write to its own target dir.
+    "postCreateCommand": "sudo chown -R vscode:vscode /workspaces/target-cache /usr/local/cargo/registry && rustc --version && rustup target list --installed && probe-rs --version && zenohd --version && rm -rf /tmp/buildcheck && cargo new --lib --vcs none /tmp/buildcheck && cargo build --manifest-path /tmp/buildcheck/Cargo.toml && rm -rf /tmp/buildcheck"
+}

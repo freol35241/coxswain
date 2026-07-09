@@ -1,0 +1,7 @@
+# Cargo builds here only when CARGO_TARGET_DIR is unset; the devcontainer
+# points it at a volume outside the tree.
+/target
+**/*.rs.bk
+
+# Compiled manifest blobs are commissioning artifacts, not source.
+*.cxmanifest

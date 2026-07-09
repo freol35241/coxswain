@@ -1,0 +1,6 @@
+# Pin deliberately; bump in its own commit so toolchain changes never hide
+# inside feature work. Embassy tracks recent stable closely.
+[toolchain]
+channel = "1.88.0"
+components = ["rustfmt", "clippy", "llvm-tools"]
+targets = ["thumbv7em-none-eabihf"]
