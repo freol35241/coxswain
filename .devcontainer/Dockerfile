@@ -17,7 +17,7 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 # ---- pinned zenoh router for integration tests ------------------------------
 # Check https://github.com/eclipse-zenoh/zenoh/releases and bump deliberately;
 # keep in lockstep with the zenoh/zenoh-pico versions used on the vessel.
-ARG ZENOH_VERSION=1.3.4
+ARG ZENOH_VERSION=1.9.0
 RUN curl -fsSL -o /tmp/zenoh.zip \
       "https://github.com/eclipse-zenoh/zenoh/releases/download/${ZENOH_VERSION}/zenoh-${ZENOH_VERSION}-x86_64-unknown-linux-gnu-standalone.zip" \
     && unzip -j /tmp/zenoh.zip -d /usr/local/bin zenohd \
