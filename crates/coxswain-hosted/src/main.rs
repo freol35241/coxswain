@@ -213,17 +213,20 @@ fn run() -> Result<(), String> {
                 .to_string(),
         );
     };
-    // Origin: the first geofence vertex anchors the sim in the vessel's
-    // declared waters; without a fence the documented default applies.
-    let origin = manifest
-        .config
-        .supervisor
-        .geofence
-        .ring
-        .as_slice()
-        .first()
-        .copied()
-        .unwrap_or_else(default_origin);
+    // Origin: the geofence ring's vertex centroid anchors the sim inside the
+    // vessel's declared waters. A vertex itself sits on the boundary, where
+    // the inside test may resolve either way and a fresh boot would latch a
+    // breach. Without a fence the documented default applies.
+    let ring = manifest.config.supervisor.geofence.ring.as_slice();
+    let origin = if ring.is_empty() {
+        default_origin()
+    } else {
+        let n = ring.len() as f64;
+        GeoPoint {
+            lat_rad: ring.iter().map(|p| p.lat_rad).sum::<f64>() / n,
+            lon_rad: ring.iter().map(|p| p.lon_rad).sum::<f64>() / n,
+        }
+    };
 
     let boot = Instant::now();
     let now_ts = |boot: &Instant| Timestamp::from_nanos(boot.elapsed().as_nanos() as u64);

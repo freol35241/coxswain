@@ -6,7 +6,8 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:
   coxswain-manifest validate <manifest.toml>
   coxswain-manifest compile <manifest.toml> --key <seed.bin> -o <out.cxmanifest>
-  coxswain-manifest inspect <blob> --pubkey <hex-or-file>";
+  coxswain-manifest inspect <blob> --pubkey <hex-or-file>
+  coxswain-manifest pubkey --key <seed.bin>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -14,6 +15,7 @@ fn main() -> ExitCode {
         Some("validate") => cmd_validate(&args[1..]),
         Some("compile") => cmd_compile(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
+        Some("pubkey") => cmd_pubkey(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     match result {
@@ -86,6 +88,18 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
         "hash:      {}",
         hex(&coxswain_manifest::manifest_hash(&blob))
     );
+    Ok(())
+}
+
+fn cmd_pubkey(args: &[String]) -> Result<(), String> {
+    let [flag, key_path] = args else {
+        return Err(USAGE.to_string());
+    };
+    if flag != "--key" {
+        return Err(USAGE.to_string());
+    }
+    let seed = read_seed(key_path)?;
+    println!("{}", hex(&coxswain_manifest::public_key(&seed)));
     Ok(())
 }
 
