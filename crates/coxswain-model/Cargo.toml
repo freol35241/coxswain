@@ -4,3 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+coxswain-contract = { path = "../coxswain-contract" }
+# no_std math per CLAUDE.md: nalgebra for the fixed-size linear algebra,
+# libm for trig without std.
+nalgebra = { version = "0.34", default-features = false, features = ["libm"] }
+libm = "0.2"
