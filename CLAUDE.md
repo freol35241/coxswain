@@ -43,9 +43,13 @@ member.
 ## Workspace conventions
 
 - Cargo workspace. Crates: coxswain-contract (internal types, keep small and
-  stable), coxswain-estimator, coxswain-guidance, coxswain-supervisor,
-  coxswain-manifest, driver crates, coxswain-keelson (adapter),
+  stable), coxswain-model (Fossen 3-DOF, no_std), coxswain-estimator,
+  coxswain-guidance, coxswain-supervisor, coxswain-manifest, coxswain-sim
+  (host-only plant + sensor models), driver crates, coxswain-keelson (adapter),
   coxswain-hosted (Linux binary), coxswain-conn-h753 (firmware, later phase).
+- coxswain-model has exactly two consumers: the estimator's process model and
+  the simulator's plant (D-020). Same coefficients, same code, run backward and
+  forward. Do not fork it into a "sim model" and a "filter model".
 - Sensor drivers implement embedded-hal traits plus the Coxswain driver trait
   (init, self-test, read-with-timestamp). Never against stm32-specific types.
 - Parsers strict by default; per-device permissiveness comes from manifest

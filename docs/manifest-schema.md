@@ -1,20 +1,26 @@
-# Coxswain Vessel Manifest: Schema Draft v0.1
+# Coxswain Vessel Manifest: Schema Draft v0.2
 
 The manifest is the per-vessel statement of what exists, where it terminates, and what
 the estimator is licensed to trust. It is authored as TOML, validated and compiled
-host-side to a CRC-protected binary blob (postcard), and written to an A/B flash
+host-side to a signed, CRC-protected binary blob (postcard), and written to an A/B flash
 region on the conn node during commissioning. The firmware treats it as pure data.
+
+Doc revision is v0.2. The wire-facing `manifest.schema_version` stays at 1; nothing
+here breaks a v0.1 reader's major version, though v0.1 blobs will not verify.
 
 Design rules encoded in this schema:
 
 1. **Trust is declared, never inferred.** Every sensor carries a `license` field.
    Nothing is inner-loop unless the manifest says so.
-2. **Physical termination is explicit.** Every sensor references a declared bus/port
-   on the conn node. Network-sourced data cannot be expressed here by construction.
+2. **Termination is explicit, and it terminates at the conn.** Every sensor references
+   a declared bus on the conn node. The governing property is not serial versus network
+   but that the path must not traverse anything above the conn node, which a network bus
+   states with `segment` (see D-014). Nothing above the conn node is expressible here.
 3. **Quirks live in configuration, not code.** Per-device permissiveness
    (checksum handling, talker overrides) is manifest data.
-4. **The manifest is auditable.** The compiled blob's hash is published in health
+4. **The manifest is auditable.** The blob is signed; its hash is published in health
    telemetry; a logged mission is verifiable against the trust configuration it ran under.
+   Everything the manifest governs is inside the blob, or a digest of it is (D-018).
 
 ---
 
@@ -37,12 +43,12 @@ date           = "2026-07-08"
 # Compile-time check: manifest must be satisfiable by this profile.
 # ------------------------------------------------------------
 [conn_node]
-board          = "coxswain-h753-a"   # board spec revision
+board          = "nucleo-h753zi"     # hardware profile, not necessarily fabricated hardware (D-016)
 watchdog_ms    = 250                 # hardware watchdog kick interval
 
 # ------------------------------------------------------------
 # Buses: every sensor/actuator references one of these by id.
-# Kinds: cyphal_can | nmea2000_can | nmea0183_uart | spi | i2c | uart
+# Kinds: cyphal_can | nmea2000_can | nmea0183_uart | nmea0183_udp | spi | i2c | uart
 # ------------------------------------------------------------
 
 [[bus]]
@@ -76,7 +82,7 @@ id       = "ais_udp"
 kind     = "nmea0183_udp"
 port     = "eth0"
 listen_port = 10110
-source_ip   = "192.168.10.40"  # required for inner_loop promotion; omit → enrichment cap
+source_ip   = "192.168.10.40"  # guards against a second sender; promotion is moot here, AIS never promotes (D-014)
 segment     = "conn"           # declares the L2 path stays below the companion computer
 checksum    = "required"
 
@@ -87,7 +93,7 @@ port     = "spi1"
 
 # ------------------------------------------------------------
 # Sensors
-# role:    gnss | imu | compass | heading | wind | depth | power | actuator_feedback
+# role:    gnss | imu | compass | heading | wind | depth | ais | power | actuator_feedback
 # license: inner_loop | enrichment
 #   inner_loop : estimator may fuse it; participates in failsafe logic
 #   enrichment : published to Keelson only; estimator must not depend on it
@@ -142,6 +148,16 @@ pgns    = [130306]
 sources = "any"                      # or explicit NAME/source-address pinning
 
 [[sensor]]
+id      = "ais_main"
+role    = "ais"
+driver  = "nmea0183"
+bus     = "ais_udp"
+license = "enrichment"               # role = "ais" caps at enrichment regardless of pinning (D-014)
+[sensor.nmea0183]
+talkers   = ["AI"]
+sentences = ["VDM", "VDO"]
+
+[[sensor]]
 id      = "battery_main"
 role    = "power"
 driver  = "cyphal_power"
@@ -184,12 +200,25 @@ heartbeat_timeout_ms = 500
 # ------------------------------------------------------------
 
 [estimator]
-model        = "fossen_3dof"
-vessel_model = "seahorse_v2"     # named parameter set shipped with firmware or blob
-gnss         = ["gnss_main"]
-imu          = ["imu_main"]
-heading      = ["mag_main", "gyro_retrofit"]   # fusion priority order
-origin       = "midship_waterline"             # vessel body-frame origin convention
+model   = "fossen_3dof"
+gnss    = ["gnss_main"]
+imu     = ["imu_main"]
+heading = ["mag_main", "gyro_retrofit"]   # fusion priority order; provisional, see open question 1
+origin  = "midship_waterline"             # vessel body-frame origin convention
+
+# Parameters for the model named above. Inline, so the blob hash covers the
+# physics and not just the wiring (D-018). Opaque to the schema: the reader
+# validates this table against the shape `estimator.model` selects, and knows
+# nothing else about it. Identification output, not hand-authored.
+[estimator.params]
+mass_kg   = 210.0
+izz_kg_m2 = 95.0
+x_udot    = -18.0     # added mass
+y_vdot    = -140.0
+n_rdot    = -80.0
+x_u       = -35.0     # linear damping
+y_v       = -220.0
+n_r       = -110.0
 
 # ------------------------------------------------------------
 # Supervisor: minimal timing/authority constants that must exist
@@ -207,8 +236,15 @@ critical_voltage_v      = 11.8
 [supervisor.geofence]
 enabled = true
 action  = "hold"                  # hold | return | zero_thrust
-# polygon shipped as part of compiled blob, authored in separate file:
-polygon_file = "geofence_seahorse.geojson"
+# Closed ring, WGS84 [lon, lat]. Inlined, not referenced by filename: the
+# geofence is failsafe-relevant, so the hash must cover it (D-018).
+polygon = [
+  [11.8912, 57.6801],
+  [11.9204, 57.6801],
+  [11.9204, 57.6693],
+  [11.8912, 57.6693],
+  [11.8912, 57.6801],
+]
 ```
 
 ---
@@ -218,46 +254,67 @@ polygon_file = "geofence_seahorse.geojson"
 **License is the load-bearing field.** `inner_loop` means three things at once:
 the estimator may fuse it, its loss participates in the failsafe matrix, and its
 declared bounds (`max_age_ms`, etc.) are enforced as licensing conditions rather
-than soft hints. `enrichment` sensors are pass-through: decoded, timestamped,
+than soft hints. Where the general staleness bound lives (a per-sensor field, or
+estimator config) is part of the staleness semantics deferred to the estimator
+per D-022; today `max_age_ms` exists only in the 0183 quirk table and is
+provisional. `enrichment` sensors are pass-through: decoded, timestamped,
 published to Keelson, invisible to control.
 
 **Compile-time checks (host tool, not firmware):**
 - Every referenced bus/port exists on the declared `conn_node.board` profile
+  (a profile per D-016: the hosted profile and dev boards are legitimate values)
 - `estimator.*` references only `inner_loop` sensors
+- `role = "ais"` implies `license = "enrichment"` (D-014)
+- `estimator.params` matches the shape selected by `estimator.model`
+- Geofence polygon is a closed, simple, non-degenerate ring
 - No duplicate physical port claims
 - Cyphal node IDs unique per bus
 - Schema version compatible with target firmware version
+- `driver` strings are not resolved here; a manifest may name drivers the target
+  firmware lacks, and that surfaces at boot self-test, not at compile
 
 **Boot-time checks (firmware):**
-- CRC + schema version on the active bank, else fall back / safe mode
-- Self-test of every `inner_loop` sensor; failure → supervisor boots but will
+- Signature + CRC + schema version on the active bank, else fall back / safe mode
+  (D-017: a bad signature is treated exactly as a bad CRC)
+- Self-test of every `inner_loop` sensor; failure means the supervisor boots but will
   not grant conn to autonomy
 - Publish manifest hash + revision in health telemetry from first heartbeat
 
-**Network-sourced 0183 (v0.1.1):** allowed as `nmea0183_udp`, listen-only, UDP only.
-The governing property is not serial-vs-network but that the path must not traverse
+**Network-sourced 0183:** allowed as `nmea0183_udp`, listen-only, UDP only. The
+governing property is not serial-vs-network but that the path must not traverse
 anything above the conn node: hence the `segment` declaration. Inner-loop promotion
 additionally requires `source_ip` pinning; unpinned listening caps at `enrichment`.
-Compile-time check: warn on any inner_loop sensor whose bus is network-kind, and
+AIS caps at `enrichment` regardless of pinning (D-014): other-vessel data, never
+own-ship state. Compile-time check: warn on any inner_loop sensor whose bus is network-kind, and
 error if its segment is not "conn".
 
-**Deliberately absent from v0.1:**
+`source_ip` is a configuration control, not a security control. It does not
+authenticate anything. On a segment declared `conn`, spoofing it requires an attacker
+already inside the trust boundary, and on a segment that is not `conn` the pinning
+would not save us anyway. What it buys is protection against a second sender appearing
+on the segment by accident: crosstalk, a misconfigured multiplexer, a duplicate
+instrument. Read it as an assertion about topology. Anyone who later mistakes it for
+authentication will build on sand.
+
+**Deliberately absent:**
 - 0183 over TCP (client state machines in firmware; no payoff for a sensor input)
 - N2K/0183 transmit configuration (scoped later feature)
 - Mission/route data (missions are runtime claims, not commissioning data)
 - Perception sensors (never terminate at Coxswain)
 
-## Open questions for v0.2
+**Settled since v0.1:** vessel model parameters are inline under a `model`
+discriminant (D-018); the blob is ed25519-signed (D-017); the geofence polygon is
+inline (D-018).
 
-1. **Vessel model parameters inline or referenced?** Above, `vessel_model` names a
-   parameter set; alternative is embedding Fossen coefficients directly, which makes
-   the blob fully self-describing at the cost of size and schema churn. Leaning inline
-   for auditability: the hash should cover the physics, not just the wiring.
-2. **Signing.** CRC protects against corruption, not tampering. An ed25519 signature
-   over the blob turns "manifest hash in telemetry" into a genuine attestation.
-   Cheap to add, and directly feeds the ICMASS warrant story.
-3. **Fusion priority vs weights.** `heading = [a, b]` as priority order is simple but
+## Open questions for v0.3
+
+1. **Fusion priority vs weights.** `heading = [a, b]` as priority order is simple but
    crude; explicit per-sensor noise parameters may belong in the manifest once the
-   estimator design firms up.
-4. **Multiple GNSS / moving-baseline heading** (dual-antenna Mosaic setups): needs a
+   estimator design firms up. Per D-022 this schema does not guess ahead of the
+   estimator, so it stays open until the estimator answers it.
+2. **Multiple GNSS / moving-baseline heading** (dual-antenna Mosaic setups): needs a
    pairing concept between two sensor entries.
+3. **Signing key custody.** D-017 settles that the blob is signed and that firmware
+   carries the public key. It does not settle who holds the private key, how it rotates,
+   or whether a vessel accepts more than one signer. Key management is the cost here,
+   not the code.

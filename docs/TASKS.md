@@ -1,111 +1,173 @@
 # TASKS.md
 
-Sequenced backlog. Work top to bottom inside a phase; phases 0 through 2 are
+Sequenced backlog. Work top to bottom inside a phase; phases 0 through 5 are
 strictly ordered, later phases can interleave where dependencies allow. Every
 task ends with the Definition of Done from CLAUDE.md.
+
+Phases 0 through 5 are the MVP (D-019): a simulated vessel holding the conn
+against a live remote claimant, with the thumbv7em gate green. Nothing below
+that line is needed to validate the invariants. Phases 6 onward are sequenced
+for time-to-water (D-021), not for the reference deployment.
 
 ## Phase 0: Scaffolding
 
 - [ ] Initialize Cargo workspace with crates per CLAUDE.md conventions
-      (contract, estimator, guidance, supervisor, manifest, hosted; empty
-      driver and keelson crates as placeholders). Apache 2.0, README stub
+      (contract, model, estimator, guidance, supervisor, manifest, sim, hosted;
+      empty driver and keelson crates as placeholders). Apache 2.0, README stub
       with the one-line positioning.
 - [ ] Verify devcontainer builds and postCreateCommand passes; fix version
       pins (rust channel, ZENOH_VERSION) against current releases.
 - [ ] CI green on the empty workspace: fmt, clippy, host tests, thumbv7em
       gate on the core crates.
 - [ ] .cargo/config.toml for the firmware target (probe-rs runner, flip-link)
-      staged but unused until Phase 5.
+      staged but unused until Phase 8.
 
-## Phase 1: Contract and manifest
+## Phase 1: Contract
 
 - [ ] coxswain-contract: core types. Vessel state (3-DOF pose/velocity +
       covariance), guidance setpoint, actuator command/feedback, health,
       arming state, conn state, claimant identity. no_std, serde-optional
       feature for host tooling. Keep it small; every addition is a review
       point.
-- [ ] coxswain-manifest: schema per docs/manifest-schema.md v0.1. TOML parse
-      (std feature), validation (bus references, license subset rules,
-      port uniqueness, network-bus segment/pinning rules), compile to
-      postcard blob with CRC + schema version, no_std reader for the blob.
-- [ ] Host tool (bin in coxswain-manifest): validate + compile + hash. Hash
-      algorithm chosen and recorded in DECISIONS.md.
-- [ ] Golden-file tests: the Seahorse example manifest from the schema doc
-      compiles, plus rejection cases for every validation rule.
+- [ ] coxswain-contract: the vessel config struct. This is the type
+      coxswain-manifest later compiles onto (D-022). Estimator and supervisor
+      consume the struct and never the TOML, so both are testable with
+      hand-built values long before the manifest compiler exists.
 
-## Phase 2: Core services on host
+## Phase 2: Estimation on replay
 
 - [ ] Replay harness first: feed timestamped sensor streams (synthetic
       generators + recorded-log reader) into the estimator, assert on state
       trajectories. This is the estimator's development environment; invest
       here.
-- [ ] coxswain-estimator: 3-DOF EKF with Fossen model prior. Start with
-      constant-velocity fallback model, add hydrodynamic prior second. GNSS +
-      IMU + heading fusion per manifest licensing, staleness handling per
-      declared bounds, covariance-based health output.
+- [ ] coxswain-estimator: constant-velocity model, GNSS + IMU + heading fusion
+      per config licensing, staleness handling per declared bounds,
+      covariance-based health output. The hydrodynamic prior lands in Phase 3
+      once the model crate exists; do not block on it.
+- [ ] Replay cases regression-locked in CI. Every later estimator change
+      arrives with one.
+
+## Phase 3: Model and plant simulator
+
+- [ ] coxswain-model: Fossen 3-DOF. no_std, no alloc, nalgebra. One crate, two
+      consumers (D-020): the estimator's process model and the simulator's
+      plant. Coefficients are the parameter struct from the manifest schema.
+- [ ] coxswain-estimator: promote from constant-velocity to the hydrodynamic
+      prior on the shared model. Replay cases must not regress.
+- [ ] coxswain-sim (host-only): plant integration on coxswain-model, plus
+      sensor models (noise, latency, dropout, quantization) that emit contract
+      types indistinguishable from a driver's.
+- [ ] Fault injection in the simulator: GNSS loss, heading disagreement,
+      claimant silence, voltage sag, geofence breach. These are the inputs the
+      failsafe matrix is tested against in Phase 4.
+
+## Phase 4: Guidance and supervisor, closed loop
+
 - [ ] coxswain-guidance: LOS path following, waypoint sequencing, speed
-      control. Station-keeping after the estimator holds up in replay.
+      control, station-keeping. Closed against the simulator, which is the only
+      place these are testable at all (D-020).
 - [ ] coxswain-supervisor: conn/claimant state machine (register, request,
-      grant, revoke, heartbeat staleness per manifest), arming logic, failsafe
-      matrix v1 (position degraded, claimant lost, low/critical voltage,
-      geofence hold) with defined degraded behaviors. Exhaustive state
-      machine tests; this crate earns trust through tests, not review.
+      grant, revoke, heartbeat staleness), arming logic, failsafe matrix v1
+      (position degraded, claimant lost, low/critical voltage, geofence hold)
+      with defined degraded behaviors. Exhaustive state machine tests; this
+      crate earns trust through tests, not review.
 - [ ] Wire the three services in-process with channels behind contract types;
       deterministic tick driver for tests.
+- [ ] Closed-loop scenario tests: each failsafe behavior asserted against
+      simulated trajectories, not against a mocked plant response.
 
-## Phase 3: Drivers
+## Phase 5: Manifest, Keelson, MVP exit
+
+- [ ] coxswain-manifest: schema per docs/manifest-schema.md v0.2. TOML parse
+      (std feature), validation (bus references, license subset rules, role
+      license caps (AIS), port uniqueness, network-bus segment/pinning rules,
+      params shape against the model discriminant, geofence ring validity),
+      compile to postcard blob with CRC + ed25519 signature + schema version,
+      no_std reader for the blob. Compiles onto the Phase 1 config struct.
+- [ ] Host tool (bin in coxswain-manifest): validate + compile + sign + hash.
+      Hash algorithm chosen and recorded in DECISIONS.md.
+- [ ] Golden-file tests: the Seahorse example manifest from the schema doc
+      compiles, plus rejection cases for every validation rule and for a bad
+      signature.
+- [ ] coxswain-keelson: publish raw + fused sensor streams, health, conn state
+      under Keelson conventions. Manifest hash + revision in health from the
+      first heartbeat.
+- [ ] Claimant-over-Keelson: teleoperation client as first remote claimant,
+      exercising the supervisor grant flow end to end.
+- [ ] coxswain-hosted: the Linux binary. Manifest from file, simulator as the
+      I/O backend, zenoh session up.
+- [ ] Integration test: hosted profile + zenohd + scripted claimant, full
+      grant/revoke/failsafe scenario in CI.
+- [ ] D-008 test: kill zenohd mid-scenario. Assert the vessel holds station,
+      the supervisor never yields the conn, and the control loop misses no tick
+      deadline (a generous fixed bound; jitter comparisons are flaky on shared
+      runners). The failure story is a claim; make it an assertion.
+
+**MVP exit.** Everything above validates every invariant in CLAUDE.md with no
+hardware. Everything below buys a boat that moves.
+
+## Phase 6: Drivers and first water
+
+Bring-up transports per D-021. Chosen for time-to-water, superseded in Phase 7.
 
 - [ ] Coxswain driver trait (init, self-test, read-with-timestamp) +
       timestamping policy (acquisition time, monotonic source injected).
 - [ ] NMEA 0183 parser crate: strict, sentence subset (GGA, RMC, HDT, VTG to
       start), quirk flags from manifest. Fuzz the parser.
-- [ ] GNSS driver: Septentrio SBF over UART (Mosaic), PPS hook stubbed for
-      host profile.
-- [ ] IMU/mag drivers per chosen hardware (embedded-hal, host-mockable).
+- [ ] GNSS driver over 0183. Covariance from HDOP and fix quality, which is
+      crude and known to be crude; the estimator's declared noise parameters
+      carry the weight until SBF lands.
+- [ ] IMU/mag drivers for the Seahorse hardware (embedded-hal, host-mockable).
+- [ ] PWM/serial actuator backend behind the driver trait. The conn/actuator
+      role split (D-010) is preserved in software; the second firmware project
+      is not yet required.
+- [ ] docs/hardware.md: the supported device list. Name what is on Seahorse and
+      nothing else. "Quirks in configuration, not code" invites an unbounded
+      device zoo; this doc is the fence.
+- [ ] coxswain-hosted on real /dev ports, systemd unit example.
+- [ ] First water trial behind a manual claimant (RC or teleop). Autonomy conn
+      grant only after the failsafe matrix has both simulator and bench mileage.
+
+## Phase 7: Production transports
+
 - [ ] Cyphal: actuator command out, feedback and power monitoring in.
       Command-then-report comparison surfaced to supervisor health.
+- [ ] GNSS driver: Septentrio SBF over UART (Mosaic), PPS hook stubbed for the
+      host profile. Earns its place when the estimator consumes covariance and
+      RTK status, and not before.
 - [ ] NMEA 2000 listen-only decode for the initial PGN set; enrichment path
       only.
 - [ ] 0183-over-UDP bus: listen socket, source_ip pinning enforcement,
       enrichment cap when unpinned.
 
-## Phase 4: Keelson adapter and hosted profile
+## Phase 8: Conn node firmware (reference deployment)
 
-- [ ] coxswain-keelson: publish raw + fused sensor streams, health, conn
-      state under Keelson conventions (Coxswain doubles as the Keelson
-      connector for its terminated devices). Manifest hash + revision in
-      health from first heartbeat.
-- [ ] Claimant-over-Keelson: teleoperation client as first remote claimant
-      exercising the supervisor grant flow end to end.
-- [ ] coxswain-hosted: the Linux binary. Manifest from file, drivers on real
-      /dev ports, zenoh session up, systemd unit example.
-- [ ] Integration test: hosted profile + zenohd + scripted claimant, full
-      grant/revoke/failsafe scenario in CI.
-
-## Phase 5: Conn node firmware (reference deployment)
-
-- [ ] coxswain-conn-h753: Embassy binding on NUCLEO-H753ZI. Manifest blob
-      from A/B flash banks, fallback + safe-mode boot path.
+- [ ] coxswain-conn-h753: Embassy binding on NUCLEO-H753ZI. Manifest blob from
+      A/B flash banks, signature verification, fallback + safe-mode boot path.
 - [ ] zenoh-pico uplink for the Keelson adapter subset.
 - [ ] Hardware watchdog integration, boot-time self-test per manifest.
-- [ ] Bench milestone: same replay scenario passing on host and on the H7
-      (fed over a test harness), byte-identical supervisor decisions.
+- [ ] Bench milestone: the same simulator scenario passing on host and on the
+      H7 (fed over a test harness), byte-identical supervisor decisions.
 
-## Phase 6: Vessel
+## Phase 9: Vessel
 
 - [ ] Actuator node firmware v1 (thruster + rudder profiles, local failsafe,
-      heartbeat).
+      heartbeat). Cyphal transport, replacing the Phase 6 PWM backend.
 - [ ] Peripheral contract validation on the bench: dev board + RS-422 and CAN
-      transceivers, real GNSS/IMU. Board spec drafted as the output (D-016).
-- [ ] First water trial behind a manual claimant (RC or teleop), autonomy
-      conn grant only after the failsafe matrix has bench mileage.
+      transceivers, real GNSS/IMU.
+- [ ] Board spec drafted as the output of that validation (D-016).
 
 ## Parked (explicitly not now)
 
 - MAVLink facade (D-004)
 - N2K/0183 transmit
-- Manifest signing (decide at Phase 1 exit; cheap then, awkward later)
 - Dual-antenna heading pairing in the schema
 - COLREGs advisor, perception integration
+- Signing key custody: rotation, multi-signer, who holds the private key.
+  D-017 settles that we sign, not who signs.
+- System identification campaign for the Seahorse hull. Until it runs, the
+  Fossen coefficients are best-effort estimates and the constant-velocity
+  fallback carries the estimator. Nothing in Phases 0 through 5 depends on the
+  coefficients being right, only on their shape being right.
 - Coxswain-micro (H7-only minimal profile); the no_std discipline keeps it
   possible, nobody builds it until a vessel needs it

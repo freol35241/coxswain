@@ -116,19 +116,78 @@ Cameras, radar, lidar live above (Keelson connectors). A future COLREGs layer
 enters the supervisor as claimant or advisor, not as trusted inner-loop
 sensing. Self-sufficient means holding the conn, not omniscience.
 
-## D-016: Shared dev/CI image
+## D-016: Conn-node board spec is an output, not an input
 
-Devcontainer and GitHub Actions run the same Dockerfile (devcontainers/ci).
-Pinned toolchain via rust-toolchain.toml, pinned zenohd for integration tests,
-probe-rs tooling baked in. The no_std gate lives in ci.yml as a crate list.
+The peripheral contract (UART count, RS-422, dual CAN, SPI, PPS, Ethernet,
+dual-bank flash) gets validated on a dev board plus transceivers before any
+board is designed. The spec is what falls out of that validation. Consequence:
+`conn_node.board` names a profile, not necessarily fabricated hardware. The
+hosted profile and NUCLEO-H753ZI are legitimate profiles.
+
+## D-017: The manifest blob is signed, not merely CRC-protected
+
+Ed25519 over the compiled bytes, signed at commissioning, public key in
+firmware. CRC catches corruption, not substitution. Manifest hash in health
+telemetry is an attestation only if the blob cannot be silently replaced;
+without a signature it is a checksum wearing a warrant's clothes. Verification
+failure is handled exactly as CRC failure: fall back to the other bank, then
+safe mode. Decided now rather than at Phase 1 exit because both the blob format
+and the boot path change if it lands later.
+
+## D-018: The manifest hash covers everything the manifest governs
+
+Any artifact that shapes control or failsafe behavior lives inside the compiled
+blob, or a digest of it does. Two consequences. The geofence polygon is inlined,
+not referenced by filename. Vessel model parameters are inline, not named:
+carried as an opaque versioned struct keyed on `estimator.model`, so the hash
+covers the physics while the parameter shape evolves under the discriminant.
+Supersedes the named-reference option left open in D-013.
+
+## D-019: MVP is a simulated vessel holding the conn
+
+D-002 restated as a delivery boundary. The MVP is done when contract,
+estimator, guidance, and supervisor run in-process against a closed-loop plant
+simulator; a remote claimant over Keelson completes grant, revoke, and failsafe
+end to end; and the thumbv7em gate is green. Drivers, conn-node firmware, and
+actuator nodes are post-MVP. The research-yield components named in D-002 need
+no hardware, and the hardware phases were most of the effort while validating
+none of them. The no_std discipline and the CI gate keep the H7 binding cheap
+to add on the far side.
+
+## D-020: The plant simulator is a core artifact, not a test fixture
+
+Replay is open loop: recorded sensors do not respond to actuation. Guidance,
+station-keeping, and every plant-coupled failsafe behavior (hold, return,
+zero_thrust) cannot be closed on replay. The Fossen model required as the
+estimator's prior is the same model run forward as the plant. One crate
+(coxswain-model, no_std, no alloc), two consumers. Replay remains the
+estimator's harness. The simulator is guidance's and the supervisor's.
+
+## D-021: Bring-up transports are chosen for time-to-water, not for the target
+
+D-010 makes the conn/actuator role split the invariant and says nothing about
+transport. First actuator backend is PWM or serial behind the driver trait, not
+Cyphal, so a hull moves without a second firmware project. This does not overturn
+D-011, whose real constraint is that actuator commands never ride a broadcast bus
+with no authority model; a point-to-point PWM link is not N2K. Cyphal remains the
+transport for the reference deployment. First GNSS is NMEA 0183 (GGA, RMC, VTG,
+HDT), not SBF; every GNSS speaks it, the Mosaic included. SBF returns when
+covariance, RTK status, PPS discipline, or moving-baseline heading are actually
+consumed, which is after the estimator can use them. Neither choice touches the
+contract crate.
+
+## D-022: The manifest schema freezes after the estimator, not before
+
+The schema's unresolved questions (per-sensor noise parameters, staleness
+semantics) are answers the estimator produces. Sequencing the manifest ahead of
+it fixes a schema against guesses. Mechanism: the vessel config struct lives in
+coxswain-contract; coxswain-manifest is a compiler onto that struct. Estimator
+and supervisor consume the struct and never the TOML, so they are testable with
+hand-built values before the compiler exists. The manifest stays in the MVP; it
+stops being a blocker.
 
 ## Open questions (not yet decided)
 
-- Manifest blob signing (ed25519 attestation vs CRC only); leans yes, feeds
-  the ICMASS warrant story
-- Vessel model parameters inline in the manifest vs named reference; leans
-  inline so the hash covers the physics
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest
+  (deferred to the estimator per D-022)
 - Dual-antenna GNSS heading (sensor pairing concept in the schema)
-- Conn-node board spec: output of validating the peripheral contract on a dev
-  board plus transceivers, not designed up front
