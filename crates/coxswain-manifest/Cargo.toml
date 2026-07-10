@@ -1,6 +1,42 @@
+# Dependency justifications (one line each):
+# - serde: derive for the blob types; already the workspace serialization story.
+# - postcard: the decided blob wire format (D-013), no_std.
+# - crc: CRC32 blob integrity per D-013.
+# - ed25519-dalek: blob signature per D-017; verify works no_std with default
+#   features off. No rand: signing from a 32-byte seed file is deterministic.
+# - sha2: manifest hash published in health telemetry; SHA-256, recorded in
+#   DECISIONS.md. 0.10 is what ed25519-dalek v2 uses internally.
+# - toml: authoring format, std/host side only.
+# - coxswain-contract: the compile target (D-022), serde feature for the blob.
+
 [package]
 name = "coxswain-manifest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+coxswain-contract = { path = "../coxswain-contract", features = ["serde"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+postcard = { version = "1", default-features = false }
+crc = "3"
+ed25519-dalek = { version = "2", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+toml = { version = "1", optional = true }
+
+[dev-dependencies]
+# Self dev-dependency so the golden-file tests see the std API even when the
+# crate is tested with default features (same pattern as coxswain-contract).
+coxswain-manifest = { path = ".", features = ["std"] }
+
+[features]
+# Default is the no_std blob reader only; "std" adds TOML parsing, validation,
+# compilation, signing, and the host tool.
+default = []
+std = ["dep:toml", "serde/std", "postcard/use-std", "ed25519-dalek/std", "sha2/std"]
+
+[[bin]]
+name = "coxswain-manifest"
+path = "src/bin/coxswain-manifest.rs"
+required-features = ["std"]

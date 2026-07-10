@@ -1,0 +1,220 @@
+# ============================================================
+# coxswain manifest: example vessel: RISE USV "Seahorse"
+# ============================================================
+
+[manifest]
+schema_version = 1          # firmware refuses unknown major versions
+vessel_id      = "se-rise-seahorse-01"
+name           = "Seahorse"
+revision       = 7          # monotonically increasing per vessel
+author         = "freol"
+date           = "2026-07-08"
+
+# ------------------------------------------------------------
+# Conn node hardware profile
+# Declares which physical resources this manifest may reference.
+# Compile-time check: manifest must be satisfiable by this profile.
+# ------------------------------------------------------------
+[conn_node]
+board          = "nucleo-h753zi"     # hardware profile, not necessarily fabricated hardware (D-016)
+watchdog_ms    = 250                 # hardware watchdog kick interval
+
+# ------------------------------------------------------------
+# Buses: every sensor/actuator references one of these by id.
+# Kinds: cyphal_can | nmea2000_can | nmea0183_uart | nmea0183_udp | spi | i2c | uart
+# ------------------------------------------------------------
+
+[[bus]]
+id       = "ctrl"
+kind     = "cyphal_can"
+port     = "can1"
+bitrate  = 1000000
+
+[[bus]]
+id       = "instruments"
+kind     = "nmea2000_can"
+port     = "can2"
+bitrate  = 250000
+mode     = "listen_only"      # transmit is a scoped later feature
+
+[[bus]]
+id       = "gnss_serial"
+kind     = "uart"
+port     = "uart4"
+baud     = 115200
+
+[[bus]]
+id       = "legacy_gyro"
+kind     = "nmea0183_uart"
+port     = "uart7"            # RS-422 input
+baud     = 4800
+checksum = "required"         # strict by default; "optional" is a per-bus quirk
+
+[[bus]]
+id       = "ais_udp"
+kind     = "nmea0183_udp"
+port     = "eth0"
+listen_port = 10110
+source_ip   = "192.168.10.40"  # guards against a second sender; promotion is moot here, AIS never promotes (D-014)
+segment     = "conn"           # declares the L2 path stays below the companion computer
+checksum    = "required"
+
+[[bus]]
+id       = "imu_spi"
+kind     = "spi"
+port     = "spi1"
+
+# ------------------------------------------------------------
+# Sensors
+# role:    gnss | imu | compass | heading | wind | depth | ais | power | actuator_feedback
+# license: inner_loop | enrichment
+#   inner_loop : estimator may fuse it; participates in failsafe logic
+#   enrichment : published to Keelson only; estimator must not depend on it
+# ------------------------------------------------------------
+
+[[sensor]]
+id      = "gnss_main"
+role    = "gnss"
+driver  = "septentrio_sbf"
+bus     = "gnss_serial"
+license = "inner_loop"
+pps     = "pps1"                     # timing input, if wired
+lever_arm_m = [1.20, 0.00, -0.85]    # antenna offset from vessel origin, x fwd, y stbd, z down
+
+[[sensor]]
+id      = "imu_main"
+role    = "imu"
+driver  = "scha63t"
+bus     = "imu_spi"
+license = "inner_loop"
+orientation = "x_fwd_z_down"         # mounting rotation, enum of standard mountings
+lever_arm_m = [0.00, 0.00, 0.00]
+
+[[sensor]]
+id      = "mag_main"
+role    = "compass"
+driver  = "rm3100"
+bus     = "imu_spi"
+license = "inner_loop"
+declination_source = "wmm"           # wmm | fixed
+# declination_deg  = 4.2             # only if source = "fixed"
+
+[[sensor]]
+id      = "gyro_retrofit"
+role    = "heading"
+driver  = "nmea0183"
+bus     = "legacy_gyro"
+license = "inner_loop"               # explicit promotion of a retrofit instrument
+[sensor.nmea0183]
+talkers   = ["HE"]                   # accepted talker IDs
+sentences = ["HDT"]                  # accepted sentence types
+max_age_ms = 500                     # staleness bound before declared lost
+
+[[sensor]]
+id      = "n2k_wind"
+role    = "wind"
+driver  = "nmea2000"
+bus     = "instruments"
+license = "enrichment"               # visible on Keelson, never fused
+[sensor.nmea2000]
+pgns    = [130306]
+sources = "any"                      # or explicit NAME/source-address pinning
+
+[[sensor]]
+id      = "ais_main"
+role    = "ais"
+driver  = "nmea0183"
+bus     = "ais_udp"
+license = "enrichment"               # role = "ais" caps at enrichment regardless of pinning (D-014)
+[sensor.nmea0183]
+talkers   = ["AI"]
+sentences = ["VDM", "VDO"]
+
+[[sensor]]
+id      = "battery_main"
+role    = "power"
+driver  = "cyphal_power"
+bus     = "ctrl"
+license = "inner_loop"               # failsafe matrix input
+node_id = 21
+
+# ------------------------------------------------------------
+# Actuator nodes (Cyphal)
+# failsafe = behavior on loss of conn-node heartbeat, enforced locally
+# ------------------------------------------------------------
+
+[[actuator_node]]
+id        = "thruster_port"
+node_id   = 11
+bus       = "ctrl"
+function  = "thruster"
+failsafe  = "zero_thrust"
+heartbeat_timeout_ms = 500
+
+[[actuator_node]]
+id        = "thruster_stbd"
+node_id   = 12
+bus       = "ctrl"
+function  = "thruster"
+failsafe  = "zero_thrust"
+heartbeat_timeout_ms = 500
+
+[[actuator_node]]
+id        = "steering"
+node_id   = 13
+bus       = "ctrl"
+function  = "rudder"
+failsafe  = "amidships"
+heartbeat_timeout_ms = 500
+
+# ------------------------------------------------------------
+# Estimator: which model, which promoted sensors, in what config
+# The sensor list here must be a subset of sensors with license = "inner_loop".
+# ------------------------------------------------------------
+
+[estimator]
+model   = "fossen_3dof"
+gnss    = ["gnss_main"]
+imu     = ["imu_main"]
+heading = ["mag_main", "gyro_retrofit"]   # fusion priority order; provisional, see open question 1
+origin  = "midship_waterline"             # vessel body-frame origin convention
+
+# Parameters for the model named above. Inline, so the blob hash covers the
+# physics and not just the wiring (D-018). Opaque to the schema: the reader
+# validates this table against the shape `estimator.model` selects, and knows
+# nothing else about it. Identification output, not hand-authored.
+[estimator.params]
+mass_kg   = 210.0
+izz_kg_m2 = 95.0
+x_udot    = -18.0     # added mass
+y_vdot    = -140.0
+n_rdot    = -80.0
+x_u       = -35.0     # linear damping
+y_v       = -220.0
+n_r       = -110.0
+
+# ------------------------------------------------------------
+# Supervisor: minimal timing/authority constants that must exist
+# with nothing above the conn node alive. The full failsafe matrix
+# is firmware logic; these are its vessel-specific constants.
+# ------------------------------------------------------------
+
+[supervisor]
+claimant_heartbeat_ms   = 1000    # remote claimant staleness bound
+conn_grant_default      = "none"  # none | autonomy: who may hold conn at boot
+position_degraded_after_ms = 3000 # GNSS silence before degraded mode
+low_voltage_v           = 12.4
+critical_voltage_v      = 11.8
+
+[supervisor.geofence]
+enabled = true
+action  = "hold"                  # hold | return | zero_thrust
+# Closed ring, WGS84 [lon, lat]. Inlined, not referenced by filename: the
+# geofence is failsafe-relevant, so the hash must cover it (D-018).
+polygon = [
+  [11.8912, 57.6801],
+  [11.9204, 57.6801],
+  [11.9204, 57.6693],
+  [11.8912, 57.6693],
+  [11.8912, 57.6801],
+]
