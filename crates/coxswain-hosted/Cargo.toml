@@ -4,3 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+coxswain-contract = { path = "../coxswain-contract" }
+coxswain-estimator = { path = "../coxswain-estimator" }
+coxswain-guidance = { path = "../coxswain-guidance" }
+coxswain-supervisor = { path = "../coxswain-supervisor" }
+
+[dev-dependencies]
+# Closed-loop scenario tests run the full loop against the simulator plant
+# (D-020); LocalFrame from coxswain-model does the test geometry.
+coxswain-model = { path = "../coxswain-model" }
+coxswain-sim = { path = "../coxswain-sim" }

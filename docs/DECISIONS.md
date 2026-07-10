@@ -199,6 +199,15 @@ contract never moves because a dependency did. Identities (claimant, sensor)
 are u16 newtypes; names map to ids at the adapter edge and in the manifest
 compiler, and authority or fusion logic never parses strings.
 
+## D-024: The manifest hash is SHA-256 over the whole signed blob
+
+The hash published in health telemetry (D-013) is SHA-256 of the complete
+compiled blob, signature included, so two blobs differing only in signature
+hash differently and the published value pins exactly the bytes in flash.
+SHA-256 because ubiquity beats novelty for an audit artifact: every tool a
+port-state inspector or an incident reviewer might hold can compute it. The
+signature already provides integrity; the hash is an identifier.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest
