@@ -26,3 +26,4 @@ jobs:
           -p coxswain-guidance
           -p coxswain-supervisor
           -p coxswain-manifest
+          --features coxswain-contract/serde

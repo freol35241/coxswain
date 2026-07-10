@@ -4,3 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]
+
+[dev-dependencies]
+# float_roundtrip so the roundtrip tests compare exact f64 values.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# Self dev-dependency so unit tests always see the serde impls.
+coxswain-contract = { path = ".", features = ["serde"] }

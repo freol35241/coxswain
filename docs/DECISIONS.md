@@ -186,6 +186,19 @@ and supervisor consume the struct and never the TOML, so they are testable with
 hand-built values before the compiler exists. The manifest stays in the MVP; it
 stops being a blocker.
 
+## D-023: Contract representation: f64, geodetic + body frames, no math dependency, integer identities
+
+Four choices bundled because they move together. All physical quantities are
+f64: geodetic position does not survive f32 and the H753 has a hardware
+double-precision FPU. Vessel state is geodetic position (WGS84, radians) plus
+body-frame velocities; covariance is 6x6 over [n, e, psi, u, v, r] in the
+local NED tangent frame, since estimation runs in the tangent frame and
+reports in geodetic. The contract crate depends on nothing but optional serde;
+nalgebra stays in the crates that do math, converting at the boundary, so the
+contract never moves because a dependency did. Identities (claimant, sensor)
+are u16 newtypes; names map to ids at the adapter edge and in the manifest
+compiler, and authority or fusion logic never parses strings.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest
