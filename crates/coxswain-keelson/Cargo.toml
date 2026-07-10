@@ -4,3 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+coxswain-contract = { path = "../coxswain-contract" }
+# The native external interface (D-003). Pinned to the zenohd 1.9 line the
+# devcontainer ships.
+zenoh = "1.9"
+# Keelson payloads are protobuf.
+prost = "0.14"
+prost-types = "0.14"
+
+[build-dependencies]
+# Codegen from the vendored protos.
+prost-build = "0.14"
+# protoc without a system install; same binary everywhere.
+protoc-bin-vendored = "3"

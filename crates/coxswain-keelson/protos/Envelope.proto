@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+package core;
+
+message Envelope {
+
+    // Timestamp when this envelope was enclosed
+    google.protobuf.Timestamp enclosed_at = 1;
+
+    // The payload should be a protobuf message specified in the payload folder
+    bytes payload = 2;
+ 
+}
+
+message KeyEnvelopePair {
+
+    // Timestamp when this KeyEnvelopePair was created
+    google.protobuf.Timestamp timestamp = 1;
+
+    // The key associated with this KeyEnvelopePair
+    string key = 2;
+
+    // The key associated with this KeyEnvelopePair
+    bytes envelope = 3;
+
+}

@@ -1,0 +1,80 @@
+// Coxswain-specific conn protocol messages. Keelson has no claim/grant
+// doctrine of its own (commands are RPCs, that is all), so these types are
+// ours; candidate to propose upstream once the shape has settled.
+
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+package coxswain;
+
+// Body of every conn RPC (conn_register, conn_request, conn_release,
+// vehicle_arm, vehicle_disarm). Claimant ids are u16 on the vessel side;
+// values above 65535 are rejected at the adapter.
+message ConnRequest {
+  uint32 claimant_id = 1;
+}
+
+message ConnReply {
+  enum Result {
+    OK = 0;
+    ALREADY_REGISTERED = 1;
+    REGISTRY_FULL = 2;
+    CONN_HELD = 3;
+    NOT_HOLDER = 4;
+    UNREGISTERED = 5;
+    REFUSED_ESTIMATOR = 6;
+    REFUSED_VOLTAGE = 7;
+    REFUSED_POSITION = 8;
+    ERROR = 9;
+  }
+  Result result = 1;
+}
+
+// One guidance setpoint from the conn holder. The continuous setpoint stream
+// doubles as the claimant heartbeat (Keelson dead-man doctrine).
+message SetpointMsg {
+  google.protobuf.Timestamp timestamp = 1;
+
+  message Idle {}
+
+  message HeadingSpeed {
+    double heading_rad = 1;
+    double speed_mps = 2;
+  }
+
+  message StationKeep {
+    double lat_deg = 1;
+    double lon_deg = 2;
+  }
+
+  message Waypoint {
+    double lat_deg = 1;
+    double lon_deg = 2;
+  }
+
+  message FollowPath {
+    repeated Waypoint waypoints = 1;
+    double speed_mps = 2;
+  }
+
+  oneof setpoint {
+    Idle idle = 2;
+    HeadingSpeed heading_speed = 3;
+    StationKeep station_keep = 4;
+    FollowPath follow_path = 5;
+  }
+}
+
+message ConnStateMsg {
+  bool held = 1;
+  uint32 holder = 2;
+  bool armed = 3;
+}
+
+// Manifest identity, published so it is in telemetry from the first
+// heartbeat.
+message ManifestInfo {
+  bytes sha256 = 1;
+  uint32 revision = 2;
+}
