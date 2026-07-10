@@ -4,3 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+coxswain-contract = { path = "../coxswain-contract" }
+# Estimator math per CLAUDE.md conventions; no_std via the libm feature.
+nalgebra = { version = "0.34", default-features = false, features = ["libm"] }
+# no_std scalar trig for the tangent frame and process model.
+libm = "0.2"
+
+[dev-dependencies]
+# serde feature so the replay harness can log measurements as JSONL.
+coxswain-contract = { path = "../coxswain-contract", features = ["serde"] }
+# float_roundtrip so log replay reproduces exact f64 values.
+serde_json = { version = "1", features = ["float_roundtrip"] }

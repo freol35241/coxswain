@@ -11,6 +11,7 @@ mod conn;
 mod geo;
 mod guidance;
 mod health;
+mod measurement;
 mod state;
 mod time;
 
@@ -23,6 +24,7 @@ pub use config::{
 pub use conn::{ArmingState, ClaimantId, ConnState};
 pub use geo::GeoPoint;
 pub use guidance::Setpoint;
-pub use health::HealthLevel;
+pub use health::{EstimatorHealth, HealthLevel};
+pub use measurement::{Measurement, MeasurementKind};
 pub use state::{BodyVelocity, Covariance, Pose, VesselState};
 pub use time::Timestamp;
