@@ -1,20 +1,36 @@
 //! EKF over x = [n, e, psi, u, v, r]: NED position (m), heading (rad,
 //! wrapped to (-pi, pi]), body surge/sway (m/s), yaw rate (rad/s).
 //!
-//! Process model is constant velocity / constant twist; the hydrodynamic
-//! prior on coxswain-model replaces it in Phase 3.
+//! The process model is selected per vessel: the hydrodynamic prior on
+//! coxswain-model, or the constant-velocity / constant-twist fallback.
 
 use core::f64::consts::{PI, TAU};
 
-use nalgebra::{SMatrix, SVector};
+use coxswain_contract::ForceDemand;
+use coxswain_model::Fossen3Dof;
+use nalgebra::{SMatrix, SVector, Vector3};
 
 pub type StateVec = SVector<f64, 6>;
 pub type StateMat = SMatrix<f64, 6, 6>;
 
+/// How the velocity states propagate between measurements. The kinematic
+/// rows (position, heading) are the same either way.
+// One instance per estimator; the precomputed model matrices are the point,
+// and boxing is not an option in a no-alloc crate.
+#[allow(clippy::large_enum_variant)]
+pub enum ProcessModel {
+    /// u, v, r held constant.
+    ConstantVelocity,
+    /// nu_dot from the Fossen 3-DOF model under the latest force demand.
+    Hydrodynamic(Fossen3Dof),
+}
+
 // Provisional noise constants, placeholders until system identification
 // (TASKS "Parked"). The sigmas are treated as PSDs of white accelerations on
 // the body velocities, so covariance growth per second is independent of the
-// prediction tick rate.
+// prediction tick rate. Under the hydrodynamic prior they budget model error
+// (wrong coefficients, unmodeled environment forces) rather than unmodeled
+// maneuvering; the values are kept until identification says otherwise.
 const SIGMA_U_DOT: f64 = 0.5; // m/s^2
 const SIGMA_V_DOT: f64 = 0.5; // m/s^2
 const SIGMA_R_DOT: f64 = 0.2; // rad/s^2
@@ -53,9 +69,11 @@ impl Ekf {
         Self { x, p }
     }
 
-    /// Euler discretization of the constant-twist kinematics: adequate at
-    /// the tick rates involved (tens of Hz between measurements).
-    pub fn predict(&mut self, dt: f64) {
+    /// Euler discretization, adequate at the tick rates involved (tens of Hz
+    /// between measurements). The kinematic rows are constant-twist; the
+    /// velocity rows follow the selected process model, with `tau` treated as
+    /// constant over the step.
+    pub fn predict(&mut self, dt: f64, model: &ProcessModel, tau: &ForceDemand) {
         if dt <= 0.0 {
             return;
         }
@@ -66,9 +84,8 @@ impl Ekf {
         self.x[0] += (u * c - v * s) * dt;
         self.x[1] += (u * s + v * c) * dt;
         self.x[2] = wrap_angle(psi + self.x[5] * dt);
-        // u, v, r are constant under this model.
 
-        // Analytic Jacobian of the Euler step.
+        // Analytic Jacobian of the Euler step, kinematic rows.
         let mut f = StateMat::identity();
         f[(0, 2)] = (-u * s - v * c) * dt;
         f[(0, 3)] = c * dt;
@@ -78,9 +95,24 @@ impl Ekf {
         f[(1, 4)] = c * dt;
         f[(2, 5)] = dt;
 
+        match model {
+            // u, v, r are constant; the velocity block of f stays identity.
+            ProcessModel::ConstantVelocity => {}
+            ProcessModel::Hydrodynamic(m) => {
+                let nu = Vector3::new(self.x[3], self.x[4], self.x[5]);
+                let nu_dot = m.nu_dot(nu, tau);
+                let jac = m.jacobian_nu(nu);
+                for i in 0..3 {
+                    self.x[3 + i] += nu_dot[i] * dt;
+                    for j in 0..3 {
+                        f[(3 + i, 3 + j)] += jac[(i, j)] * dt;
+                    }
+                }
+            }
+        }
+
         // Diagonal mapping of the white accelerations (Wiener velocity
         // model per axis); the position/velocity cross terms are dropped.
-        // Provisional simplification, revisited with the Phase 3 prior.
         let dt3 = dt * dt * dt / 3.0;
         let q = StateMat::from_diagonal(&StateVec::from([
             SIGMA_U_DOT * SIGMA_U_DOT * dt3,
@@ -128,6 +160,29 @@ impl Ekf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coxswain_contract::Fossen3DofParams;
+
+    fn zero_tau() -> ForceDemand {
+        ForceDemand {
+            surge_n: 0.0,
+            sway_n: 0.0,
+            yaw_nm: 0.0,
+        }
+    }
+
+    /// Seahorse example params from docs/manifest-schema.md.
+    fn seahorse() -> Fossen3DofParams {
+        Fossen3DofParams {
+            mass_kg: 210.0,
+            izz_kg_m2: 95.0,
+            x_udot: -18.0,
+            y_vdot: -140.0,
+            n_rdot: -80.0,
+            x_u: -35.0,
+            y_v: -220.0,
+            n_r: -110.0,
+        }
+    }
 
     /// With r = 0 the Euler step adds the same increment every tick, so the
     /// propagated state must match the closed-form straight line exactly
@@ -142,7 +197,7 @@ mod tests {
         let dt = 0.1;
         let steps = 100;
         for _ in 0..steps {
-            ekf.predict(dt);
+            ekf.predict(dt, &ProcessModel::ConstantVelocity, &zero_tau());
         }
 
         let t = dt * steps as f64;
@@ -153,6 +208,55 @@ mod tests {
         assert!(libm::fabs(ekf.x[2] - psi) < 1e-9);
         assert!(libm::fabs(ekf.x[3] - u) < 1e-12);
         assert!(libm::fabs(ekf.x[4] - v) < 1e-12);
+    }
+
+    /// tau = C(nu) nu + D nu makes steady nu a fixed point of the dynamics,
+    /// so the hydrodynamic predict must hold the velocity states exactly and
+    /// reduce to the constant-twist kinematics for position and heading.
+    #[test]
+    fn hydrodynamic_predict_holds_balanced_state() {
+        let p = seahorse();
+        let model = ProcessModel::Hydrodynamic(Fossen3Dof::new(&p).unwrap());
+        let (u, r) = (2.0, 0.05);
+        // v = 0: C(nu) nu = [0, m_u u r, 0], D nu = [-x_u u, 0, -n_r r].
+        let tau = ForceDemand {
+            surge_n: -p.x_u * u,
+            sway_n: (p.mass_kg - p.x_udot) * u * r,
+            yaw_nm: -p.n_r * r,
+        };
+        let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.0, 0.1);
+        ekf.x[3] = u;
+        ekf.x[5] = r;
+
+        for _ in 0..100 {
+            ekf.predict(0.1, &model, &tau);
+        }
+
+        assert!(libm::fabs(ekf.x[3] - u) < 1e-12);
+        assert!(libm::fabs(ekf.x[4]) < 1e-12);
+        assert!(libm::fabs(ekf.x[5] - r) < 1e-12);
+        assert!(libm::fabs(ekf.x[2] - r * 10.0) < 1e-9);
+    }
+
+    /// Unforced, the damped dynamics must pull the velocity states toward
+    /// zero; the constant-velocity model must leave them alone.
+    #[test]
+    fn hydrodynamic_predict_decays_unforced_velocity() {
+        let model = ProcessModel::Hydrodynamic(Fossen3Dof::new(&seahorse()).unwrap());
+        let mut hydro = Ekf::init(0.0, 0.0, 1.0, 0.0, 0.1);
+        hydro.x[3] = 2.0;
+        let mut cv = hydro;
+
+        for _ in 0..100 {
+            hydro.predict(0.1, &model, &zero_tau());
+            cv.predict(0.1, &ProcessModel::ConstantVelocity, &zero_tau());
+        }
+
+        // Surge time constant is (m - x_udot) / -x_u = 6.51 s; after 10 s
+        // roughly a fifth of the initial speed remains.
+        assert!(hydro.x[3] < 0.5, "surge did not decay: {}", hydro.x[3]);
+        assert!(hydro.x[3] > 0.0);
+        assert!(libm::fabs(cv.x[3] - 2.0) < 1e-12);
     }
 
     /// Filter near +pi, measurement near -pi: the update must move psi the

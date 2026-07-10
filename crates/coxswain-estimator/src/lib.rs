@@ -3,18 +3,21 @@
 #![no_std]
 
 mod ekf;
-mod frame;
 
-pub use frame::LocalFrame;
+// The tangent frame lives in coxswain-model since both the estimator and the
+// simulator anchor the model's local NED state to geodetic truth (D-020).
+pub use coxswain_model::LocalFrame;
 
 use core::time::Duration;
 
 use coxswain_contract::{
-    BodyVelocity, BoundedList, EstimatorHealth, HealthLevel, License, Measurement, MeasurementKind,
-    Pose, SensorConfig, SensorId, Timestamp, VesselConfig, VesselState,
+    ActuatorCommand, BodyVelocity, BoundedList, EstimatorHealth, ForceDemand, HealthLevel, License,
+    Measurement, MeasurementKind, ModelParams, Pose, SensorConfig, SensorId, Timestamp,
+    VesselConfig, VesselState,
 };
+use coxswain_model::Fossen3Dof;
 
-use ekf::Ekf;
+use ekf::{Ekf, ProcessModel};
 
 /// Why a measurement was refused. `UnknownSensor`: not in the matching fusion
 /// list, or no sensor entry at all. `NotLicensed`: listed, but the license is
@@ -61,10 +64,17 @@ pub struct Estimator {
     init_pos_std_m: Option<f64>,
     init_heading: Option<(f64, f64)>,
     filter: Option<Filter>,
+    process: ProcessModel,
+    // Latest force demand; zero until the first command arrives.
+    tau: ForceDemand,
 }
 
 impl Estimator {
-    /// Copies the fusion lists and per-sensor max_age out of the config.
+    /// Copies the fusion lists and per-sensor max_age out of the config and
+    /// selects the process model. Bad Fossen params (non-positive inertia)
+    /// fall back to constant velocity: hand-built configs must still yield a
+    /// working estimator, rejection of bad params is the manifest compiler's
+    /// job (Phase 5).
     pub fn new(config: &VesselConfig) -> Self {
         let min_age = |list: &BoundedList<SensorId, 4>| {
             config
@@ -73,6 +83,13 @@ impl Estimator {
                 .filter(|s| s.license == License::InnerLoop && list.contains(&s.id))
                 .map(|s| s.max_age)
                 .min()
+        };
+        let process = match &config.estimator.model {
+            ModelParams::ConstantVelocity => ProcessModel::ConstantVelocity,
+            ModelParams::Fossen3Dof(params) => match Fossen3Dof::new(params) {
+                Ok(model) => ProcessModel::Hydrodynamic(model),
+                Err(_) => ProcessModel::ConstantVelocity,
+            },
         };
         Self {
             gnss_max_age: min_age(&config.estimator.gnss),
@@ -90,7 +107,21 @@ impl Estimator {
             init_pos_std_m: None,
             init_heading: None,
             filter: None,
+            process,
+            tau: ForceDemand {
+                surge_n: 0.0,
+                sway_n: 0.0,
+                yaw_nm: 0.0,
+            },
         }
+    }
+
+    /// Latest force demand for the hydrodynamic prior; tau is treated as
+    /// piecewise constant between predicts. Command timestamps are not
+    /// fused: the filter never rewinds to apply a demand at its stamped
+    /// time. Harmless no-op under the constant-velocity model.
+    pub fn command(&mut self, cmd: &ActuatorCommand) {
+        self.tau = cmd.demand;
     }
 
     /// Predict to m.t, then update. Rejects measurements from sensors not in
@@ -112,9 +143,11 @@ impl Estimator {
 
         match &mut self.filter {
             Some(filter) => {
-                filter
-                    .ekf
-                    .predict(m.t.saturating_duration_since(filter.t).as_secs_f64());
+                filter.ekf.predict(
+                    m.t.saturating_duration_since(filter.t).as_secs_f64(),
+                    &self.process,
+                    &self.tau,
+                );
                 filter.t = m.t;
                 match m.kind {
                     MeasurementKind::GnssPosition { position, std_m } => {
@@ -181,7 +214,11 @@ impl Estimator {
         let frame = self.frame.as_ref()?;
         let t = now.max(filter.t);
         let mut ekf = filter.ekf;
-        ekf.predict(t.saturating_duration_since(filter.t).as_secs_f64());
+        ekf.predict(
+            t.saturating_duration_since(filter.t).as_secs_f64(),
+            &self.process,
+            &self.tau,
+        );
 
         let mut covariance = [[0.0; 6]; 6];
         for (i, row) in covariance.iter_mut().enumerate() {
@@ -224,7 +261,11 @@ impl Estimator {
             },
             Some(filter) => {
                 let mut ekf = filter.ekf;
-                ekf.predict(now.saturating_duration_since(filter.t).as_secs_f64());
+                ekf.predict(
+                    now.saturating_duration_since(filter.t).as_secs_f64(),
+                    &self.process,
+                    &self.tau,
+                );
                 let level = if gnss_stale || heading_stale || yaw_rate_stale {
                     HealthLevel::Degraded
                 } else {
@@ -305,7 +346,7 @@ mod tests {
             ])
             .unwrap(),
             estimator: EstimatorConfig {
-                // Coefficients are unused by the constant-velocity filter.
+                // Seahorse coefficients from docs/manifest-schema.md.
                 model: ModelParams::Fossen3Dof(Fossen3DofParams {
                     mass_kg: 210.0,
                     izz_kg_m2: 95.0,
@@ -403,6 +444,18 @@ mod tests {
         assert_eq!(est.handle(&fix), Err(Rejection::UnknownSensor));
 
         assert_eq!(est.state(ts(2.0)).unwrap(), before);
+    }
+
+    #[test]
+    fn bad_model_params_fall_back_to_constant_velocity() {
+        let mut cfg = config();
+        if let ModelParams::Fossen3Dof(ref mut p) = cfg.estimator.model {
+            p.mass_kg = -300.0; // non-positive inertia
+        }
+        let mut est = Estimator::new(&cfg);
+        est.handle(&gnss_at(1.0)).unwrap();
+        est.handle(&heading_at(1.2, COMPASS)).unwrap();
+        assert!(est.state(ts(2.0)).is_some());
     }
 
     #[test]

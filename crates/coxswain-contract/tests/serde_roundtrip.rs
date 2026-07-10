@@ -83,6 +83,15 @@ fn vessel_config_roundtrip() {
 }
 
 #[test]
+fn constant_velocity_model_roundtrip() {
+    let mut config = seahorse_config();
+    config.estimator.model = ModelParams::ConstantVelocity;
+    let json = serde_json::to_string(&config).unwrap();
+    let back: VesselConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, config);
+}
+
+#[test]
 fn vessel_state_roundtrip() {
     let mut covariance = [[0.0; 6]; 6];
     for (i, row) in covariance.iter_mut().enumerate() {

@@ -78,6 +78,10 @@ pub struct Fossen3DofParams {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ModelParams {
     Fossen3Dof(Fossen3DofParams),
+    /// Constant-velocity process model, no coefficients. The system
+    /// identification campaign is parked, so this fallback must stay
+    /// selectable per vessel.
+    ConstantVelocity,
 }
 
 /// Which model and which promoted sensors. The heading list is fusion

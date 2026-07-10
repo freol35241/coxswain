@@ -12,9 +12,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use coxswain_contract::{
-    BoundedList, ConnGrantDefault, EstimatorConfig, Fossen3DofParams, GeoPoint, GeofenceAction,
-    GeofenceConfig, License, Measurement, MeasurementKind, ModelParams, SensorConfig, SensorId,
-    SensorRole, SupervisorConfig, Timestamp, VesselConfig,
+    ActuatorCommand, BoundedList, ConnGrantDefault, EstimatorConfig, ForceDemand, Fossen3DofParams,
+    GeoPoint, GeofenceAction, GeofenceConfig, License, Measurement, MeasurementKind, ModelParams,
+    SensorConfig, SensorId, SensorRole, SupervisorConfig, Timestamp, VesselConfig,
 };
 use coxswain_estimator::LocalFrame;
 
@@ -270,6 +270,40 @@ pub fn merge(streams: Vec<Vec<Measurement>>) -> Vec<Measurement> {
 }
 
 // ---------------------------------------------------------------------------
+// Force demands for the hydrodynamic prior.
+
+/// tau that balances the Seahorse dynamics at the given steady nu:
+/// M nu_dot = tau - C(nu) nu - D nu, so tau = C(nu) nu + D nu makes nu a
+/// fixed point and the model coasts along the truth trajectory exactly.
+/// Closed form for the diagonal M and D of the Seahorse coefficients.
+pub fn balancing_tau(truth: &Truth) -> ForceDemand {
+    let p = seahorse_fossen_params();
+    let m_u = p.mass_kg - p.x_udot;
+    let m_v = p.mass_kg - p.y_vdot;
+    let (u, v, r) = (truth.u, truth.v, truth.r);
+    // C(nu) nu = [-m_v v r, m_u u r, (m_v - m_u) u v], D = -diag(x_u, y_v, n_r).
+    ForceDemand {
+        surge_n: -m_v * v * r - p.x_u * u,
+        sway_n: m_u * u * r - p.y_v * v,
+        yaw_nm: (m_v - m_u) * u * v - p.n_r * r,
+    }
+}
+
+/// Balancing tau sampled along the trajectory, first command one period in.
+pub fn sample_commands(
+    traj: &Trajectory,
+    window: (f64, f64),
+    rate_hz: f64,
+) -> Vec<ActuatorCommand> {
+    sample_times(window, rate_hz)
+        .map(|t| ActuatorCommand {
+            t: ts(t),
+            demand: balancing_tau(&traj.truth_at(t)),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Standard test config: Seahorse-like values, ids matching the samplers.
 
 fn sensor(id: SensorId, role: SensorRole, license: License, max_age_ms: u64) -> SensorConfig {
@@ -281,7 +315,22 @@ fn sensor(id: SensorId, role: SensorRole, license: License, max_age_ms: u64) -> 
     }
 }
 
-pub fn test_config() -> VesselConfig {
+/// Seahorse coefficients from docs/manifest-schema.md; also the source of
+/// truth for `balancing_tau`.
+pub fn seahorse_fossen_params() -> Fossen3DofParams {
+    Fossen3DofParams {
+        mass_kg: 210.0,
+        izz_kg_m2: 95.0,
+        x_udot: -18.0,
+        y_vdot: -140.0,
+        n_rdot: -80.0,
+        x_u: -35.0,
+        y_v: -220.0,
+        n_r: -110.0,
+    }
+}
+
+pub fn test_config(model: ModelParams) -> VesselConfig {
     VesselConfig {
         sensors: BoundedList::from_slice(&[
             sensor(GNSS_ID, SensorRole::Gnss, License::InnerLoop, 3_000),
@@ -298,18 +347,7 @@ pub fn test_config() -> VesselConfig {
         ])
         .unwrap(),
         estimator: EstimatorConfig {
-            // Seahorse coefficients from docs/manifest-schema.md; unused by
-            // the constant-velocity filter until Phase 3.
-            model: ModelParams::Fossen3Dof(Fossen3DofParams {
-                mass_kg: 210.0,
-                izz_kg_m2: 95.0,
-                x_udot: -18.0,
-                y_vdot: -140.0,
-                n_rdot: -80.0,
-                x_u: -35.0,
-                y_v: -220.0,
-                n_r: -110.0,
-            }),
+            model,
             gnss: BoundedList::from_slice(&[GNSS_ID]).unwrap(),
             imu: BoundedList::from_slice(&[GYRO_ID]).unwrap(),
             heading: BoundedList::from_slice(&[HEADING_ID, ENRICHMENT_HEADING_ID]).unwrap(),

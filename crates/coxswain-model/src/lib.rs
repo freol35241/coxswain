@@ -17,6 +17,10 @@
 
 #![no_std]
 
+mod frame;
+
+pub use frame::LocalFrame;
+
 use core::f64::consts::PI;
 
 use coxswain_contract::{ForceDemand, Fossen3DofParams};

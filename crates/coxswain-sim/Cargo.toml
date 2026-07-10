@@ -4,3 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+coxswain-contract = { path = "../coxswain-contract" }
+coxswain-model = { path = "../coxswain-model" }
+# Same nalgebra configuration as the rest of the workspace so the graph
+# resolves to one build of the crate, even though this crate is host-only.
+nalgebra = { version = "0.34", default-features = false, features = ["libm"] }
