@@ -4,3 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+coxswain-contract = { path = "../coxswain-contract" }
+# LocalFrame for the per-tick LOS geometry; same model crate the estimator
+# and simulator share (D-020).
+coxswain-model = { path = "../coxswain-model" }
+# no_std trig per CLAUDE.md.
+libm = "0.2"
+
+[dev-dependencies]
+# The closed-loop plant is the only honest test bench for guidance (D-020).
+coxswain-sim = { path = "../coxswain-sim" }
