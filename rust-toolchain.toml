@@ -1,0 +1,6 @@
+# Pinned so the devcontainer, CI, and any bare host build the same way.
+# Bump deliberately; the thumbv7em gate must stay green across bumps.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+targets = ["thumbv7em-none-eabihf"]

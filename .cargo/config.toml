@@ -1,0 +1,6 @@
+# Staged for the Phase 8 firmware bring-up. The no_std gate only builds
+# libs for this target and never links, so these settings stay inert
+# until then.
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip STM32H753ZITx"
+rustflags = ["-C", "linker=flip-link", "-C", "link-arg=-Tlink.x", "-C", "link-arg=--nmagic"]

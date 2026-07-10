@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml declares the toolchain, components, and the
+      # thumbv7em target; rustup show triggers the install up front so
+      # rust-cache keys on the pinned rustc, not the runner default.
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: >
+          cargo build --target thumbv7em-none-eabihf
+          -p coxswain-contract
+          -p coxswain-model
+          -p coxswain-estimator
+          -p coxswain-guidance
+          -p coxswain-supervisor
+          -p coxswain-manifest

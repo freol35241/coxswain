@@ -7,7 +7,11 @@
 	"features": {
 		"ghcr.io/devcontainers/features/docker-in-docker:4": {},
 		"ghcr.io/devcontainers-extra/features/claude-code:2": {}
-	}
+	},
+
+	// Installs the pinned toolchain and zenohd; the pins live in the script
+	// and in rust-toolchain.toml.
+	"postCreateCommand": "bash .devcontainer/postCreate.sh"
 
 	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
 	// "mounts": [
