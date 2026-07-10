@@ -6,7 +6,7 @@ Coxswain is a maritime-native vessel control and autonomy stack: the ArduPilot
 role rebuilt from marine first principles. Read docs/DECISIONS.md before writing
 any code; it records the settled architecture and the rationale. docs/TASKS.md
 holds the sequenced backlog. docs/manifest-schema.md is the draft vessel
-manifest schema (v0.1).
+manifest schema (v0.2).
 
 One line: ArduPilot is an autopilot that tolerates boats. Coxswain is a crew
 member.
@@ -77,7 +77,33 @@ member.
 3. DECISIONS.md updated if the task settled anything architectural
 4. No new dependency without a one-line justification in the PR/commit body
 
+## Working style
+
+- Surface assumptions before implementing; if the task is ambiguous, ask.
+  Minimal diffs: every changed line traces to the task at hand.
+- Verify at incremental complexity. Napkin-scale cases first, full scenarios
+  after. The replay harness and the simulator are the verification
+  instruments; build on them rather than mocking around them.
+- Alternatives discussion is bounded by DECISIONS.md. Settled entries are not
+  re-litigated in passing. A new architectural question becomes a proposed
+  entry and gets discussed before the code is written.
+
 ## Prose style for docs and comments
 
 Direct, dry, plain. No em-dashes. No management-book cadence, no marketing
 adjectives. Comments explain why, not what. Short files beat clever ones.
+Say each thing once and let the evidence carry the claim.
+
+## Lab diary
+
+A running lab diary is maintained at `diary/`. One markdown file per day. A
+file may contain multiple entries. Update it when:
+
+- A design decision is made or deferred
+- A modelling experiment is run and results are noted
+- A new component or idea is introduced
+- Something surprising is observed in the data or model behaviour
+
+Keep entries brief and dated. The diary is a thinking tool, not a polished
+document. Anything that settles architecture graduates to docs/DECISIONS.md;
+the diary keeps the trail that led there.
