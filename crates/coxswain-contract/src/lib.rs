@@ -12,6 +12,7 @@ mod geo;
 mod guidance;
 mod health;
 mod measurement;
+mod power;
 mod state;
 mod time;
 
@@ -21,10 +22,11 @@ pub use config::{
     ConnGrantDefault, EstimatorConfig, Fossen3DofParams, GeofenceAction, GeofenceConfig, License,
     ModelParams, SensorConfig, SensorId, SensorRole, SupervisorConfig, VesselConfig,
 };
-pub use conn::{ArmingState, ClaimantId, ConnState};
+pub use conn::{AUTONOMY, ArmingState, ClaimantId, ConnState};
 pub use geo::GeoPoint;
 pub use guidance::Setpoint;
 pub use health::{EstimatorHealth, HealthLevel};
 pub use measurement::{Measurement, MeasurementKind};
+pub use power::PowerStatus;
 pub use state::{BodyVelocity, Covariance, Pose, VesselState};
 pub use time::Timestamp;
