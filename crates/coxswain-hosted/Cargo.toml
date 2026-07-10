@@ -10,9 +10,19 @@ coxswain-contract = { path = "../coxswain-contract" }
 coxswain-estimator = { path = "../coxswain-estimator" }
 coxswain-guidance = { path = "../coxswain-guidance" }
 coxswain-supervisor = { path = "../coxswain-supervisor" }
+# The binary boots from a compiled blob; default features are the no_std
+# reader plus the hash, which is all it needs.
+coxswain-manifest = { path = "../coxswain-manifest" }
+# Keelson adapter at the process boundary (D-003, D-008).
+coxswain-keelson = { path = "../coxswain-keelson" }
+# This profile's I/O backend per TASKS Phase 5; real /dev ports are Phase 6.
+coxswain-sim = { path = "../coxswain-sim" }
+# Session construction only; same 1.9 line the keelson crate pins.
+zenoh = "1.9"
 
 [dev-dependencies]
 # Closed-loop scenario tests run the full loop against the simulator plant
 # (D-020); LocalFrame from coxswain-model does the test geometry.
 coxswain-model = { path = "../coxswain-model" }
-coxswain-sim = { path = "../coxswain-sim" }
+# The integration tests compile the Seahorse manifest themselves.
+coxswain-manifest = { path = "../coxswain-manifest", features = ["std"] }

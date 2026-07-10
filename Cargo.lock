@@ -375,9 +375,12 @@ dependencies = [
  "coxswain-contract",
  "coxswain-estimator",
  "coxswain-guidance",
+ "coxswain-keelson",
+ "coxswain-manifest",
  "coxswain-model",
  "coxswain-sim",
  "coxswain-supervisor",
+ "zenoh",
 ]
 
 [[package]]

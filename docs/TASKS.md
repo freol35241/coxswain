@@ -11,94 +11,94 @@ for time-to-water (D-021), not for the reference deployment.
 
 ## Phase 0: Scaffolding
 
-- [ ] Initialize Cargo workspace with crates per CLAUDE.md conventions
+- [x] Initialize Cargo workspace with crates per CLAUDE.md conventions
       (contract, model, estimator, guidance, supervisor, manifest, sim, hosted;
       empty driver and keelson crates as placeholders). Apache 2.0, README stub
       with the one-line positioning.
-- [ ] Verify devcontainer builds and postCreateCommand passes; fix version
+- [x] Verify devcontainer builds and postCreateCommand passes; fix version
       pins (rust channel, ZENOH_VERSION) against current releases.
-- [ ] CI green on the empty workspace: fmt, clippy, host tests, thumbv7em
+- [x] CI green on the empty workspace: fmt, clippy, host tests, thumbv7em
       gate on the core crates.
-- [ ] .cargo/config.toml for the firmware target (probe-rs runner, flip-link)
+- [x] .cargo/config.toml for the firmware target (probe-rs runner, flip-link)
       staged but unused until Phase 8.
 
 ## Phase 1: Contract
 
-- [ ] coxswain-contract: core types. Vessel state (3-DOF pose/velocity +
+- [x] coxswain-contract: core types. Vessel state (3-DOF pose/velocity +
       covariance), guidance setpoint, actuator command/feedback, health,
       arming state, conn state, claimant identity. no_std, serde-optional
       feature for host tooling. Keep it small; every addition is a review
       point.
-- [ ] coxswain-contract: the vessel config struct. This is the type
+- [x] coxswain-contract: the vessel config struct. This is the type
       coxswain-manifest later compiles onto (D-022). Estimator and supervisor
       consume the struct and never the TOML, so both are testable with
       hand-built values long before the manifest compiler exists.
 
 ## Phase 2: Estimation on replay
 
-- [ ] Replay harness first: feed timestamped sensor streams (synthetic
+- [x] Replay harness first: feed timestamped sensor streams (synthetic
       generators + recorded-log reader) into the estimator, assert on state
       trajectories. This is the estimator's development environment; invest
       here.
-- [ ] coxswain-estimator: constant-velocity model, GNSS + IMU + heading fusion
+- [x] coxswain-estimator: constant-velocity model, GNSS + IMU + heading fusion
       per config licensing, staleness handling per declared bounds,
       covariance-based health output. The hydrodynamic prior lands in Phase 3
       once the model crate exists; do not block on it.
-- [ ] Replay cases regression-locked in CI. Every later estimator change
+- [x] Replay cases regression-locked in CI. Every later estimator change
       arrives with one.
 
 ## Phase 3: Model and plant simulator
 
-- [ ] coxswain-model: Fossen 3-DOF. no_std, no alloc, nalgebra. One crate, two
+- [x] coxswain-model: Fossen 3-DOF. no_std, no alloc, nalgebra. One crate, two
       consumers (D-020): the estimator's process model and the simulator's
       plant. Coefficients are the parameter struct from the manifest schema.
-- [ ] coxswain-estimator: promote from constant-velocity to the hydrodynamic
+- [x] coxswain-estimator: promote from constant-velocity to the hydrodynamic
       prior on the shared model. Replay cases must not regress.
-- [ ] coxswain-sim (host-only): plant integration on coxswain-model, plus
+- [x] coxswain-sim (host-only): plant integration on coxswain-model, plus
       sensor models (noise, latency, dropout, quantization) that emit contract
       types indistinguishable from a driver's.
-- [ ] Fault injection in the simulator: GNSS loss, heading disagreement,
+- [x] Fault injection in the simulator: GNSS loss, heading disagreement,
       claimant silence, voltage sag, geofence breach. These are the inputs the
       failsafe matrix is tested against in Phase 4.
 
 ## Phase 4: Guidance and supervisor, closed loop
 
-- [ ] coxswain-guidance: LOS path following, waypoint sequencing, speed
+- [x] coxswain-guidance: LOS path following, waypoint sequencing, speed
       control, station-keeping. Closed against the simulator, which is the only
       place these are testable at all (D-020).
-- [ ] coxswain-supervisor: conn/claimant state machine (register, request,
+- [x] coxswain-supervisor: conn/claimant state machine (register, request,
       grant, revoke, heartbeat staleness), arming logic, failsafe matrix v1
       (position degraded, claimant lost, low/critical voltage, geofence hold)
       with defined degraded behaviors. Exhaustive state machine tests; this
       crate earns trust through tests, not review.
-- [ ] Wire the three services in-process with channels behind contract types;
+- [x] Wire the three services in-process with channels behind contract types;
       deterministic tick driver for tests.
-- [ ] Closed-loop scenario tests: each failsafe behavior asserted against
+- [x] Closed-loop scenario tests: each failsafe behavior asserted against
       simulated trajectories, not against a mocked plant response.
 
 ## Phase 5: Manifest, Keelson, MVP exit
 
-- [ ] coxswain-manifest: schema per docs/manifest-schema.md v0.2. TOML parse
+- [x] coxswain-manifest: schema per docs/manifest-schema.md v0.2. TOML parse
       (std feature), validation (bus references, license subset rules, role
       license caps (AIS), port uniqueness, network-bus segment/pinning rules,
       params shape against the model discriminant, geofence ring validity),
       compile to postcard blob with CRC + ed25519 signature + schema version,
       no_std reader for the blob. Compiles onto the Phase 1 config struct.
-- [ ] Host tool (bin in coxswain-manifest): validate + compile + sign + hash.
+- [x] Host tool (bin in coxswain-manifest): validate + compile + sign + hash.
       Hash algorithm chosen and recorded in DECISIONS.md.
-- [ ] Golden-file tests: the Seahorse example manifest from the schema doc
+- [x] Golden-file tests: the Seahorse example manifest from the schema doc
       compiles, plus rejection cases for every validation rule and for a bad
       signature.
-- [ ] coxswain-keelson: publish raw + fused sensor streams, health, conn state
+- [x] coxswain-keelson: publish raw + fused sensor streams, health, conn state
       under Keelson conventions. Manifest hash + revision in health from the
       first heartbeat.
-- [ ] Claimant-over-Keelson: teleoperation client as first remote claimant,
+- [x] Claimant-over-Keelson: teleoperation client as first remote claimant,
       exercising the supervisor grant flow end to end.
-- [ ] coxswain-hosted: the Linux binary. Manifest from file, simulator as the
+- [x] coxswain-hosted: the Linux binary. Manifest from file, simulator as the
       I/O backend, zenoh session up.
-- [ ] Integration test: hosted profile + zenohd + scripted claimant, full
+- [x] Integration test: hosted profile + zenohd + scripted claimant, full
       grant/revoke/failsafe scenario in CI.
-- [ ] D-008 test: kill zenohd mid-scenario. Assert the vessel holds station,
+- [x] D-008 test: kill zenohd mid-scenario. Assert the vessel holds station,
       the supervisor never yields the conn, and the control loop misses no tick
       deadline (a generous fixed bound; jitter comparisons are flaky on shared
       runners). The failure story is a claim; make it an assertion.
