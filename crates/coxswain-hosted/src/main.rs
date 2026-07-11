@@ -58,10 +58,9 @@ const NMEA0183_HEADING_STD_RAD: f64 = 0.02;
 
 // RC and the actuator link are conn-node-local serial (`Args` doc comment),
 // with no manifest bus to carry a baud, so the profile fixes one. CRSF's
-// real link runs 420000 baud, which is not a POSIX `Bxxxx` rate (see
-// serial.rs); the request is issued anyway and silently not honored by
-// `serial::open_serial`; real hardware bring-up needing the exact rate is
-// tracked there, not solved here.
+// real link runs 420000 baud, which is not a POSIX `Bxxxx` rate; on Linux
+// `serial::open_serial` reaches for termios2/BOTHER to hit it exactly (see
+// serial.rs).
 const RC_BAUD_HINT: u32 = 420_000;
 const ACTUATOR_BAUD: u32 = 115_200;
 

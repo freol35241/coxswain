@@ -17,7 +17,8 @@ procurement shortlist.
 - Actuator command out: one `$CXACT,<surge_n>,<sway_n>,<yaw_nm>*HH` line
   per 100 ms control tick over UART. The far end must fail safe on
   silence (recommended: zero thrust after 500 ms without a valid line).
-- Hosted profile serial: standard POSIX bauds via termios. See gaps.
+- Hosted profile serial: standard POSIX bauds via termios; on Linux, any
+  other exact rate (CRSF's 420000, notably) via termios2/BOTHER.
 
 ## What first water requires (from the 2026-07-10 replay experiment)
 
@@ -57,9 +58,9 @@ ordering anything.
 
 ## Known gaps before real hardware
 
-- CRSF runs at 420000 baud; the hosted termios path sets standard POSIX
-  bauds only. Needs termios2/BOTHER (flagged in code, Phase 6 backlog).
-  Ptys ignore baud, so the desk rig does not catch this.
+- Closed: CRSF's 420000 baud is not a POSIX `Bxxxx` rate; the hosted
+  termios path now falls back to Linux's termios2/BOTHER ioctl pair for
+  any rate outside that table (coxswain-hosted/src/serial.rs).
 - No power monitoring input path in real-serial mode; the failsafe
   matrix currently sees a healthy default. Must be closed before any
   armed on-water operation.
