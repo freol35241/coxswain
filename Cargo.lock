@@ -382,13 +382,17 @@ name = "coxswain-hosted"
 version = "0.1.0"
 dependencies = [
  "coxswain-contract",
+ "coxswain-crsf",
+ "coxswain-drivers",
  "coxswain-estimator",
  "coxswain-guidance",
  "coxswain-keelson",
  "coxswain-manifest",
  "coxswain-model",
+ "coxswain-nmea0183",
  "coxswain-sim",
  "coxswain-supervisor",
+ "libc",
  "zenoh",
 ]
 

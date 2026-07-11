@@ -15,10 +15,22 @@ coxswain-supervisor = { path = "../coxswain-supervisor" }
 coxswain-manifest = { path = "../coxswain-manifest" }
 # Keelson adapter at the process boundary (D-003, D-008).
 coxswain-keelson = { path = "../coxswain-keelson" }
-# This profile's I/O backend per TASKS Phase 5; real /dev ports are Phase 6.
+# This profile's I/O backend per TASKS Phase 5; real /dev ports (below) are
+# Phase 6, and sim stays the default (D-020: a core artifact, not superseded).
 coxswain-sim = { path = "../coxswain-sim" }
+# GNSS-over-0183, RC, and actuator-serial drivers this profile wires to real
+# ports (Phase 6: "coxswain-hosted on real /dev ports").
+coxswain-drivers = { path = "../coxswain-drivers" }
+# Byte-to-CRSF-frame assembly for the real RC port.
+coxswain-crsf = { path = "../coxswain-crsf" }
+# Only for the `Quirks` type `coxswain-drivers::gnss0183::Config` takes;
+# already pulled in transitively via coxswain-drivers.
+coxswain-nmea0183 = { path = "../coxswain-nmea0183" }
 # Session construction only; same 1.9 line the keelson crate pins.
 zenoh = "1.9"
+# Raw termios for real serial ports (serial.rs); already a transitive
+# dependency via zenoh, promoted to direct since this crate now calls it.
+libc = "0.2"
 
 [dev-dependencies]
 # Closed-loop scenario tests run the full loop against the simulator plant

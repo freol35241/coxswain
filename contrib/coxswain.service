@@ -1,0 +1,42 @@
+# systemd unit example for coxswain-hosted on a conn node (Phase 6).
+#
+# Deliberately no `After=network.target` / `Wants=network-online.target`:
+# per invariant 1 (CLAUDE.md), the vessel senses, decides, and actuates with
+# nothing above the conn node alive, so control must not wait on, or depend
+# on, the network coming up. Keelson/zenoh (--connect/--listen below) is
+# enrichment; its absence at boot is not a startup failure.
+#
+# Placeholders below (manifest path, pubkey, --port bus=device mappings, RC
+# and actuator device paths) are per-vessel commissioning data, filled in
+# when the unit is installed, not shipped as-is.
+
+[Unit]
+Description=Coxswain vessel control and autonomy stack
+# No After=/Requires=/Wants= on networking: see the comment above.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/coxswain-hosted \
+    --manifest /etc/coxswain/vessel.cxmanifest \
+    --pubkey /etc/coxswain/vessel.pubkey \
+    --port gnss_serial=/dev/ttyUSB0 \
+    --rc-port /dev/ttyUSB1 --rc-claimant-id 1 \
+    --actuator-port /dev/ttyUSB2
+    # --connect tcp/<companion-computer>:7447   # Keelson/zenoh, optional
+
+# The control loop is the vessel's safety-critical process: if it dies,
+# restart it immediately rather than leaving the vessel unattended. This is
+# not a substitute for the conn node's own hardware watchdog (manifest
+# conn_node.watchdog_ms), which covers the case where the process is alive
+# but wedged; systemd only covers the process dying outright.
+Restart=always
+RestartSec=1
+
+# Optional: have systemd itself watch a liveness ping if/when the binary
+# grows sd_notify(WATCHDOG=1) support (it does not yet). Uncomment both
+# lines together; a WatchdogSec with no pings from the process just kills it
+# on schedule.
+# WatchdogSec=5
+
+[Install]
+WantedBy=multi-user.target
