@@ -17,6 +17,12 @@ procurement shortlist.
 - Actuator command out: one `$CXACT,<surge_n>,<sway_n>,<yaw_nm>*HH` line
   per 100 ms control tick over UART. The far end must fail safe on
   silence (recommended: zero thrust after 500 ms without a valid line).
+- Power report in, same UART, reverse direction: the far end sends
+  `$CXPWR,<voltage_v>*HH`, recommended 1 Hz, from an INA2xx-class monitor
+  on the actuator MCU. Command-then-report lite ahead of Cyphal
+  (D-021, D-010); the parser ignores any other traffic on the wire
+  (an echoed `$CXACT`, say), so nothing further is required of the far
+  end beyond emitting the line.
 - Hosted profile serial: standard POSIX bauds via termios; on Linux, any
   other exact rate (CRSF's 420000, notably) via termios2/BOTHER.
 
@@ -33,10 +39,10 @@ procurement shortlist.
    and drives the vessel's ESC/servo hardware, failing safe on silence.
    This is the one piece of custom far-end firmware in the bring-up
    path; the Phase 9 actuator node replaces it.
-4. Power monitoring reaching the failsafe matrix. No input path exists
-   in the hosted real-serial mode yet (see gaps); decide the mechanism
-   on the bench (candidates: an INA2xx-class monitor read by the
-   actuator MCU and reported back, or a separate sensor line).
+4. Power monitoring reaching the failsafe matrix: the actuator far end
+   measures the battery (INA2xx-class monitor) and reports
+   `$CXPWR,<voltage_v>*HH` at about 1 Hz back on the actuator serial
+   link. The input path exists; the far-end firmware owns the reading.
 5. A Linux computer as the conn node for the hosted profile (Raspberry
    Pi 4/5 class or any industrial equivalent) with USB-serial adapters,
    or onboard UARTs. The NUCLEO-H753ZI enters at Phase 8, not first
@@ -61,9 +67,11 @@ ordering anything.
 - Closed: CRSF's 420000 baud is not a POSIX `Bxxxx` rate; the hosted
   termios path now falls back to Linux's termios2/BOTHER ioctl pair for
   any rate outside that table (coxswain-hosted/src/serial.rs).
-- No power monitoring input path in real-serial mode; the failsafe
-  matrix currently sees a healthy default. Must be closed before any
-  armed on-water operation.
+- Closed: power monitoring input path in real-serial mode. `$CXPWR`
+  reports on the actuator link's reverse direction now feed the failsafe
+  matrix (coxswain-drivers/src/actuator_serial.rs); the healthy default
+  applies only until the first report arrives. Report staleness (what
+  happens if reports stop) is not handled and remains an open item.
 - RC and actuator serial links are CLI options, not manifest buses;
   promoting them into the schema is an open item recorded in the code.
 - Baud for the GNSS bus comes from the manifest bus entry; confirm the

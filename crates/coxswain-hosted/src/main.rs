@@ -22,7 +22,7 @@ use coxswain_contract::{
     Setpoint, Timestamp, VesselState,
 };
 use coxswain_crsf::{FrameReader, ParseOutcome};
-use coxswain_drivers::actuator_serial::ActuatorSerialDriver;
+use coxswain_drivers::actuator_serial::{ActuatorSerialDriver, PowerReportReader};
 use coxswain_drivers::gnss0183::{self, Gnss0183Driver};
 use coxswain_drivers::rc::{self, RcAdapter};
 use coxswain_hosted::{ArmError, ClaimError, Core, TickOutput};
@@ -620,13 +620,27 @@ fn run() -> Result<(), String> {
         }
         _ => None,
     };
-    let mut actuator_port = match &args.actuator_port {
-        Some(path) => {
-            Some(serial::open_serial(path, ACTUATOR_BAUD).map_err(|e| format!("{path}: {e}"))?)
-        }
-        None => None,
-    };
+    // The actuator link is bidirectional (D-021 "command-then-report
+    // lite"): `port` stays open for `write_demand`, and a `try_clone`
+    // duplicates the fd for a reader thread on the same pattern as the GNSS
+    // and RC links (`spawn_byte_reader`'s own doc comment), draining the
+    // far end's $CXPWR reports.
+    let mut actuator_port = None;
+    let mut actuator_rx = None;
+    if let Some(path) = &args.actuator_port {
+        let port = serial::open_serial(path, ACTUATOR_BAUD).map_err(|e| format!("{path}: {e}"))?;
+        let reader_handle = port
+            .try_clone()
+            .map_err(|e| format!("{path}: clone for the power-report reader: {e}"))?;
+        actuator_rx = Some(spawn_byte_reader(reader_handle, boot));
+        actuator_port = Some(port);
+    }
     let actuator_driver = ActuatorSerialDriver::new();
+    let mut power_reader = PowerReportReader::new();
+    // Flips true on the first $CXPWR report so the boot-default-to-measured
+    // transition logs exactly once (see the ingestion block below); the
+    // default itself lives in `Core::new` and needs no change here.
+    let mut power_report_received = false;
 
     let mut core = Core::new(&manifest.config);
     // Register the RC claimant at boot with its manifest-authored id (the
@@ -658,9 +672,10 @@ fn run() -> Result<(), String> {
     // either way it must not stop the loop, so one line covers both.
     let mut ingest_error_logged = false;
     // One more single-shot log line, shared by every real-driver error path
-    // (0183 parse failures, CRSF frame failures, a non-finite actuator
-    // demand): same "log the first, keep going" doctrine as `publish` and
-    // `ingest_error_logged` above, just for the ports this profile now owns.
+    // (0183 parse failures, CRSF frame failures, a rejected power report, a
+    // non-finite actuator demand): same "log the first, keep going"
+    // doctrine as `publish` and `ingest_error_logged` above, just for the
+    // ports this profile now owns.
     let mut driver_error_logged = false;
 
     let mut tick: u64 = 0;
@@ -767,6 +782,37 @@ fn run() -> Result<(), String> {
                     }
                     Some(Err(e)) if !driver_error_logged => {
                         eprintln!("coxswain-hosted: CRSF frame rejected (continuing): {e:?}");
+                        driver_error_logged = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Real power reports: the actuator link's reverse direction
+        // (coxswain-drivers::actuator_serial's module doc comment), drained
+        // the same way as the other real-driver byte streams above and fed
+        // into the core exactly where the sim backend feeds its voltage.
+        // No staleness handling here: if reports stop, `core.power` simply
+        // keeps holding the last good value (Core::power's own latest-wins
+        // doc comment); that is a deliberate open item, not an oversight,
+        // left for its own failsafe-matrix decision rather than invented
+        // here.
+        if let Some(rx) = &actuator_rx {
+            while let Ok((byte, acquired_at)) = rx.try_recv() {
+                match power_reader.push(byte, acquired_at) {
+                    Some(Ok(status)) => {
+                        if !power_report_received {
+                            eprintln!(
+                                "coxswain-hosted: first power report received ({:.1} V)",
+                                status.voltage_v
+                            );
+                            power_report_received = true;
+                        }
+                        core.power(status);
+                    }
+                    Some(Err(e)) if !driver_error_logged => {
+                        eprintln!("coxswain-hosted: power report rejected (continuing): {e:?}");
                         driver_error_logged = true;
                     }
                     _ => {}

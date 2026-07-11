@@ -51,8 +51,27 @@
 //! is written to the sink; upstream guards (guidance, supervisor) should
 //! make a non-finite demand unreachable, so this is defense at the last
 //! boundary, not the primary guard.
+//!
+//! ## Power reports: the reverse direction of the same link
+//!
+//! The actuator MCU is where an INA2xx-class monitor lives (docs/
+//! hardware.md); it reports bus voltage back on the same wire, the far
+//! end's half of command-then-report lite ahead of Cyphal (D-021, D-010).
+//! One line per report:
+//!
+//! ```text
+//! $CXPWR,<voltage_v>*HH\r\n
+//! ```
+//!
+//! Same shape as `$CXACT`: `CXPWR` is talker `CX`, sentence id `PWR`, `HH`
+//! the standard XOR checksum over every byte between `$` and `*`. One
+//! decimal digit is the recommendation for the far end, not something this
+//! parser enforces (see `PowerReportReader`); recommended report rate is
+//! 1 Hz, but the far end owns the rate and the parser does not care.
+//! `PowerReportReader` is the push-based reader for this direction, the
+//! same shape as `write_demand` is for the outgoing one.
 
-use coxswain_contract::{ForceDemand, Timestamp};
+use coxswain_contract::{ForceDemand, PowerStatus, Timestamp};
 
 use crate::Driver;
 
@@ -168,6 +187,215 @@ impl Driver for ActuatorSerialDriver {
         _acquired_at: Timestamp,
     ) -> Result<Self::Reading, Self::Error> {
         Err(Error::TransmitOnly)
+    }
+}
+
+/// Errors `PowerReportReader::push` can surface for a line whose address
+/// matched `CXPWR`. A line whose address does *not* match is not an error
+/// at all; see `PowerReportReader`'s doc comment for why.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PowerError {
+    /// `*hh` missing, malformed, or not matching the payload's XOR fold.
+    BadChecksum,
+    /// The voltage field did not parse as a number, or parsed to something
+    /// unusable as a bus voltage: NaN, +-infinity (both valid `f64` textual
+    /// forms per `core::str::FromStr`, so parsing alone would not catch
+    /// them), or negative.
+    InvalidVoltage,
+}
+
+/// Longest line this reader keeps before giving up on it as unrecognized
+/// (module doc comment on why "unrecognized" is not an error): generous
+/// versus any real `$CXPWR,<voltage>*HH` line (well under 20 bytes for any
+/// voltage a small vessel's DC bus would ever report), and comfortably past
+/// `ActuatorSerialDriver::MAX_LINE_LEN` (41, this module's own worst-case
+/// `$CXACT` line without its `\r\n`) so a full echoed `$CXACT` is captured
+/// intact and skipped by its address, not truncated into a false read.
+const MAX_POWER_LINE_LEN: usize = 48;
+
+/// `$CXPWR`'s five-character address, `TTSSS` shape (talker `CX`, sentence
+/// id `PWR`), same convention `$CXACT` documents at the top of this module.
+const CXPWR_ADDRESS: [u8; 5] = *b"CXPWR";
+
+/// Push-based reader for `$CXPWR` reports arriving on the actuator link:
+/// the reverse direction of `$CXACT` (module doc comment). Byte-fed and
+/// pure, same shape as `coxswain_nmea0183::SentenceReader` and
+/// `gnss0183::Gnss0183Driver::push`: no UART, no clock, no allocation.
+///
+/// ## Why this is not `coxswain_nmea0183::SentenceReader`
+///
+/// `SentenceReader` frames and checksum-verifies a line, then dispatches on
+/// a fixed, private set of sentence types (`GGA`/`RMC`/`HDT`/`VTG`); an
+/// address it does not recognize -- `CXPWR` included -- comes back as
+/// `ParseError::UnsupportedSentence` with the field body already discarded
+/// (this module's own write-path tests rely on exactly that to cross-check
+/// `$CXACT`'s checksum). There is no hook to reach the voltage field even
+/// after the checksum passes, short of forking that crate to teach it a
+/// sentence type that belongs to this point-to-point link, not to a
+/// general-purpose 0183 bus. `SentenceReader` also checksum-verifies
+/// *before* it knows the address, which would surface a `ChecksumMismatch`
+/// for any garbled byte on the wire, including traffic this link does not
+/// care about (see below). A small, self-contained accumulator here,
+/// mirroring `SentenceReader`'s framing but stopping only for `CXPWR`, is
+/// the smaller and more honest fix than reshaping a shared parser crate for
+/// one caller.
+///
+/// ## Unknown addresses are quiet, unlike the GNSS path
+///
+/// The GNSS 0183 path surfaces framing and checksum failures as errors
+/// because it tolerates an external, uncontrolled bus (manifest quirk
+/// flags exist for exactly that case). This link is ours end to end: the
+/// far end is the actuator firmware this repo specifies, its only other
+/// traffic is an echo of the `$CXACT` lines we sent it, and the only
+/// consumer here is the voltage. So a line whose address is not `CXPWR`
+/// -- an echo, noise, anything else -- is skipped without an error, the
+/// same treatment `SentenceReader` already gives bytes before the first
+/// `$`.
+pub struct PowerReportReader {
+    buf: [u8; MAX_POWER_LINE_LEN],
+    len: usize,
+    /// `true` once a `$` has been seen and not yet terminated; mirrors
+    /// `coxswain_nmea0183::SentenceReader`'s own field of the same name and
+    /// purpose.
+    active: bool,
+}
+
+impl PowerReportReader {
+    pub fn new() -> Self {
+        Self {
+            buf: [0; MAX_POWER_LINE_LEN],
+            len: 0,
+            active: false,
+        }
+    }
+
+    /// Feed one byte, acquired at `acquired_at` (driver-crate timestamping
+    /// policy: the byte's capture instant, caller-injected, never a clock
+    /// read here, same as `Gnss0183Driver::push`). `Some` exactly when a
+    /// line terminator ends a `$CXPWR` line: `Ok` with the parsed report,
+    /// `Err` once the address matched but something inside the line was
+    /// wrong. Any other line -- an echoed `$CXACT`, noise, a line that
+    /// outgrows the buffer before a terminator -- resolves to `None`
+    /// (this type's own doc comment on why unknown addresses are quiet
+    /// here).
+    pub fn push(
+        &mut self,
+        byte: u8,
+        acquired_at: Timestamp,
+    ) -> Option<Result<PowerStatus, PowerError>> {
+        match byte {
+            b'$' => {
+                // A fresh `$` always resyncs, even mid-line, same rationale
+                // as `coxswain_nmea0183::SentenceReader`: the UART gives no
+                // framing of its own, so a stray `$` is the only
+                // trustworthy boundary marker.
+                self.buf[0] = b'$';
+                self.len = 1;
+                self.active = true;
+                None
+            }
+            b'\r' | b'\n' => {
+                if !self.active {
+                    return None; // stray terminator between lines
+                }
+                self.active = false;
+                let len = self.len;
+                self.len = 0;
+                parse_power_line(&self.buf[..len], acquired_at)
+            }
+            _ => {
+                if !self.active {
+                    return None; // noise before the next '$'
+                }
+                if self.len >= MAX_POWER_LINE_LEN {
+                    // Nothing this reader cares about is ever this long
+                    // (`MAX_POWER_LINE_LEN`'s own derivation); resync
+                    // quietly rather than erroring, the same treatment any
+                    // other unrecognized line gets.
+                    self.active = false;
+                    self.len = 0;
+                    return None;
+                }
+                self.buf[self.len] = byte;
+                self.len += 1;
+                None
+            }
+        }
+    }
+}
+
+impl Default for PowerReportReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parses one accumulated line (`line[0] == '$'`, no terminator, the
+/// invariant `PowerReportReader::push` already established before calling
+/// this). `None` if the address is not `CXPWR` (quietly not ours, this
+/// type's own doc comment); `Some(Err(_))` once the address matched but the
+/// checksum or the voltage field did not.
+fn parse_power_line(
+    line: &[u8],
+    acquired_at: Timestamp,
+) -> Option<Result<PowerStatus, PowerError>> {
+    let body = line.strip_prefix(b"$")?;
+    let comma = body.iter().position(|&b| b == b',')?;
+    let (address, after_address) = body.split_at(comma);
+    if address != CXPWR_ADDRESS {
+        return None; // not ours: quietly ignored (type doc comment)
+    }
+    let rest = &after_address[1..]; // drop the comma split_at left in place
+
+    let Some(star) = rest.iter().rposition(|&b| b == b'*') else {
+        return Some(Err(PowerError::BadChecksum));
+    };
+    let (field, hex) = (&rest[..star], &rest[star + 1..]);
+    if hex.len() != 2 {
+        return Some(Err(PowerError::BadChecksum));
+    }
+    let (Some(hi), Some(lo)) = (hex_val(hex[0]), hex_val(hex[1])) else {
+        return Some(Err(PowerError::BadChecksum));
+    };
+    let expected = (hi << 4) | lo;
+    // Fold covers address+comma+field, `$` and `*hh` excluded: the same
+    // span `coxswain-nmea0183`'s own checksum fold covers, and the span
+    // `write_demand`'s checksum above covers for the outgoing direction.
+    let actual = address
+        .iter()
+        .chain(core::iter::once(&b','))
+        .chain(field)
+        .fold(0u8, |acc, &b| acc ^ b);
+    if actual != expected {
+        return Some(Err(PowerError::BadChecksum));
+    }
+
+    let Ok(text) = core::str::from_utf8(field) else {
+        return Some(Err(PowerError::InvalidVoltage));
+    };
+    let Ok(voltage_v) = text.parse::<f64>() else {
+        return Some(Err(PowerError::InvalidVoltage));
+    };
+    // Non-finite (NaN/+-infinity all parse cleanly per `f64::FromStr`) and
+    // negative are both garbage for a bus voltage; the supervisor's own
+    // non-finite guard (coxswain-supervisor) is the backstop, not the
+    // primary defense, so this rejects both at the source.
+    if !voltage_v.is_finite() || voltage_v < 0.0 {
+        return Some(Err(PowerError::InvalidVoltage));
+    }
+
+    Some(Ok(PowerStatus {
+        t: acquired_at,
+        voltage_v,
+    }))
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
     }
 }
 
@@ -369,5 +597,140 @@ mod tests {
             driver.read_with_timestamp(Timestamp::from_nanos(0)),
             Err(Error::TransmitOnly)
         );
+    }
+
+    // ---------------------------------------------------------- CXPWR read
+
+    /// Feeds one complete line (`line` starts with `$`, no terminator) plus
+    /// its `<CR>`, one byte at a time (this crate is `no_std`: no `Vec` to
+    /// collect a stream of results, so every test drives one line at a
+    /// time). Every byte but the last is mid-line and must yield `None`;
+    /// returns whatever the terminating `<CR>` produced. Same shape as
+    /// `gnss0183`'s own test `feed` helper.
+    fn feed(
+        reader: &mut PowerReportReader,
+        line: &[u8],
+        acquired_at: Timestamp,
+    ) -> Option<Result<PowerStatus, PowerError>> {
+        for &b in line {
+            assert_eq!(reader.push(b, acquired_at), None);
+        }
+        reader.push(b'\r', acquired_at)
+    }
+
+    /// Feeds `prefix` one byte at a time, asserting every push stays `None`
+    /// (still mid-line, no terminator seen). For proving a reader recovers
+    /// from abandoned or unrelated traffic before the line under test.
+    fn feed_silently(reader: &mut PowerReportReader, prefix: &[u8], acquired_at: Timestamp) {
+        for &b in prefix {
+            assert_eq!(reader.push(b, acquired_at), None);
+        }
+    }
+
+    /// Independently re-verifies a `$CXPWR` line's checksum by replaying it
+    /// through `coxswain-nmea0183`'s own parser, same trick
+    /// `assert_checksum_matches_0183_parser` uses for `$CXACT`: `CXPWR` is a
+    /// well-formed five-character address this crate does not parse, so a
+    /// correct checksum surfaces as `UnsupportedSentence` and a wrong one as
+    /// `ChecksumMismatch`.
+    fn assert_cxpwr_checksum_matches_0183_parser(line: &[u8]) {
+        let result = coxswain_nmea0183::parse_sentence(line, &coxswain_nmea0183::Quirks::default());
+        assert_eq!(
+            result,
+            Err(coxswain_nmea0183::ParseError::UnsupportedSentence)
+        );
+    }
+
+    #[test]
+    fn golden_cxpwr_line_parses_to_exact_voltage() {
+        // Checksum hand-verified: XOR of "CXPWR,12.6" is 0x79.
+        const LINE: &[u8] = b"$CXPWR,12.6*79";
+        assert_cxpwr_checksum_matches_0183_parser(LINE);
+
+        let t = Timestamp::from_nanos(1_000);
+        let mut reader = PowerReportReader::new();
+        let status = feed(&mut reader, LINE, t).unwrap().unwrap();
+
+        assert_eq!(status.voltage_v, 12.6);
+        assert_eq!(status.t, t);
+    }
+
+    #[test]
+    fn fragmented_delivery_parses_identically_to_the_golden_line() {
+        // A truncated, abandoned line (no terminator) fed first, byte at a
+        // time: the stray '$' that opens the real line afterward must
+        // resync instead of corrupting it, same property
+        // `coxswain-nmea0183`'s `stray_dollar_mid_line_resyncs_instead_of_
+        // erroring` proves for `SentenceReader`. Both parts are delivered
+        // one byte per `push` call throughout, standing in for a UART's
+        // actual granularity.
+        let t = Timestamp::from_nanos(1_000);
+        let mut reader = PowerReportReader::new();
+        feed_silently(&mut reader, b"$CXPWR,abandoned-mid-line", t);
+        let status = feed(&mut reader, b"$CXPWR,12.6*79", t).unwrap().unwrap();
+
+        assert_eq!(status.voltage_v, 12.6);
+    }
+
+    #[test]
+    fn bad_checksum_is_rejected() {
+        // Same line as the golden test with the checksum hex corrupted.
+        let t = Timestamp::from_nanos(1_000);
+        let mut reader = PowerReportReader::new();
+        let result = feed(&mut reader, b"$CXPWR,12.6*00", t);
+
+        assert_eq!(result, Some(Err(PowerError::BadChecksum)));
+    }
+
+    #[test]
+    fn negative_voltage_is_rejected() {
+        // Checksum hand-verified: XOR of "CXPWR,-1.0" is 0x60. A correct
+        // checksum on a negative reading proves the value is rejected on
+        // its own merits, not as a side effect of a bad fold.
+        let t = Timestamp::from_nanos(1_000);
+        let mut reader = PowerReportReader::new();
+        let result = feed(&mut reader, b"$CXPWR,-1.0*60", t);
+
+        assert_eq!(result, Some(Err(PowerError::InvalidVoltage)));
+    }
+
+    #[test]
+    fn garbage_numeric_field_is_rejected() {
+        // Checksum hand-verified: XOR of "CXPWR,abc" is 0x02.
+        let t = Timestamp::from_nanos(1_000);
+        let mut reader = PowerReportReader::new();
+        let result = feed(&mut reader, b"$CXPWR,abc*02", t);
+
+        assert_eq!(result, Some(Err(PowerError::InvalidVoltage)));
+    }
+
+    #[test]
+    fn non_finite_voltage_is_rejected() {
+        // "nan" is a valid f64::FromStr literal (PowerError::InvalidVoltage
+        // doc comment): parsing alone would not catch it. Checksum
+        // hand-verified: XOR of "CXPWR,nan" is 0x03.
+        let t = Timestamp::from_nanos(1_000);
+        let mut reader = PowerReportReader::new();
+        let result = feed(&mut reader, b"$CXPWR,nan*03", t);
+
+        assert_eq!(result, Some(Err(PowerError::InvalidVoltage)));
+    }
+
+    #[test]
+    fn interleaved_cxact_echo_is_skipped_without_error() {
+        // A far end may echo the $CXACT lines it receives, or emit other
+        // traffic; this reader's own doc comment on why an unrecognized
+        // address is quiet, not an error. The golden $CXACT line from the
+        // write-path tests above stands in for the echo: fed in full,
+        // including its terminator, it must produce no result at all (not
+        // even an error) before the genuine CXPWR report that follows on
+        // the same reader parses normally, proving the reader recovers
+        // cleanly rather than getting stuck.
+        let t = Timestamp::from_nanos(1_000);
+        let mut reader = PowerReportReader::new();
+        feed_silently(&mut reader, b"$CXACT,0.0,0.0,0.0*4F\r\n", t);
+        let status = feed(&mut reader, b"$CXPWR,12.6*79", t).unwrap().unwrap();
+
+        assert_eq!(status.voltage_v, 12.6);
     }
 }

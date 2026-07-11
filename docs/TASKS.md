@@ -143,7 +143,7 @@ Bring-up transports per D-021. Chosen for time-to-water, superseded in Phase 7.
       direct effort setpoints.
 - [x] CRSF real baud: the hosted termios path sets standard POSIX bauds
       only; 420000 needs termios2/BOTHER. Ptys mask this (hardware.md gap).
-- [ ] Power monitoring input path for the hosted real-serial mode; the
+- [x] Power monitoring input path for the hosted real-serial mode; the
       failsafe matrix currently sees a healthy default. Blocks armed
       on-water operation (hardware.md gap). Mechanism decided on the bench.
 - [ ] First water trial behind a manual claimant (RC or teleop). Autonomy conn

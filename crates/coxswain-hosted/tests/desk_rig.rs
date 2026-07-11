@@ -3,12 +3,12 @@
 //! physical loop through the actual termios/byte-reader code path (Phase 6:
 //! "coxswain-hosted on real /dev ports").
 //!
-//! Split into two tests rather than one long script, per the task's own
+//! Split into separate tests rather than one long script, per the task's own
 //! escape hatch: a single script chaining GNSS convergence, RC preemption,
-//! effort, kill, and release would multiply the ways a shared-runner hiccup
-//! could make an unrelated assertion flaky, and the two halves exercise
-//! independent code paths (the 0183 read path; the RC/actuator read+write
-//! path) that don't need to share state.
+//! effort, kill, release, and power-report reaction would multiply the ways
+//! a shared-runner hiccup could make an unrelated assertion flaky, and each
+//! rig exercises an independent code path that doesn't need to share state
+//! with the others.
 //!
 //! - `gnss_fusion_rig`: boots the binary with only the GNSS bus mapped to a
 //!   pty. A harness-side `coxswain-sim` plant is truth; every 200 ms (5 Hz,
@@ -26,10 +26,17 @@
 //!   release. See that test's doc comment for why the final assertion is
 //!   "the RC claimant's link stays alive", not "thrust resumes": nothing in
 //!   the RC adapter re-arms.
+//! - `power_report_rig`: boots the binary with the GNSS bus and the
+//!   actuator port mapped, no RC. Writes `$CXPWR` reports on the actuator
+//!   pty master (the real link's reverse direction, coxswain-drivers::
+//!   actuator_serial's module doc comment) and asserts the failsafe matrix
+//!   v1's report-only low-voltage behavior (a fresh arm attempt refused,
+//!   the existing armed state untouched) followed by a critical-voltage
+//!   forced disarm.
 //!
-//! Requires zenohd on PATH for `rc_authority_rig` (same as
-//! integration_zenoh.rs); `gnss_fusion_rig` needs no router at all, since it
-//! drives no claimant.
+//! Requires zenohd on PATH for `rc_authority_rig` and `power_report_rig`
+//! (same as integration_zenoh.rs); `gnss_fusion_rig` needs no router at
+//! all, since it drives no claimant.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -257,6 +264,17 @@ fn gga_sentence(lat_deg: f64, lon_deg: f64) -> String {
 /// One checksummed `$HEHDT` true-heading line, CRLF-terminated.
 fn hdt_sentence(heading_deg: f64) -> String {
     let body = format!("HEHDT,{heading_deg:.3},T");
+    format!("${body}*{:02X}\r\n", nmea_checksum(&body))
+}
+
+// ------------------------------------------------------------- $CXPWR write
+
+/// One checksummed `$CXPWR,<voltage_v>*hh` line, CRLF-terminated
+/// (coxswain-drivers::actuator_serial's module doc comment: one decimal
+/// digit is the wire convention for the far end, though the parser under
+/// test does not itself require it).
+fn cxpwr_line(voltage_v: f64) -> String {
+    let body = format!("CXPWR,{voltage_v:.1}");
     format!("${body}*{:02X}\r\n", nmea_checksum(&body))
 }
 
@@ -933,6 +951,188 @@ fn rc_authority_rig() {
     assert!(
         !last.armed,
         "kill is a one-way latch; nothing re-armed the vessel"
+    );
+
+    let _ = vessel.kill();
+    let _ = vessel.wait();
+    let _ = zenohd.kill();
+    let _ = zenohd.wait();
+}
+
+/// One control tick, matching `coxswain-hosted`'s own `TICK` constant
+/// (main.rs); reaction latencies below are reported in these units as well
+/// as milliseconds, since a tick is the actual resolution of the loop
+/// that reads the report and re-evaluates the failsafe matrix.
+const TICK_S: f64 = 0.1;
+
+/// The power-report half: `$CXPWR` reports on the actuator link's reverse
+/// direction (coxswain-drivers::actuator_serial's module doc comment),
+/// feeding the supervisor's voltage input in real-serial mode (the
+/// docs/hardware.md gap this task closes). A third rig test rather than
+/// folding this into `rc_authority_rig`: this scenario shares no state
+/// with RC preemption or kill beyond the actuator port itself, which is
+/// reopened fresh here, and the module doc comment's own rationale for
+/// splitting applies just as much to a third independent script as to the
+/// second. No RC needed: only a teleop claimant (over Keelson) to observe
+/// the arm/disarm reaction.
+#[test]
+fn power_report_rig() {
+    let tmp = make_tmp("power");
+    let (blob, pubkey_hex) = build_blob();
+    let blob_path = tmp.0.join("desk-rig.cxmanifest");
+    std::fs::write(&blob_path, &blob).unwrap();
+
+    let (gnss_master, gnss_slave) = open_pty_pair();
+    let (actuator_master, actuator_slave) = open_pty_pair();
+    let mut power_writer = actuator_master
+        .try_clone()
+        .expect("clone the actuator pty master for writing $CXPWR");
+    // Drains the vessel's own $CXACT stream, unused here (this rig never
+    // arms thrust output): the pty's finite kernel buffer would otherwise
+    // fill and block the vessel's writes within seconds, same reasoning as
+    // `rc_authority_rig`'s `cxact_rx`. Kept alive (bound, not dropped) for
+    // the whole test so the draining thread keeps running.
+    let _cxact_rx = spawn_cxact_reader(actuator_master);
+    let plant = PlantLoop::start(gnss_master, None);
+
+    let port = free_port();
+    let endpoint = format!("tcp/127.0.0.1:{port}");
+    let mut zenohd = Command::new("zenohd")
+        .args(["--listen", &endpoint, "--no-multicast-scouting"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("zenohd on PATH (see .devcontainer/postCreate.sh)");
+    {
+        let deadline = Instant::now() + BRING_UP;
+        loop {
+            match zenoh::open(client_config(&endpoint)).wait() {
+                Ok(session) => {
+                    session.close().wait().unwrap();
+                    break;
+                }
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "zenohd never became ready: {e}");
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    let (mut vessel, status_rx) = spawn_vessel(
+        &blob_path,
+        &pubkey_hex,
+        Some(&endpoint),
+        &[
+            "--port".to_string(),
+            format!("gnss0183={gnss_slave}"),
+            "--actuator-port".to_string(),
+            actuator_slave,
+        ],
+    );
+
+    // A healthy report before anything else: proves the read path itself
+    // is what is being exercised, not merely that the boot default (also
+    // 13.0 V, `Core::new`'s own doc comment) happens to be healthy too.
+    power_writer
+        .write_all(cxpwr_line(13.0).as_bytes())
+        .expect("write healthy $CXPWR");
+
+    let session = zenoh::open(client_config(&endpoint)).wait().unwrap();
+    let teleop = ClaimantClient::new(session, "keelson", "cx-desk-rig-01", ClaimantId(7));
+    assert_eq!(rpc("register", || teleop.register()), ConnReplyResult::Ok);
+    assert_eq!(
+        rpc("request_conn", || teleop.request_conn()),
+        ConnReplyResult::Ok
+    );
+    let deadline = Instant::now() + BRING_UP;
+    loop {
+        match rpc("arm", || teleop.arm()) {
+            ConnReplyResult::Ok => break,
+            ConnReplyResult::RefusedEstimator | ConnReplyResult::RefusedPosition => {}
+            other => panic!("arm refused: {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "teleop arm never succeeded");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let armed = wait_for(&status_rx, BRING_UP, "armed at healthy voltage", |s| {
+        s.armed && s.conn == "held:7"
+    });
+    println!(
+        "power report: armed at healthy voltage at t={:.1}s",
+        armed.t_s
+    );
+
+    // Sag below low_voltage_v (12.4, the manifest template) but above
+    // critical_voltage_v (11.8): report-only per the failsafe matrix v1
+    // (coxswain-supervisor::Supervisor::arm's own comment on why an
+    // already-armed vessel tolerates it) -- the existing armed state must
+    // survive, but a *fresh* arm attempt is refused.
+    let low_report_at = Instant::now();
+    power_writer
+        .write_all(cxpwr_line(12.0).as_bytes())
+        .expect("write low $CXPWR");
+    let refusal_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if rpc("arm", || teleop.arm()) == ConnReplyResult::RefusedVoltage {
+            break;
+        }
+        assert!(
+            Instant::now() < refusal_deadline,
+            "arm was never refused for low voltage"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let low_latency = low_report_at.elapsed();
+    println!(
+        "power report: arm refused {:.0} ms ({:.1} ticks) after the low-voltage report",
+        low_latency.as_millis(),
+        low_latency.as_secs_f64() / TICK_S
+    );
+
+    // Still armed, no failsafe latched: low voltage is report-only, not a
+    // forced disarm (`FailsafeCause` has no low-voltage variant at all,
+    // coxswain-supervisor's own doc comment on `Directive::low_voltage`).
+    let after_low = collect_for(&status_rx, Duration::from_secs(1));
+    let last_low = after_low.last().expect("no status after the low report");
+    assert!(
+        last_low.armed,
+        "low voltage forced a disarm; should be report-only"
+    );
+    assert_ne!(last_low.failsafe.as_deref(), Some("CriticalVoltage"));
+
+    // Sag below critical_voltage_v (11.8): the failsafe matrix forces a
+    // disarm (coxswain-supervisor::Supervisor::tick, FailsafeCause::
+    // CriticalVoltage). Unlike `rc_authority_rig`'s kill scenario, this rig
+    // never arms any thrust (teleop sends no effort), so there is no
+    // $CXACT-zeroing evidence to bound the reaction at true tick
+    // resolution; the 1 Hz stdout status line is the only observable
+    // surface here, so the printed latency is an upper bound set mostly by
+    // that cadence, not a measurement of the supervisor's actual (one
+    // tick, ~100 ms) reaction time.
+    let critical_report_at = Instant::now();
+    power_writer
+        .write_all(cxpwr_line(11.0).as_bytes())
+        .expect("write critical $CXPWR");
+    let disarmed = wait_for(
+        &status_rx,
+        Duration::from_secs(5),
+        "disarmed by critical voltage",
+        |s| !s.armed,
+    );
+    let critical_latency = critical_report_at.elapsed();
+    assert_eq!(disarmed.failsafe.as_deref(), Some("CriticalVoltage"));
+    let (truth_pos, _) = plant.truth_now();
+    println!(
+        "power report: disarmed status observed {:.0} ms ({:.1} ticks, upper-bounded by the \
+         1 Hz status cadence, see comment above) after the critical-voltage report, status \
+         confirmed by t={:.1}s (plant held at {:.5},{:.5} throughout, no thrust ever armed in \
+         this rig)",
+        critical_latency.as_millis(),
+        critical_latency.as_secs_f64() / TICK_S,
+        disarmed.t_s,
+        truth_pos.lat_rad.to_degrees(),
+        truth_pos.lon_rad.to_degrees(),
     );
 
     let _ = vessel.kill();
