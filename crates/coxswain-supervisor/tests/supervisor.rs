@@ -519,6 +519,68 @@ fn critical_voltage_forces_disarm_and_it_sticks() {
     assert_eq!(d.failsafe, None);
 }
 
+#[test]
+fn nan_voltage_does_not_trip_critical_or_low() {
+    let mut sup = armed(GeofenceAction::Hold);
+    sup.heartbeat(AUTONOMY, ts(100)).unwrap();
+    // NaN carries no information (IEEE comparisons against it are always
+    // false); the guard must not let it manufacture a trip either. With no
+    // prior good reading yet, voltage is treated as within bounds.
+    let d = sup.tick(
+        ts(100),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(f64::NAN),
+        Some(cruise()),
+    );
+    assert_eq!(d.failsafe, None);
+    assert!(!d.low_voltage);
+    assert_eq!(d.arming, ArmingState::Armed);
+}
+
+#[test]
+fn nan_voltage_does_not_clear_latched_critical_voltage() {
+    let mut sup = armed(GeofenceAction::Hold);
+    sup.heartbeat(AUTONOMY, ts(100)).unwrap();
+    let d = sup.tick(
+        ts(100),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(V_CRIT),
+        Some(cruise()),
+    );
+    assert_eq!(d.failsafe, Some(FailsafeCause::CriticalVoltage));
+
+    // A NaN reading the next tick must not clear the latch: it is ignored,
+    // so the last good (critical) reading still applies.
+    sup.heartbeat(AUTONOMY, ts(200)).unwrap();
+    let d = sup.tick(
+        ts(200),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(f64::NAN),
+        Some(cruise()),
+    );
+    assert_eq!(d.failsafe, Some(FailsafeCause::CriticalVoltage));
+    assert!(d.low_voltage);
+    assert_eq!(d.arming, ArmingState::Disarmed);
+
+    // A subsequent good reading behaves exactly as an unguarded recovery
+    // would: the failsafe clears, though disarm still sticks (re-arming is
+    // the holder's call).
+    sup.heartbeat(AUTONOMY, ts(300)).unwrap();
+    let d = sup.tick(
+        ts(300),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(V_OK),
+        Some(cruise()),
+    );
+    assert_eq!(d.failsafe, None);
+    assert!(!d.low_voltage);
+    assert_eq!(d.arming, ArmingState::Disarmed);
+}
+
 // ------------------------------------------------- failsafe matrix, singles
 
 #[test]

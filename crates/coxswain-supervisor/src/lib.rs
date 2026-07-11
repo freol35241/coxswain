@@ -336,12 +336,25 @@ impl Supervisor {
             }
         }
 
-        let low_voltage = power.voltage_v < self.cfg.low_voltage_v;
-        let critical_voltage = power.voltage_v < self.cfg.critical_voltage_v;
+        // A non-finite voltage reading (NaN/inf) carries no information, but
+        // IEEE comparisons against NaN are always false: trusting it as-is
+        // would silently disable both the low- and critical-voltage
+        // failsafes rather than trip them. Ignore it and keep the last good
+        // reading; before any good reading has arrived there is nothing to
+        // compare against, so treat voltage as within bounds rather than
+        // manufacture a trip out of missing information.
+        let voltage_v = if power.voltage_v.is_finite() {
+            power.voltage_v
+        } else {
+            self.last_tick.map_or(f64::INFINITY, |c| c.voltage_v)
+        };
+
+        let low_voltage = voltage_v < self.cfg.low_voltage_v;
+        let critical_voltage = voltage_v < self.cfg.critical_voltage_v;
 
         self.last_tick = Some(TickCache {
             level: health.level,
-            voltage_v: power.voltage_v,
+            voltage_v,
         });
 
         if critical_voltage {

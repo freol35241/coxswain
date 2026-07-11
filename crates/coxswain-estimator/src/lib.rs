@@ -21,12 +21,15 @@ use ekf::{Ekf, ProcessModel};
 
 /// Why a measurement was refused. `UnknownSensor`: not in the matching fusion
 /// list, or no sensor entry at all. `NotLicensed`: listed, but the license is
-/// not `InnerLoop`. `OutOfOrder`: timestamp behind the filter.
+/// not `InnerLoop`. `OutOfOrder`: timestamp behind the filter. `NonFinite`: a
+/// value or declared std is NaN/infinite; caught at the boundary so one bad
+/// sample cannot poison the filter through the Kalman gain.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Rejection {
     UnknownSensor,
     NotLicensed,
     OutOfOrder,
+    NonFinite,
 }
 
 /// The three fused measurement roles, named for what is measured rather than
@@ -124,11 +127,15 @@ impl Estimator {
         self.tau = cmd.demand;
     }
 
-    /// Predict to m.t, then update. Rejects measurements from sensors not in
-    /// the config's fusion lists (UnknownSensor), sensors whose license is
-    /// not InnerLoop (NotLicensed), and timestamps behind the filter
-    /// (OutOfOrder).
+    /// Predict to m.t, then update. Rejects a non-finite value or declared
+    /// std before anything else runs (NonFinite), then measurements from
+    /// sensors not in the config's fusion lists (UnknownSensor), sensors
+    /// whose license is not InnerLoop (NotLicensed), and timestamps behind
+    /// the filter (OutOfOrder).
     pub fn handle(&mut self, m: &Measurement) -> Result<(), Rejection> {
+        if !Self::values_finite(&m.kind) {
+            return Err(Rejection::NonFinite);
+        }
         let role = match m.kind {
             MeasurementKind::GnssPosition { .. } => Role::Gnss,
             MeasurementKind::Heading { .. } => Role::Heading,
@@ -287,6 +294,35 @@ impl Estimator {
                 }
             }
         }
+    }
+
+    /// True when every value and declared std carried by `kind` is finite
+    /// (not NaN, not +-inf). A non-finite input would otherwise ride the
+    /// Kalman gain straight into the state and covariance.
+    fn values_finite(kind: &MeasurementKind) -> bool {
+        match *kind {
+            MeasurementKind::GnssPosition { position, std_m } => {
+                position.lat_rad.is_finite() && position.lon_rad.is_finite() && std_m.is_finite()
+            }
+            MeasurementKind::Heading {
+                heading_rad,
+                std_rad,
+            } => heading_rad.is_finite() && std_rad.is_finite(),
+            MeasurementKind::YawRate {
+                yaw_rate_radps,
+                std_radps,
+            } => yaw_rate_radps.is_finite() && std_radps.is_finite(),
+        }
+    }
+
+    /// Test-only seam: pokes NaN directly into the filter state, bypassing
+    /// intake (which now rejects non-finite measurements before they reach
+    /// here). Exists so the health backstop stays exercised for the case it
+    /// actually guards against: non-finiteness arising from the arithmetic
+    /// itself (e.g. an unstable predict), not from a bad measurement.
+    #[cfg(test)]
+    fn poison_state(&mut self) {
+        self.filter.as_mut().expect("call after init").ekf.x[2] = f64::NAN;
     }
 
     fn admit(&self, sensor: SensorId, role: Role) -> Result<(), Rejection> {
@@ -465,18 +501,59 @@ mod tests {
         assert!(est.state(ts(2.0)).is_some());
     }
 
-    /// A NaN measurement value is not rejected by intake (no NaN validation
-    /// there today), so it poisons the filter state directly; health must
-    /// catch that rather than let a wrecked filter report Nominal/Degraded.
+    /// Intake now rejects a non-finite measurement before it ever reaches the
+    /// filter (see non_finite_* tests below), so this drives a NaN state
+    /// through the poison_state seam instead: the backstop must still catch
+    /// non-finiteness that arises from the arithmetic itself (e.g. an
+    /// unstable predict) rather than from a bad measurement, and must not let
+    /// a wrecked filter report Nominal/Degraded.
     #[test]
     fn nan_state_reports_fault_health() {
         let mut est = initialized();
-        let mut bad = heading_at(1.4, COMPASS);
+        est.poison_state();
+        assert_eq!(est.health(ts(1.4)).level, HealthLevel::Fault);
+    }
+
+    /// A NaN heading is rejected at intake with NonFinite, and the rejection
+    /// leaves the filter untouched: state and health after the attempt match
+    /// a run that never saw the bad sample.
+    #[test]
+    fn non_finite_heading_is_rejected_and_leaves_filter_unchanged() {
+        let baseline = initialized();
+
+        let mut with_nan = initialized();
+        let mut bad = heading_at(1.3, COMPASS);
         if let MeasurementKind::Heading { heading_rad, .. } = &mut bad.kind {
             *heading_rad = f64::NAN;
         }
-        est.handle(&bad).unwrap();
-        assert_eq!(est.health(ts(1.4)).level, HealthLevel::Fault);
+        assert_eq!(with_nan.handle(&bad), Err(Rejection::NonFinite));
+
+        assert_eq!(with_nan.state(ts(2.0)), baseline.state(ts(2.0)));
+        assert_eq!(with_nan.health(ts(2.0)), baseline.health(ts(2.0)));
+    }
+
+    /// Infinite GNSS latitude is rejected the same way as NaN.
+    #[test]
+    fn infinite_gnss_latitude_is_rejected() {
+        let mut est = initialized();
+        let mut bad = gnss_at(1.3);
+        if let MeasurementKind::GnssPosition { position, .. } = &mut bad.kind {
+            position.lat_rad = f64::INFINITY;
+        }
+        assert_eq!(est.handle(&bad), Err(Rejection::NonFinite));
+    }
+
+    /// The declared std, not just the value, is checked: a NaN std_rad must
+    /// also be rejected, since it would otherwise divide the Kalman gain by
+    /// garbage.
+    #[test]
+    fn non_finite_declared_std_is_rejected() {
+        let mut est = initialized();
+        let mut bad = heading_at(1.3, COMPASS);
+        if let MeasurementKind::Heading { std_rad, .. } = &mut bad.kind {
+            *std_rad = f64::NAN;
+        }
+        assert_eq!(est.handle(&bad), Err(Rejection::NonFinite));
     }
 
     #[test]
