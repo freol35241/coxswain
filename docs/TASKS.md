@@ -156,7 +156,7 @@ Bring-up transports per D-021. Chosen for time-to-water, superseded in Phase 7.
 - [ ] GNSS driver: Septentrio SBF over UART (Mosaic), PPS hook stubbed for the
       host profile. Earns its place when the estimator consumes covariance and
       RTK status, and not before.
-- [ ] NMEA 2000 listen-only decode for the initial PGN set; enrichment path
+- [x] NMEA 2000 listen-only decode for the initial PGN set; enrichment path
       only.
 - [x] 0183-over-UDP bus: listen socket, source_ip pinning enforcement,
       enrichment cap when unpinned.

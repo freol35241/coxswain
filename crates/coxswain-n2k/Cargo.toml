@@ -1,0 +1,14 @@
+[package]
+name = "coxswain-n2k"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Intentionally empty: no_std, no allocation, zero dependencies (design
+# constraint, Phase 7 backlog). This crate decodes CAN id/payload pairs
+# into typed enrichment messages only; it does not touch sockets or
+# SocketCAN (the hosted transport's job, later), and it does not map onto
+# coxswain-contract (D-011: N2K is enrichment/pass-through, not inner_loop;
+# see lib.rs doc).
+[dependencies]

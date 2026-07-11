@@ -31,5 +31,6 @@ jobs:
           -p coxswain-manifest
           -p coxswain-nmea0183
           -p coxswain-crsf
+          -p coxswain-n2k
           -p coxswain-drivers
           --features coxswain-contract/serde

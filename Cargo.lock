@@ -432,6 +432,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "coxswain-n2k"
+version = "0.1.0"
+
+[[package]]
 name = "coxswain-nmea0183"
 version = "0.1.0"
 
