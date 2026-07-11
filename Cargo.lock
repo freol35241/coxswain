@@ -352,6 +352,7 @@ name = "coxswain-drivers"
 version = "0.1.0"
 dependencies = [
  "coxswain-contract",
+ "coxswain-crsf",
  "coxswain-nmea0183",
 ]
 
