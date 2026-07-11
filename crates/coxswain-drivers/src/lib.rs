@@ -25,6 +25,8 @@
 
 use coxswain_contract::Timestamp;
 
+pub mod gnss0183;
+
 /// init, self-test, timestamped read: the three capabilities every driver
 /// exposes. Blocking; see the crate-level timestamping policy for the
 /// meaning of `acquired_at`.
