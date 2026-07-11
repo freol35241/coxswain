@@ -158,7 +158,7 @@ Bring-up transports per D-021. Chosen for time-to-water, superseded in Phase 7.
       RTK status, and not before.
 - [ ] NMEA 2000 listen-only decode for the initial PGN set; enrichment path
       only.
-- [ ] 0183-over-UDP bus: listen socket, source_ip pinning enforcement,
+- [x] 0183-over-UDP bus: listen socket, source_ip pinning enforcement,
       enrichment cap when unpinned.
 
 ## Phase 8: Conn node firmware (reference deployment)

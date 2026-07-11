@@ -12,6 +12,12 @@ procurement shortlist.
 - NMEA 0183 over UART, listen-only, strict parsing (GGA, RMC, HDT, VTG;
   NMEA 2.3/4.1 layouts with FAA mode). The GNSS driver emits position
   (GGA, gated on fix quality, std from HDOP x UERE) and heading (HDT).
+- NMEA 0183 over UDP, listen-only, same parser and sentence set as the
+  UART path (D-014). Binds `0.0.0.0:<listen_port>`, not the manifest's
+  named interface: `SO_BINDTODEVICE` needs `CAP_NET_RAW`/`CAP_NET_ADMIN`,
+  the wrong trade for a listen-only sensor input. `source_ip` pinning is
+  enforced at the socket, dropping any datagram from an unpinned source
+  before it reaches the parser; an unpinned bus caps at enrichment.
 - CRSF over UART from an RC receiver (RC channels, link statistics).
   Kill switch, takeover switch, surge/yaw sticks per D-025.
 - Actuator command out: one `$CXACT,<surge_n>,<sway_n>,<yaw_nm>*HH` line

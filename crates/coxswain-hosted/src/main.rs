@@ -33,6 +33,7 @@ use coxswain_sim::{GnssModel, HeadingModel, Simulator, YawRateModel};
 use zenoh::Wait;
 
 mod serial;
+mod udp;
 
 const TICK: Duration = Duration::from_millis(100);
 const STATUS_PERIOD: Duration = Duration::from_secs(1);
@@ -400,6 +401,23 @@ fn build_filter(quirks: Option<Nmea0183Quirks>) -> gnss0183::AcceptFilter {
     filter
 }
 
+/// Builds a `Gnss0183Driver`'s `Config` from one bus's wiring and checksum
+/// mode. Shared by the uart and udp bring-up blocks below: same driver,
+/// same sentence set, only the transport underneath differs.
+fn gnss0183_config(wiring: &Nmea0183Wiring, checksum: ChecksumMode) -> gnss0183::Config {
+    gnss0183::Config {
+        position_sensor: wiring.position_sensor,
+        heading_sensor: wiring.heading_sensor,
+        uere_m: gnss0183::DEFAULT_UERE_M,
+        fallback_std_m: NMEA0183_FALLBACK_STD_M,
+        heading_std_rad: NMEA0183_HEADING_STD_RAD,
+        filter: wiring.filter,
+        quirks: Nmea0183ParserQuirks {
+            checksum_required: matches!(checksum, ChecksumMode::Required),
+        },
+    }
+}
+
 /// Applies one parsed CRSF frame's events to the core (D-025). Kill maps to
 /// disarm, re-issued every frame while engaged (dead-man doctrine: cheap,
 /// idempotent, and the caller's choice per coxswain-drivers::rc's doc
@@ -453,8 +471,18 @@ fn run() -> Result<(), String> {
 
     // The simulator backend is on unless a port map opted this boot into
     // real serial I/O (mutual exclusivity is checked in parse_args); this
-    // is the pre-Phase-6 default preserved exactly (TASKS Phase 5).
-    let sim_enabled = args.sim || args.ports.is_empty();
+    // is the pre-Phase-6 default preserved exactly (TASKS Phase 5). A
+    // nmea0183_udp bus needs no --port (the manifest fully specifies the
+    // socket, see the udp bring-up block below), so it counts as real I/O
+    // too: without this, a manifest wired entirely over UDP would fall
+    // through the "no --port given" default straight into the simulator,
+    // silently feeding the estimator synthetic fixes alongside (or instead
+    // of) the real ones.
+    let udp_gnss_wired = manifest.buses.iter().any(|b| {
+        b.kind == BusKind::Nmea0183Udp
+            && nmea0183_wiring(b.id.as_str(), manifest.sensors.as_slice()).is_some()
+    });
+    let sim_enabled = args.sim || (args.ports.is_empty() && !udp_gnss_wired);
     let mut sim: Option<Simulator> = if sim_enabled {
         // This profile's simulator backend needs a plant; a
         // constant_velocity manifest has no physics to run forward, so it
@@ -535,6 +563,13 @@ fn run() -> Result<(), String> {
             if port_map.contains_key(bus.id.as_str()) {
                 continue;
             }
+            if bus.kind == BusKind::Nmea0183Udp {
+                // Handled by the udp bring-up block below, which has its
+                // own bind-failure boot-error check (D-009); it needs no
+                // --port, so it would otherwise wrongly fall into the
+                // generic "no driver for that bus kind yet" error below.
+                continue;
+            }
             let inner_loop_here = manifest
                 .sensors
                 .iter()
@@ -586,21 +621,83 @@ fn run() -> Result<(), String> {
         };
         let port = serial::open_serial(path, bus.rate).map_err(|e| format!("{path}: {e}"))?;
         let rx = spawn_byte_reader(port, boot);
-        let config = gnss0183::Config {
-            position_sensor: wiring.position_sensor,
-            heading_sensor: wiring.heading_sensor,
-            uere_m: gnss0183::DEFAULT_UERE_M,
-            fallback_std_m: NMEA0183_FALLBACK_STD_M,
-            heading_std_rad: NMEA0183_HEADING_STD_RAD,
-            filter: wiring.filter,
-            quirks: Nmea0183ParserQuirks {
-                checksum_required: matches!(bus.checksum, ChecksumMode::Required),
-            },
-        };
         nmea0183_links.push(Nmea0183Link {
-            driver: Gnss0183Driver::new(config),
+            driver: Gnss0183Driver::new(gnss0183_config(&wiring, bus.checksum)),
             rx,
         });
+    }
+    // Wire a Gnss0183Driver per nmea0183_udp bus that has a gnss/heading
+    // sensor declared for it, binding its listen socket at boot. Unlike the
+    // uart block above this needs no --port map: the manifest fully
+    // specifies the socket (listen_port), so it runs unconditionally, not
+    // gated on sim_enabled/port_map (`sim_enabled`'s own comment above
+    // already accounts for this bus kind needing no --port).
+    for bus in manifest.buses.iter() {
+        if bus.kind != BusKind::Nmea0183Udp {
+            continue;
+        }
+        let Some(wiring) = nmea0183_wiring(bus.id.as_str(), manifest.sensors.as_slice()) else {
+            continue; // e.g. seahorse's ais_udp: role "ais" only, no gnss/heading
+        };
+        // D-014's invariant this driver leans on: an unpinned bus caps
+        // every sensor on it at enrichment, so nothing it carries may reach
+        // the estimator. coxswain-manifest::compile already refuses an
+        // inner_loop sensor on an unpinned bus at compile time
+        // (InnerLoopUdpUnpinned); this is a second, cheap check on that
+        // same invariant, not the primary enforcement (the estimator's own
+        // per-sensor license table, `SensorConfig::license`, is), so a
+        // compiled blob that somehow violated it fails loudly here instead
+        // of silently promoting a Measurement.
+        let sensor_license = |id: SensorId| {
+            manifest
+                .sensors
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.license)
+        };
+        let position_license = sensor_license(wiring.position_sensor);
+        let heading_license = sensor_license(wiring.heading_sensor);
+        debug_assert!(
+            bus.source_ip.is_some() || position_license != Some(License::InnerLoop),
+            "bus {:?} is unpinned but its position sensor is inner_loop; compile-time \
+             validation should have refused this manifest (D-014)",
+            bus.id.as_str()
+        );
+        debug_assert!(
+            bus.source_ip.is_some() || heading_license != Some(License::InnerLoop),
+            "bus {:?} is unpinned but its heading sensor is inner_loop; compile-time \
+             validation should have refused this manifest (D-014)",
+            bus.id.as_str()
+        );
+        let inner_loop_here = position_license == Some(License::InnerLoop)
+            || heading_license == Some(License::InnerLoop);
+        match udp::bind(bus.listen_port) {
+            Ok(socket) => {
+                let rx =
+                    udp::spawn_reader(socket, boot, bus.source_ip, bus.id.as_str().to_string());
+                nmea0183_links.push(Nmea0183Link {
+                    driver: Gnss0183Driver::new(gnss0183_config(&wiring, bus.checksum)),
+                    rx,
+                });
+            }
+            Err(e) if inner_loop_here => {
+                // Self-sufficiency (invariant 1, D-009): a bus this vessel
+                // needs for an inner_loop sensor must actually come up.
+                return Err(format!(
+                    "bus {:?}: UDP listen on 0.0.0.0:{} failed: {e} (self-sufficiency, D-009)",
+                    bus.id.as_str(),
+                    bus.listen_port
+                ));
+            }
+            Err(e) => {
+                eprintln!(
+                    "coxswain-hosted: bus {:?}: UDP listen on 0.0.0.0:{} failed (continuing, \
+                     enrichment only): {e}",
+                    bus.id.as_str(),
+                    bus.listen_port
+                );
+            }
+        }
     }
 
     // RC and the actuator link: conn-node-local serial, not manifest buses
