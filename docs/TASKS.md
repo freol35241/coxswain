@@ -110,14 +110,21 @@ hardware. Everything below buys a boat that moves.
 
 Bring-up transports per D-021. Chosen for time-to-water, superseded in Phase 7.
 
-- [ ] Coxswain driver trait (init, self-test, read-with-timestamp) +
+- [x] Coxswain driver trait (init, self-test, read-with-timestamp) +
       timestamping policy (acquisition time, monotonic source injected).
-- [ ] NMEA 0183 parser crate: strict, sentence subset (GGA, RMC, HDT, VTG to
+- [x] NMEA 0183 parser crate: strict, sentence subset (GGA, RMC, HDT, VTG to
       start), quirk flags from manifest. Fuzz the parser.
 - [ ] GNSS driver over 0183. Covariance from HDOP and fix quality, which is
       crude and known to be crude; the estimator's declared noise parameters
       carry the weight until SBF lands.
+- [x] EKF predict safeguard: substep the Euler predict (or guard the
+      covariance) when the correction gap grows; the no-gyro + 1 Hz heading
+      replay diverges to NaN today (diary 2026-07-10). Health must flag NaN
+      as Fault. Gates first water.
 - [ ] IMU/mag drivers for the Seahorse hardware (embedded-hal, host-mockable).
+      Off the first-water critical path: the 2026-07-10 replay experiment
+      shows a 5 Hz 0183 heading source suffices (heading RMSE ~1.5 deg, NEES
+      healthy). Returns if trial data disagrees or higher speeds demand it.
 - [ ] PWM/serial actuator backend behind the driver trait. The conn/actuator
       role split (D-010) is preserved in software; the second firmware project
       is not yet required.
@@ -125,6 +132,15 @@ Bring-up transports per D-021. Chosen for time-to-water, superseded in Phase 7.
       nothing else. "Quirks in configuration, not code" invites an unbounded
       device zoo; this doc is the fence.
 - [ ] coxswain-hosted on real /dev ports, systemd unit example.
+- [x] RC receiver driver crate: CRSF frame parser (SBUS fallback if the
+      hardware dictates), strict, fuzzed like the 0183 parser (D-025).
+- [ ] RC kill channel: switch position mapped to disarm at the conn node.
+      Lands before RC can hold the conn (D-025 sequencing).
+- [x] Claimant priority and preemption in the supervisor; priority declared
+      per claimant in the manifest (v0.3). Direct-effort Setpoint variant in
+      the contract for manual helm (D-025).
+- [ ] RC claimant adapter: transmitter switch to claimant verbs, sticks to
+      direct effort setpoints.
 - [ ] First water trial behind a manual claimant (RC or teleop). Autonomy conn
       grant only after the failsafe matrix has both simulator and bench mileage.
 

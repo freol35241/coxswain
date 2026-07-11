@@ -208,6 +208,30 @@ SHA-256 because ubiquity beats novelty for an audit artifact: every tool a
 port-state inspector or an incident reviewer might hold can compute it. The
 signature already provides integrity; the hash is an identifier.
 
+## D-025: RC hand controller is a claimant; conn preemption is manifest-declared priority
+
+An RC receiver at the conn node gives a human a physical takeover path that
+works with nothing above the conn node alive, which is the human input D-009's
+self-sufficiency story was missing. It is not a new mechanism: the receiver is
+a UART device behind the driver trait (CRSF/ELRS preferred, SBUS as fallback),
+an adapter maps a transmitter switch to the claimant verbs and the sticks to
+setpoints, and link loss rides the existing ClaimantLost failsafe since both
+protocols carry explicit failsafe flags. Authority stays data (D-005).
+
+Takeover is only worth having if the switch takes the conn without the
+holder's cooperation, so grants become priority-ordered: each claimant
+carries a priority declared per vessel in the manifest, and a higher priority
+preempts a lower one on request_conn. The supervisor compares integers and
+never knows RC from GCS; which source outranks which on a given hull is
+vessel configuration, not architecture (D-013's trust-is-declared, extended
+from sensors to claimants). This retires the MVP's no-preemption restriction
+and is manifest v0.3 business under D-022's sequencing logic.
+
+Two RC functions, sequenced separately: a kill/disarm channel first (simpler,
+and what first water trials actually need), RC as a conn-holding claimant
+second. Manual helm issues direct effort setpoints, a contract Setpoint
+addition; RC bypasses guidance, never the supervisor or arming.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest

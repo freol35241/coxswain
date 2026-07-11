@@ -148,6 +148,10 @@ impl Guidance {
             Setpoint::FollowPath { path, speed_mps } => {
                 self.follow_path(path.as_slice(), *speed_mps, state)
             }
+            // Manual helm: no control law, the demanded tau goes straight to
+            // the actuator command, subject to the same output clamp as any
+            // other setpoint (D-025).
+            Setpoint::DirectEffort(tau) => *tau,
         };
         saturate(demand)
     }
@@ -320,6 +324,7 @@ mod tests {
                     action: GeofenceAction::Hold,
                     ring: BoundedList::new(),
                 },
+                claimant_priorities: BoundedList::new(),
             },
         }
     }
@@ -384,6 +389,32 @@ mod tests {
         let mut g = Guidance::new(&config());
         let d = g.tick(&Setpoint::Idle, &state(1.0, 2.0, 0.5));
         assert_eq!(d, ZERO_DEMAND);
+    }
+
+    #[test]
+    fn direct_effort_passes_tau_straight_through() {
+        let mut g = Guidance::new(&config());
+        let tau = ForceDemand {
+            surge_n: 50.0,
+            sway_n: -20.0,
+            yaw_nm: 10.0,
+        };
+        let d = g.tick(&Setpoint::DirectEffort(tau), &state(0.0, 1.0, 0.1));
+        assert_eq!(d, tau);
+    }
+
+    #[test]
+    fn direct_effort_clamps_like_any_other_setpoint() {
+        let mut g = Guidance::new(&config());
+        let tau = ForceDemand {
+            surge_n: 10_000.0,
+            sway_n: -10_000.0,
+            yaw_nm: 10_000.0,
+        };
+        let d = g.tick(&Setpoint::DirectEffort(tau), &state(0.0, 0.0, 0.0));
+        assert_eq!(d.surge_n, MAX_SURGE_N);
+        assert_eq!(d.sway_n, -MAX_SWAY_N);
+        assert_eq!(d.yaw_nm, MAX_YAW_NM);
     }
 
     #[test]

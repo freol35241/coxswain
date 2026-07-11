@@ -19,8 +19,9 @@ mod time;
 pub use actuator::{ActuatorCommand, ActuatorFeedback, ForceDemand};
 pub use bounded::{BoundedList, CapacityError};
 pub use config::{
-    ConnGrantDefault, EstimatorConfig, Fossen3DofParams, GeofenceAction, GeofenceConfig, License,
-    ModelParams, SensorConfig, SensorId, SensorRole, SupervisorConfig, VesselConfig,
+    ClaimantPriority, ConnGrantDefault, EstimatorConfig, Fossen3DofParams, GeofenceAction,
+    GeofenceConfig, License, ModelParams, SensorConfig, SensorId, SensorRole, SupervisorConfig,
+    VesselConfig,
 };
 pub use conn::{AUTONOMY, ArmingState, ClaimantId, ConnState};
 pub use geo::GeoPoint;

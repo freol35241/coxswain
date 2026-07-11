@@ -344,8 +344,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "coxswain-crsf"
+version = "0.1.0"
+
+[[package]]
 name = "coxswain-drivers"
 version = "0.1.0"
+dependencies = [
+ "coxswain-contract",
+]
 
 [[package]]
 name = "coxswain-estimator"
@@ -417,6 +424,10 @@ dependencies = [
  "libm",
  "nalgebra",
 ]
+
+[[package]]
+name = "coxswain-nmea0183"
+version = "0.1.0"
 
 [[package]]
 name = "coxswain-sim"

@@ -40,6 +40,15 @@ const PSI_FLOOR: f64 = 1e-8;
 // Generous initial uncertainty on the unmeasured velocity states.
 const INIT_VEL_STD: f64 = 3.0; // m/s
 const INIT_YAW_RATE_STD: f64 = 0.5; // rad/s
+// Predict intervals longer than this are split into substeps of at most this
+// length. The nominal conn tick is 100 ms, and the replay bounds are tuned
+// against single Euler steps at that scale, so this reproduces the original
+// behavior for normal ticks while a degraded correction gap (sparse or
+// missing heading/yaw-rate fixes) gets walked forward in nominal-tick-sized
+// pieces instead of one large linearization. A single ~1 s Euler step under
+// the hydrodynamic prior with no yaw-rate observation is what drove the
+// diary's r estimate to NaN; substepping keeps the Jacobian locally valid.
+const MAX_SUBSTEP_S: f64 = 0.1;
 
 /// Wrap an angle to (-pi, pi].
 pub fn wrap_angle(a: f64) -> f64 {
@@ -69,14 +78,26 @@ impl Ekf {
         Self { x, p }
     }
 
-    /// Euler discretization, adequate at the tick rates involved (tens of Hz
-    /// between measurements). The kinematic rows are constant-twist; the
-    /// velocity rows follow the selected process model, with `tau` treated as
-    /// constant over the step.
+    /// Predict to `dt` ahead, substepping at `MAX_SUBSTEP_S` so a long gap
+    /// between corrections (degraded or missing sensors) does not hand a
+    /// single large step to the Euler integrator and its linearized
+    /// covariance propagation.
     pub fn predict(&mut self, dt: f64, model: &ProcessModel, tau: &ForceDemand) {
         if dt <= 0.0 {
             return;
         }
+        let steps = (libm::ceil(dt / MAX_SUBSTEP_S) as u32).max(1);
+        let sub_dt = dt / f64::from(steps);
+        for _ in 0..steps {
+            self.predict_step(sub_dt, model, tau);
+        }
+    }
+
+    /// Euler discretization, adequate at the substep scale `predict` calls
+    /// this with. The kinematic rows are constant-twist; the velocity rows
+    /// follow the selected process model, with `tau` treated as constant
+    /// over the step.
+    fn predict_step(&mut self, dt: f64, model: &ProcessModel, tau: &ForceDemand) {
         let psi = self.x[2];
         let (u, v) = (self.x[3], self.x[4]);
         let (s, c) = (libm::sin(psi), libm::cos(psi));
@@ -142,6 +163,13 @@ impl Ekf {
 
     pub fn update_yaw_rate(&mut self, r_radps: f64, std_radps: f64) {
         self.scalar_update(5, r_radps - self.x[5], std_radps * std_radps);
+    }
+
+    /// False once any state or covariance element has gone non-finite
+    /// (NaN/inf), the estimator's health gate for a filter that has come
+    /// numerically unglued.
+    pub fn is_finite(&self) -> bool {
+        self.x.iter().all(|v| v.is_finite()) && self.p.iter().all(|v| v.is_finite())
     }
 
     /// Standard EKF update for a measurement that reads one state directly.
@@ -286,5 +314,41 @@ mod tests {
         assert!(libm::fabs(wrap_angle(-PI) - PI) < 1e-12);
         assert!(libm::fabs(wrap_angle(PI + 0.1) - (-PI + 0.1)) < 1e-12);
         assert!(libm::fabs(wrap_angle(-0.5) - (-0.5)) < 1e-12);
+    }
+
+    /// predict(dt) for dt above MAX_SUBSTEP_S stands in for repeated calls
+    /// at the bound, so a single 1 s predict must match ten 0.1 s predicts
+    /// exactly (same substep count, same per-step arithmetic).
+    #[test]
+    fn predict_substeps_match_manual_fine_steps() {
+        let model = ProcessModel::Hydrodynamic(Fossen3Dof::new(&seahorse()).unwrap());
+        let tau = zero_tau();
+        let mut coarse = Ekf::init(0.0, 0.0, 1.0, 0.3, 0.1);
+        coarse.x[3] = 2.0;
+        coarse.x[5] = 0.05;
+        let mut fine = coarse;
+
+        coarse.predict(1.0, &model, &tau);
+        for _ in 0..10 {
+            fine.predict(0.1, &model, &tau);
+        }
+
+        assert!(libm::fabs(coarse.x[0] - fine.x[0]) < 1e-12);
+        assert!(libm::fabs(coarse.x[2] - fine.x[2]) < 1e-12);
+        assert!(libm::fabs(coarse.x[5] - fine.x[5]) < 1e-12);
+        assert!(libm::fabs(coarse.p[(0, 0)] - fine.p[(0, 0)]) < 1e-12);
+    }
+
+    #[test]
+    fn is_finite_flags_nan_state_and_covariance() {
+        let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.0, 0.1);
+        assert!(ekf.is_finite());
+
+        ekf.x[5] = f64::NAN;
+        assert!(!ekf.is_finite());
+
+        let mut ekf2 = Ekf::init(0.0, 0.0, 1.0, 0.0, 0.1);
+        ekf2.p[(4, 4)] = f64::INFINITY;
+        assert!(!ekf2.is_finite());
     }
 }

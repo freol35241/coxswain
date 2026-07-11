@@ -65,8 +65,8 @@ pub fn ned_cov_to_enu(cov: &Covariance) -> [f64; 9] {
     ]
 }
 
-pub fn setpoint_to_proto(sp: &Setpoint) -> setpoint_msg::Setpoint {
-    match *sp {
+pub fn setpoint_to_proto(sp: &Setpoint) -> Result<setpoint_msg::Setpoint, Error> {
+    Ok(match *sp {
         Setpoint::Idle => setpoint_msg::Setpoint::Idle(setpoint_msg::Idle {}),
         Setpoint::HeadingSpeed {
             heading_rad,
@@ -94,7 +94,15 @@ pub fn setpoint_to_proto(sp: &Setpoint) -> setpoint_msg::Setpoint {
                 speed_mps,
             })
         }
-    }
+        // Manual helm's raw force demand is local to the conn node (RC
+        // bypasses guidance, not the supervisor or arming, D-025) and never
+        // crosses Keelson; the wire schema deliberately has no case for it.
+        Setpoint::DirectEffort(_) => {
+            return Err(Error::Protocol(
+                "direct_effort setpoint is not wire-representable",
+            ));
+        }
+    })
 }
 
 pub fn setpoint_from_proto(msg: &SetpointMsg) -> Result<Setpoint, Error> {
@@ -188,7 +196,7 @@ mod tests {
     fn roundtrip(sp: Setpoint) {
         let msg = SetpointMsg {
             timestamp: Some(wall_to_proto(SystemTime::now())),
-            setpoint: Some(setpoint_to_proto(&sp)),
+            setpoint: Some(setpoint_to_proto(&sp).unwrap()),
         };
         // Through the actual wire bytes, not just the structs.
         let decoded = SetpointMsg::decode(msg.encode_to_vec().as_slice()).unwrap();
@@ -227,6 +235,19 @@ mod tests {
             path,
             speed_mps: 2.0,
         });
+    }
+
+    #[test]
+    fn direct_effort_is_not_wire_representable() {
+        // D-025: manual helm never crosses Keelson, so the wire schema has
+        // no case for it; the conversion refuses rather than silently
+        // dropping or misrepresenting the setpoint.
+        let sp = Setpoint::DirectEffort(coxswain_contract::ForceDemand {
+            surge_n: 1.0,
+            sway_n: 0.0,
+            yaw_nm: 0.0,
+        });
+        assert!(matches!(setpoint_to_proto(&sp), Err(Error::Protocol(_))));
     }
 
     #[test]

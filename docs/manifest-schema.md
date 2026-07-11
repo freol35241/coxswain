@@ -1,12 +1,13 @@
-# Coxswain Vessel Manifest: Schema Draft v0.2
+# Coxswain Vessel Manifest: Schema Draft v0.3
 
 The manifest is the per-vessel statement of what exists, where it terminates, and what
 the estimator is licensed to trust. It is authored as TOML, validated and compiled
 host-side to a signed, CRC-protected binary blob (postcard), and written to an A/B flash
 region on the conn node during commissioning. The firmware treats it as pure data.
 
-Doc revision is v0.2. The wire-facing `manifest.schema_version` stays at 1; nothing
-here breaks a v0.1 reader's major version, though v0.1 blobs will not verify.
+Doc revision is v0.3. The wire-facing `manifest.schema_version` bumps 1 -> 2 for the
+claimant priority table (D-025); the bump is deliberate and pre-release, so a v0.2
+reader rejects a v0.3 blob outright rather than attempting to interpret it.
 
 Design rules encoded in this schema:
 
@@ -30,7 +31,7 @@ Design rules encoded in this schema:
 # ============================================================
 
 [manifest]
-schema_version = 1          # firmware refuses unknown major versions
+schema_version = 2          # firmware refuses unknown major versions
 vessel_id      = "se-rise-seahorse-01"
 name           = "Seahorse"
 revision       = 7          # monotonically increasing per vessel
@@ -195,6 +196,23 @@ failsafe  = "amidships"
 heartbeat_timeout_ms = 500
 
 # ------------------------------------------------------------
+# Claimants: conn preemption priority, higher wins (D-025).
+# id is the runtime ClaimantId a claimant registers with, not
+# compiler-assigned. A claimant absent from this table defaults to
+# priority 0.
+# ------------------------------------------------------------
+
+[[claimant]]
+name     = "autonomy"
+id       = 0
+priority = 0
+
+[[claimant]]
+name     = "rc"
+id       = 1
+priority = 100        # the hand controller outranks autonomy on request
+
+# ------------------------------------------------------------
 # Estimator: which model, which promoted sensors, in what config
 # The sensor list here must be a subset of sensors with license = "inner_loop".
 # ------------------------------------------------------------
@@ -269,6 +287,7 @@ published to Keelson, invisible to control.
 - Geofence polygon is a closed, simple, non-degenerate ring
 - No duplicate physical port claims
 - Cyphal node IDs unique per bus
+- No duplicate claimant ids in `[[claimant]]` (D-025)
 - Schema version compatible with target firmware version
 - `driver` strings are not resolved here; a manifest may name drivers the target
   firmware lacks, and that surfaces at boot self-test, not at compile
@@ -306,7 +325,14 @@ authentication will build on sand.
 discriminant (D-018); the blob is ed25519-signed (D-017); the geofence polygon is
 inline (D-018).
 
-## Open questions for v0.3
+**Settled since v0.2:** conn preemption is manifest-declared priority, one integer
+per claimant, higher wins; a claimant absent from `[[claimant]]` defaults to
+priority 0 (D-025). Unlike sensors, buses, and actuator nodes, a claimant's `id`
+is authored directly rather than compiler-assigned: it is the runtime `ClaimantId`
+the claimant registers with, so the manifest and the running claimant must agree
+on it out of band.
+
+## Open questions for v0.4
 
 1. **Fusion priority vs weights.** `heading = [a, b]` as priority order is simple but
    crude; explicit per-sensor noise parameters may belong in the manifest once the

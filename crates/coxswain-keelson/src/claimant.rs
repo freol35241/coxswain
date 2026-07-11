@@ -110,7 +110,7 @@ impl ClaimantClient {
         let now = SystemTime::now();
         let msg = pb::SetpointMsg {
             timestamp: Some(wall_to_proto(now)),
-            setpoint: Some(setpoint_to_proto(sp)),
+            setpoint: Some(setpoint_to_proto(sp)?),
         };
         let key = keys::pubsub_key(
             &self.base_path,

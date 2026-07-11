@@ -46,11 +46,26 @@ fn seahorse_compiles_and_roundtrips() {
     assert_eq!(manifest.vessel_id.as_str(), "se-rise-seahorse-01");
     assert_eq!(manifest.name.as_str(), "Seahorse");
     assert_eq!(manifest.revision, 7);
-    assert_eq!(manifest.schema_version, 1);
+    assert_eq!(manifest.schema_version, 2);
     assert_eq!(manifest.buses.len(), 6);
     assert_eq!(manifest.sensors.len(), 7);
     assert_eq!(manifest.actuator_nodes.len(), 3);
     assert_eq!(manifest.config.sensors.len(), 7);
+    // D-025: autonomy default, rc outranking it.
+    let priorities = manifest.config.supervisor.claimant_priorities.as_slice();
+    assert_eq!(
+        priorities,
+        &[
+            coxswain_contract::ClaimantPriority {
+                id: coxswain_contract::ClaimantId(0),
+                priority: 0,
+            },
+            coxswain_contract::ClaimantPriority {
+                id: coxswain_contract::ClaimantId(1),
+                priority: 100,
+            },
+        ]
+    );
 
     let blob = coxswain_manifest::write(&manifest, &seed());
     let read_back = coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed()))
@@ -197,6 +212,13 @@ fn rejects_duplicate_actuator_id() {
         expect_invalid(&src),
         ValidateError::DuplicateActuatorId(id) if id == "thruster_port"
     ));
+}
+
+// Rule 3: unique claimant ids (D-025).
+#[test]
+fn rejects_duplicate_claimant_id() {
+    let src = patched("id       = 1", "id       = 0");
+    assert_eq!(expect_invalid(&src), ValidateError::DuplicateClaimantId(0));
 }
 
 // Rule 4: estimator lists reference only inner_loop sensors.
@@ -384,13 +406,13 @@ fn rejects_inner_loop_on_udp_bus_outside_conn_segment() {
     ));
 }
 
-// Rule 10: schema_version must be 1.
+// Rule 10: schema_version must be 2.
 #[test]
 fn rejects_unknown_schema_version() {
-    let src = patched("schema_version = 1", "schema_version = 2");
+    let src = patched("schema_version = 2", "schema_version = 3");
     assert_eq!(
         expect_invalid(&src),
-        ValidateError::UnsupportedSchemaVersion(2)
+        ValidateError::UnsupportedSchemaVersion(3)
     );
 }
 
@@ -450,10 +472,10 @@ fn wrong_magic_is_rejected() {
 #[test]
 fn wrong_header_version_is_rejected() {
     let mut blob = seahorse_blob();
-    blob[4] = 2;
+    blob[4] = 9;
     assert_eq!(
         coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed())),
-        Err(ReadError::BadVersion(2))
+        Err(ReadError::BadVersion(9))
     );
 }
 

@@ -4,9 +4,10 @@
 use core::time::Duration;
 
 use coxswain_contract::{
-    BodyVelocity, BoundedList, ConnGrantDefault, EstimatorConfig, Fossen3DofParams, GeoPoint,
-    GeofenceAction, GeofenceConfig, License, ModelParams, Pose, SensorConfig, SensorId, SensorRole,
-    SupervisorConfig, Timestamp, VesselConfig, VesselState,
+    AUTONOMY, BodyVelocity, BoundedList, ClaimantId, ClaimantPriority, ConnGrantDefault,
+    EstimatorConfig, Fossen3DofParams, GeoPoint, GeofenceAction, GeofenceConfig, License,
+    ModelParams, Pose, SensorConfig, SensorId, SensorRole, SupervisorConfig, Timestamp,
+    VesselConfig, VesselState,
 };
 
 fn geo(lon_deg: f64, lat_deg: f64) -> GeoPoint {
@@ -70,8 +71,28 @@ fn seahorse_config() -> VesselConfig {
                 ])
                 .unwrap(),
             },
+            // RC hand controller outranks autonomy (D-025); autonomy is
+            // unlisted here on purpose, exercising the default-0 path.
+            claimant_priorities: BoundedList::from_slice(&[ClaimantPriority {
+                id: ClaimantId(1),
+                priority: 100,
+            }])
+            .unwrap(),
         },
     }
+}
+
+#[test]
+fn autonomy_defaults_to_unlisted() {
+    // Not a roundtrip assertion; just documents that AUTONOMY is deliberately
+    // absent from `seahorse_config`'s claimant_priorities.
+    assert!(
+        seahorse_config()
+            .supervisor
+            .claimant_priorities
+            .iter()
+            .all(|p| p.id != AUTONOMY)
+    );
 }
 
 #[test]

@@ -4,6 +4,7 @@
 use core::time::Duration;
 
 use crate::bounded::BoundedList;
+use crate::conn::ClaimantId;
 use crate::geo::GeoPoint;
 
 /// Declared trust level of a sensor. `InnerLoop` may be fused and participates
@@ -119,6 +120,28 @@ pub enum ConnGrantDefault {
     Autonomy,
 }
 
+/// Per-claimant conn preemption priority (D-025): higher wins. A request
+/// from a registered claimant preempts the current holder only if its
+/// priority is strictly greater; a claimant absent from this list is
+/// priority 0. The supervisor compares the integer only and never special-
+/// cases which claimant it belongs to.
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ClaimantPriority {
+    pub id: ClaimantId,
+    pub priority: u8,
+}
+
+// Dead-tail filler for BoundedList only, as for SensorConfig.
+impl Default for ClaimantPriority {
+    fn default() -> Self {
+        Self {
+            id: ClaimantId(0),
+            priority: 0,
+        }
+    }
+}
+
 /// Vessel-specific constants of the failsafe matrix; the matrix itself is
 /// firmware logic.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -130,6 +153,10 @@ pub struct SupervisorConfig {
     pub low_voltage_v: f64,
     pub critical_voltage_v: f64,
     pub geofence: GeofenceConfig,
+    /// Capacity mirrors `coxswain_supervisor::MAX_CLAIMANTS`; the contract
+    /// crate does not depend on the supervisor crate, so the two are kept in
+    /// sync by convention, not by a shared constant.
+    pub claimant_priorities: BoundedList<ClaimantPriority, 8>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]

@@ -10,10 +10,10 @@
 use core::time::Duration;
 
 use coxswain_contract::{
-    ArmingState, BoundedList, ClaimantId, ConnGrantDefault, ConnState, EstimatorConfig,
-    ForceDemand, Fossen3DofParams, GeoPoint, GeofenceAction, GeofenceConfig, License, ModelParams,
-    PowerStatus, SensorConfig, SensorId, SensorRole, Setpoint, SupervisorConfig, Timestamp,
-    VesselConfig,
+    ArmingState, BoundedList, ClaimantId, ClaimantPriority, ConnGrantDefault, ConnState,
+    EstimatorConfig, ForceDemand, Fossen3DofParams, GeoPoint, GeofenceAction, GeofenceConfig,
+    License, ModelParams, PowerStatus, SensorConfig, SensorId, SensorRole, Setpoint,
+    SupervisorConfig, Timestamp, VesselConfig,
 };
 use coxswain_hosted::{ArmError, Core, FailsafeCause, TickOutput};
 use coxswain_model::LocalFrame;
@@ -23,6 +23,9 @@ const TICK: Duration = Duration::from_millis(100);
 const HEARTBEAT_NS: u64 = 500_000_000;
 
 const TELEOP: ClaimantId = ClaimantId(7);
+/// Stand-in for the RC hand controller (D-025): outranks TELEOP, which is
+/// unlisted in `config()` and so defaults to priority 0.
+const RC: ClaimantId = ClaimantId(9);
 const GNSS: SensorId = SensorId(1);
 const COMPASS: SensorId = SensorId(2);
 const GYRO: SensorId = SensorId(3);
@@ -91,6 +94,11 @@ fn config(geofence: GeofenceConfig) -> VesselConfig {
             low_voltage_v: 12.4,
             critical_voltage_v: 11.8,
             geofence,
+            claimant_priorities: BoundedList::from_slice(&[ClaimantPriority {
+                id: RC,
+                priority: 100,
+            }])
+            .unwrap(),
         },
     }
 }
@@ -504,4 +512,34 @@ fn d008_rehearsal_holds_without_claimants() {
         assert_eq!(out.directive.setpoint, Setpoint::Idle);
         assert_eq!(out.command.demand, ZERO);
     }
+}
+
+/// Scenario 7 (D-025): RC's manifest-declared priority preempts a lower-
+/// priority holder mid-transit. The transfer is clean, not a failsafe:
+/// arming survives, ClaimantLost never latches, and the ex-holder's release
+/// no longer touches the conn.
+#[test]
+fn higher_priority_claimant_preempts_conn_cleanly() {
+    let mut h = Harness::new(no_fence());
+    h.bring_up();
+    h.core.set_setpoint(TELEOP, north(1.0));
+    let out = h.step();
+    assert_eq!(out.directive.conn, ConnState::Held(TELEOP));
+    assert_eq!(out.directive.arming, ArmingState::Armed);
+
+    let now = h.sim.now();
+    h.core.register(RC, now).unwrap();
+    h.core.request_conn(RC, now).unwrap();
+    h.core.set_setpoint(RC, north(0.0));
+
+    let out = h.step();
+    assert_eq!(out.directive.conn, ConnState::Held(RC));
+    assert_eq!(out.directive.arming, ArmingState::Armed);
+    assert_ne!(out.directive.failsafe, Some(FailsafeCause::ClaimantLost));
+
+    // TELEOP is still registered but no longer holds the conn: its release
+    // is a no-op against the new holder.
+    assert!(h.core.release_conn(TELEOP).is_err());
+    let out = h.step();
+    assert_eq!(out.directive.conn, ConnState::Held(RC));
 }

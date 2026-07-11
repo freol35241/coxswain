@@ -241,9 +241,10 @@ impl Estimator {
         })
     }
 
-    /// Fault until initialized, Degraded while any fused role is stale, else
-    /// Nominal. The stds come from the covariance predicted to `now`;
-    /// thresholds on them are the supervisor's business, not ours.
+    /// Fault until initialized or if the state/covariance has gone
+    /// non-finite, Degraded while any fused role is stale, else Nominal.
+    /// The stds come from the covariance predicted to `now`; thresholds on
+    /// them are the supervisor's business, not ours.
     pub fn health(&self, now: Timestamp) -> EstimatorHealth {
         let gnss_stale = Self::stale(now, self.last_gnss, self.gnss_max_age);
         let heading_stale = Self::stale(now, self.last_heading, self.heading_max_age);
@@ -266,7 +267,12 @@ impl Estimator {
                     &self.process,
                     &self.tau,
                 );
-                let level = if gnss_stale || heading_stale || yaw_rate_stale {
+                // A non-finite state or covariance (predict gone unstable)
+                // overrides staleness: the filter is unusable, not merely
+                // degraded, and must not be allowed to self-report Nominal.
+                let level = if !ekf.is_finite() {
+                    HealthLevel::Fault
+                } else if gnss_stale || heading_stale || yaw_rate_stale {
                     HealthLevel::Degraded
                 } else {
                     HealthLevel::Nominal
@@ -372,6 +378,7 @@ mod tests {
                     action: GeofenceAction::Hold,
                     ring: BoundedList::new(),
                 },
+                claimant_priorities: BoundedList::new(),
             },
         }
     }
@@ -456,6 +463,20 @@ mod tests {
         est.handle(&gnss_at(1.0)).unwrap();
         est.handle(&heading_at(1.2, COMPASS)).unwrap();
         assert!(est.state(ts(2.0)).is_some());
+    }
+
+    /// A NaN measurement value is not rejected by intake (no NaN validation
+    /// there today), so it poisons the filter state directly; health must
+    /// catch that rather than let a wrecked filter report Nominal/Degraded.
+    #[test]
+    fn nan_state_reports_fault_health() {
+        let mut est = initialized();
+        let mut bad = heading_at(1.4, COMPASS);
+        if let MeasurementKind::Heading { heading_rad, .. } = &mut bad.kind {
+            *heading_rad = f64::NAN;
+        }
+        est.handle(&bad).unwrap();
+        assert_eq!(est.health(ts(1.4)).level, HealthLevel::Fault);
     }
 
     #[test]

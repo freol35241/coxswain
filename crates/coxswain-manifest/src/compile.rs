@@ -7,14 +7,15 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use coxswain_contract::{
-    BoundedList, ConnGrantDefault, EstimatorConfig, Fossen3DofParams, GeoPoint, GeofenceAction,
-    GeofenceConfig, License, ModelParams, SensorConfig, SensorId, SensorRole, SupervisorConfig,
-    VesselConfig,
+    BoundedList, ClaimantId, ClaimantPriority, ConnGrantDefault, EstimatorConfig, Fossen3DofParams,
+    GeoPoint, GeofenceAction, GeofenceConfig, License, ModelParams, SensorConfig, SensorId,
+    SensorRole, SupervisorConfig, VesselConfig,
 };
 
 use crate::toml_model::{
-    BusKindToml, BusToml, ChecksumToml, ConnGrantToml, EstimatorToml, FailsafeToml, FunctionToml,
-    GeofenceActionToml, GeofenceToml, LicenseToml, ManifestToml, RoleToml, SensorToml,
+    BusKindToml, BusToml, ChecksumToml, ClaimantToml, ConnGrantToml, EstimatorToml, FailsafeToml,
+    FunctionToml, GeofenceActionToml, GeofenceToml, LicenseToml, ManifestToml, RoleToml,
+    SensorToml,
 };
 use crate::types::{
     ActuatorFailsafe, ActuatorFunction, ActuatorNodeEntry, BusEntry, BusKind, ChecksumMode,
@@ -32,7 +33,7 @@ const BOARD_HOSTED: &str = "hosted";
 
 /// Per-role staleness defaults, milliseconds. This is the estimator's Phase 2
 /// answer landing per D-022; a 0183 quirk table's `max_age_ms` overrides the
-/// default for that sensor, and a general per-sensor field is v0.3 business
+/// default for that sensor, and a general per-sensor field is v0.4 business
 /// (schema doc, open questions).
 const MAX_AGE_GNSS_MS: u64 = 3000;
 const MAX_AGE_HEADING_MS: u64 = 1000; // heading and compass alike
@@ -66,6 +67,9 @@ pub enum ValidateError {
     DuplicateBusId(String),
     DuplicateSensorId(String),
     DuplicateActuatorId(String),
+    /// D-025: two `[[claimant]]` entries declare the same runtime
+    /// `ClaimantId`.
+    DuplicateClaimantId(u16),
     UnknownBus {
         owner: String,
         bus: String,
@@ -131,7 +135,7 @@ impl std::fmt::Display for ValidateError {
             Self::UnsupportedSchemaVersion(v) => {
                 write!(
                     f,
-                    "schema_version {v} unsupported, this tool compiles version 1"
+                    "schema_version {v} unsupported, this tool compiles version 2"
                 )
             }
             Self::UnknownBoard(b) => write!(f, "unknown conn_node.board profile {b:?}"),
@@ -147,6 +151,7 @@ impl std::fmt::Display for ValidateError {
             Self::DuplicateBusId(id) => write!(f, "duplicate bus id {id:?}"),
             Self::DuplicateSensorId(id) => write!(f, "duplicate sensor id {id:?}"),
             Self::DuplicateActuatorId(id) => write!(f, "duplicate actuator_node id {id:?}"),
+            Self::DuplicateClaimantId(id) => write!(f, "duplicate claimant id {id}"),
             Self::UnknownBus { owner, bus } => {
                 write!(f, "{owner:?} references undeclared bus {bus:?}")
             }
@@ -315,6 +320,12 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
             return Err(ValidateError::DuplicateActuatorId(node.id.clone()));
         }
     }
+    let mut claimant_ids: HashSet<u16> = HashSet::new();
+    for claimant in &m.claimants {
+        if !claimant_ids.insert(claimant.id) {
+            return Err(ValidateError::DuplicateClaimantId(claimant.id));
+        }
+    }
 
     // Every bus reference names a declared bus; pps inputs sit on the profile.
     for sensor in &m.sensors {
@@ -427,6 +438,7 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         low_voltage_v: m.supervisor.low_voltage_v,
         critical_voltage_v: m.supervisor.critical_voltage_v,
         geofence: build_geofence(m.supervisor.geofence.as_ref())?,
+        claimant_priorities: claimant_priorities(&m.claimants)?,
     };
 
     // Blob tables and the per-sensor trust declarations.
@@ -532,6 +544,27 @@ fn id_list(
     Ok(ids)
 }
 
+/// D-025: `id` is authored directly, not compiler-assigned (see
+/// `ClaimantToml`'s doc comment), so this is a straight copy plus the
+/// capacity check every other blob table gets.
+fn claimant_priorities(
+    claimants: &[ClaimantToml],
+) -> Result<BoundedList<ClaimantPriority, 8>, ValidateError> {
+    let mut priorities: BoundedList<ClaimantPriority, 8> = BoundedList::new();
+    for c in claimants {
+        priorities
+            .push(ClaimantPriority {
+                id: ClaimantId(c.id),
+                priority: c.priority,
+            })
+            .map_err(|_| ValidateError::TooMany {
+                what: "claimants",
+                max: 8,
+            })?;
+    }
+    Ok(priorities)
+}
+
 fn model_params(est: &EstimatorToml) -> Result<ModelParams, ValidateError> {
     match est.model.as_str() {
         "fossen_3dof" => {
@@ -575,7 +608,8 @@ fn model_params(est: &EstimatorToml) -> Result<ModelParams, ValidateError> {
             }))
         }
         // Accepted although the schema doc names only fossen_3dof: the
-        // contract carries the variant, and the doc gains it in v0.3.
+        // contract carries the variant, and the doc gains it in a later
+        // revision.
         "constant_velocity" => {
             if est.params.is_some() {
                 return Err(ValidateError::ParamsShape {

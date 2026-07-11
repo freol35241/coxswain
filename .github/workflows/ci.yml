@@ -29,4 +29,7 @@ jobs:
           -p coxswain-guidance
           -p coxswain-supervisor
           -p coxswain-manifest
+          -p coxswain-nmea0183
+          -p coxswain-crsf
+          -p coxswain-drivers
           --features coxswain-contract/serde

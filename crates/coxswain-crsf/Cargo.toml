@@ -1,0 +1,13 @@
+[package]
+name = "coxswain-crsf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Intentionally empty: no_std, no allocation, zero dependencies (design
+# constraint, Phase 6 backlog). Mapping RC channels/link stats onto
+# coxswain-contract Setpoints and reading manifest-declared claimant
+# priority both belong to the RC claimant adapter, a later task (D-025;
+# CLAUDE.md invariant 3: interfaces are adapters, never the internal truth).
+[dependencies]

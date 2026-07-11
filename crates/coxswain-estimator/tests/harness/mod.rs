@@ -363,6 +363,7 @@ pub fn test_config(model: ModelParams) -> VesselConfig {
                 action: GeofenceAction::Hold,
                 ring: BoundedList::new(),
             },
+            claimant_priorities: BoundedList::new(),
         },
     }
 }

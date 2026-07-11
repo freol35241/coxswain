@@ -11,7 +11,11 @@ use serde::{Deserialize, Serialize};
 
 /// Wire-facing manifest schema version. The blob header and the payload both
 /// carry it; the reader refuses anything else.
-pub const SCHEMA_VERSION: u16 = 1;
+///
+/// Bumped 1 -> 2 for the claimant priority table (D-025, schema v0.3).
+/// Deliberate: pre-release, so old readers simply reject new blobs and new
+/// readers reject old ones, no migration path needed.
+pub const SCHEMA_VERSION: u16 = 2;
 
 /// Fixed-capacity UTF-8 string, zero-padded. Exists so the blob needs no
 /// allocator; 32 bytes fits every identifier the schema doc uses.

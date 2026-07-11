@@ -1,3 +1,4 @@
+use crate::actuator::ForceDemand;
 use crate::bounded::BoundedList;
 use crate::geo::GeoPoint;
 
@@ -24,4 +25,8 @@ pub enum Setpoint {
         path: BoundedList<GeoPoint, 16>,
         speed_mps: f64,
     },
+    /// Manual helm: the demanded tau passes straight to the actuator command,
+    /// no control law (D-025). Reuses `ForceDemand`, the same generalized-
+    /// force shape the actuator command already carries.
+    DirectEffort(ForceDemand),
 }

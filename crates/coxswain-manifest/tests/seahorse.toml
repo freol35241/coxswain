@@ -3,7 +3,7 @@
 # ============================================================
 
 [manifest]
-schema_version = 1          # firmware refuses unknown major versions
+schema_version = 2          # firmware refuses unknown major versions
 vessel_id      = "se-rise-seahorse-01"
 name           = "Seahorse"
 revision       = 7          # monotonically increasing per vessel
@@ -166,6 +166,23 @@ bus       = "ctrl"
 function  = "rudder"
 failsafe  = "amidships"
 heartbeat_timeout_ms = 500
+
+# ------------------------------------------------------------
+# Claimants: conn preemption priority, higher wins (D-025).
+# id is the runtime ClaimantId a claimant registers with, not
+# compiler-assigned. A claimant absent from this table defaults to
+# priority 0.
+# ------------------------------------------------------------
+
+[[claimant]]
+name     = "autonomy"
+id       = 0
+priority = 0
+
+[[claimant]]
+name     = "rc"
+id       = 1
+priority = 100        # the hand controller outranks autonomy on request
 
 # ------------------------------------------------------------
 # Estimator: which model, which promoted sensors, in what config

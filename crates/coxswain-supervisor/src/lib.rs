@@ -134,6 +134,18 @@ impl Supervisor {
         self.claimants.iter_mut().flatten().find(|c| c.id == id)
     }
 
+    /// Declared preemption priority (D-025); a claimant absent from the
+    /// manifest's list defaults to 0. Compares the integer only, never the
+    /// identity.
+    fn priority_of(&self, id: ClaimantId) -> u8 {
+        self.cfg
+            .claimant_priorities
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.priority)
+            .unwrap_or(0)
+    }
+
     pub fn register(&mut self, id: ClaimantId, now: Timestamp) -> Result<(), ClaimError> {
         if self.claimant_mut(id).is_some() {
             return Err(ClaimError::AlreadyRegistered);
@@ -156,9 +168,19 @@ impl Supervisor {
         };
         claimant.last_heartbeat = Some(now);
         match self.conn {
-            // No preemption in the MVP; a priority scheme for a future GCS
-            // is post-MVP.
-            ConnState::Held(_) => Err(ClaimError::ConnHeld),
+            // Preemption (D-025): a strictly higher declared priority takes
+            // the conn from the current holder, a clean transfer rather than
+            // a failsafe. Equal or lower priority is refused, as before
+            // priorities existed.
+            ConnState::Held(holder) => {
+                if self.priority_of(id) > self.priority_of(holder) {
+                    self.conn = ConnState::Held(id);
+                    self.claimant_lost = None;
+                    Ok(())
+                } else {
+                    Err(ClaimError::ConnHeld)
+                }
+            }
             ConnState::Unheld => {
                 self.conn = ConnState::Held(id);
                 // A fresh grant is the only thing that clears a latched

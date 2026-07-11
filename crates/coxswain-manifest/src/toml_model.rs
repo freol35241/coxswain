@@ -1,4 +1,4 @@
-//! Serde model of the authored TOML, docs/manifest-schema.md v0.2. Parsing
+//! Serde model of the authored TOML, docs/manifest-schema.md v0.3. Parsing
 //! is strict: unknown fields and unknown enum values are errors. Fields the
 //! compiler carries raw (orientation, segment, declination_source, N2K
 //! sources) stay strings here.
@@ -16,6 +16,8 @@ pub struct ManifestToml {
     pub sensors: Vec<SensorToml>,
     #[serde(default, rename = "actuator_node")]
     pub actuator_nodes: Vec<ActuatorNodeToml>,
+    #[serde(default, rename = "claimant")]
+    pub claimants: Vec<ClaimantToml>,
     pub estimator: EstimatorToml,
     pub supervisor: SupervisorToml,
 }
@@ -161,6 +163,19 @@ pub struct ActuatorNodeToml {
     pub function: FunctionToml,
     pub failsafe: FailsafeToml,
     pub heartbeat_timeout_ms: u32,
+}
+
+/// Per-claimant conn preemption priority (D-025). Unlike sensor/bus/
+/// actuator_node ids, `id` here is not compiler-assigned: it is the actual
+/// `ClaimantId` a claimant registers with at runtime, so it must be authored
+/// directly. `name` is an audit label only, not compiled into the blob.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimantToml {
+    #[allow(dead_code)]
+    pub name: String,
+    pub id: u16,
+    pub priority: u8,
 }
 
 #[derive(Deserialize)]

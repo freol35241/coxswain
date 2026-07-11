@@ -1,0 +1,12 @@
+[package]
+name = "coxswain-nmea0183"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Intentionally empty: this crate is pure bytes-to-sentence-struct, no_std,
+# no allocation, no external interface assumptions. Mapping onto
+# coxswain-contract Measurements and reading manifest-declared quirks both
+# belong to the driver layer, a later task (see CLAUDE.md invariant 3).
+[dependencies]

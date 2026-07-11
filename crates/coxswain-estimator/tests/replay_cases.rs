@@ -483,6 +483,62 @@ fn log_roundtrip_replays_identically_hydro() {
 // balancing tau fed to both (a no-op under constant velocity). The
 // hydrodynamic prior knows the dynamics and the demand, so its dead-reckoning
 // through the 30 s gap must beat the constant-velocity coast.
+// Scenario 8: the yaw-rate predict divergence from diary/2026-07-10.md
+// ("Yaw-rate degradation experiment"). No gyro, heading degraded to 1 Hz,
+// hydrodynamic prior, straight line, seed 2 (same trajectory as
+// noisy_straight()). Before the substep fix, the ~1 s Euler predict between
+// heading corrections drove r to NaN within about 17 s.
+#[test]
+fn no_gyro_degraded_heading_stays_finite() {
+    let traj = Trajectory::straight(origin(), deg(40.0), 3.0, 120.0);
+    let mut rng = Rng::new(2);
+    let ms = merge(vec![
+        sample_gnss(&traj, (0.0, 120.0), 1.0, 2.0, &mut rng),
+        sample_heading(
+            &traj,
+            HEADING_ID,
+            (0.0, 120.0),
+            1.0,
+            deg(1.0),
+            0.0,
+            &mut rng,
+        ),
+        // No yaw-rate stream: this is the condition that diverged.
+    ]);
+    let commands = sample_commands(&traj, (0.0, 120.0), COMMAND_RATE_HZ);
+    let mut est = Estimator::new(&test_config(ModelParams::Fossen3Dof(
+        seahorse_fossen_params(),
+    )));
+    let errs = run_probed(&mut est, &ms, &commands, &traj, 20.0, 120.0);
+
+    println!(
+        "no-gyro degraded heading [hydrodynamic]: pos RMSE {:.3} m, heading RMSE {:.3} deg",
+        rmse(&errs.pos_m),
+        rmse(&errs.psi_rad).to_degrees()
+    );
+    assert!(
+        errs.pos_m.iter().all(|v| v.is_finite()),
+        "position diverged"
+    );
+    assert!(
+        errs.psi_rad.iter().all(|v| v.is_finite()),
+        "heading diverged"
+    );
+    assert!(
+        errs.surge_mps.iter().all(|v| v.is_finite()),
+        "surge diverged"
+    );
+    // Divergence tripwire, not an accuracy claim: 1 Hz heading with no gyro
+    // is a degraded-sensor scenario, not one this filter is tuned for. The
+    // bound is set well above the measured RMSE so it only catches a
+    // regression back toward instability, not ordinary tuning noise.
+    assert!(
+        rmse(&errs.psi_rad) < deg(10.0),
+        "heading RMSE {:.3} deg exceeds the divergence tripwire",
+        rmse(&errs.psi_rad).to_degrees()
+    );
+}
+
 #[test]
 fn gnss_dropout_hydrodynamic_beats_constant_velocity() {
     let max_gap_err = |variant: Variant| {

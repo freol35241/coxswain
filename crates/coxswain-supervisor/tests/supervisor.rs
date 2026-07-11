@@ -4,10 +4,10 @@
 use core::time::Duration;
 
 use coxswain_contract::{
-    AUTONOMY, ArmingState, BodyVelocity, BoundedList, ClaimantId, ConnGrantDefault, ConnState,
-    EstimatorConfig, EstimatorHealth, Fossen3DofParams, GeoPoint, GeofenceAction, GeofenceConfig,
-    HealthLevel, ModelParams, Pose, PowerStatus, Setpoint, SupervisorConfig, Timestamp,
-    VesselConfig, VesselState,
+    AUTONOMY, ArmingState, BodyVelocity, BoundedList, ClaimantId, ClaimantPriority,
+    ConnGrantDefault, ConnState, EstimatorConfig, EstimatorHealth, Fossen3DofParams, GeoPoint,
+    GeofenceAction, GeofenceConfig, HealthLevel, ModelParams, Pose, PowerStatus, Setpoint,
+    SupervisorConfig, Timestamp, VesselConfig, VesselState,
 };
 use coxswain_supervisor::{
     ArmError, ClaimError, Directive, FailsafeCause, MAX_CLAIMANTS, Supervisor,
@@ -89,6 +89,7 @@ fn config_with_fence(grant: ConnGrantDefault, fence: GeofenceConfig) -> VesselCo
             low_voltage_v: 12.4,
             critical_voltage_v: 11.8,
             geofence: fence,
+            claimant_priorities: BoundedList::new(),
         },
     }
 }
@@ -102,6 +103,23 @@ fn config(grant: ConnGrantDefault, action: GeofenceAction) -> VesselConfig {
             ring: seahorse_ring(),
         },
     )
+}
+
+/// `config()` plus a declared priority list (D-025); claimants absent from
+/// `entries` default to priority 0.
+fn config_with_priorities(grant: ConnGrantDefault, entries: &[(ClaimantId, u8)]) -> VesselConfig {
+    let mut cfg = config(grant, GeofenceAction::Hold);
+    let mut priorities = BoundedList::new();
+    for (id, priority) in entries {
+        priorities
+            .push(ClaimantPriority {
+                id: *id,
+                priority: *priority,
+            })
+            .unwrap();
+    }
+    cfg.supervisor.claimant_priorities = priorities;
+    cfg
 }
 
 fn health(level: HealthLevel, gnss_stale: bool) -> EstimatorHealth {
@@ -286,6 +304,97 @@ fn regrant_after_revocation() {
     assert_eq!(d.conn, ConnState::Held(AUTONOMY));
     assert_eq!(d.failsafe, None);
     assert_eq!(d.setpoint, cruise());
+}
+
+// -------------------------------------------------------- preemption (D-025)
+
+#[test]
+fn higher_priority_preempts_the_conn() {
+    let cfg = config_with_priorities(ConnGrantDefault::Autonomy, &[(OTHER, 10)]);
+    let mut sup = Supervisor::new(&cfg);
+    sup.register(OTHER, ts(0)).unwrap();
+    assert_eq!(sup.conn(), ConnState::Held(AUTONOMY));
+    // AUTONOMY is unlisted and defaults to priority 0; OTHER's declared 10
+    // outranks it.
+    sup.request_conn(OTHER, ts(1)).unwrap();
+    assert_eq!(sup.conn(), ConnState::Held(OTHER));
+}
+
+#[test]
+fn equal_priority_does_not_preempt() {
+    // Both unlisted: both default to priority 0.
+    let mut sup = Supervisor::new(&config(ConnGrantDefault::Autonomy, GeofenceAction::Hold));
+    sup.register(OTHER, ts(0)).unwrap();
+    assert_eq!(sup.request_conn(OTHER, ts(1)), Err(ClaimError::ConnHeld));
+    assert_eq!(sup.conn(), ConnState::Held(AUTONOMY));
+}
+
+#[test]
+fn lower_priority_does_not_preempt() {
+    let cfg = config_with_priorities(ConnGrantDefault::Autonomy, &[(AUTONOMY, 10)]);
+    let mut sup = Supervisor::new(&cfg);
+    sup.register(OTHER, ts(0)).unwrap();
+    // OTHER is unlisted and defaults to 0, below AUTONOMY's declared 10.
+    assert_eq!(sup.request_conn(OTHER, ts(1)), Err(ClaimError::ConnHeld));
+    assert_eq!(sup.conn(), ConnState::Held(AUTONOMY));
+}
+
+#[test]
+fn preemption_is_a_clean_transfer_not_a_failsafe() {
+    let cfg = config_with_priorities(ConnGrantDefault::Autonomy, &[(OTHER, 10)]);
+    let mut sup = Supervisor::new(&cfg);
+    sup.heartbeat(AUTONOMY, ts(0)).unwrap();
+    nominal_tick(&mut sup, ts(0));
+    sup.arm(AUTONOMY).unwrap();
+    sup.register(OTHER, ts(0)).unwrap();
+
+    sup.request_conn(OTHER, ts(1)).unwrap();
+    let d = nominal_tick(&mut sup, ts(1));
+    assert_eq!(d.conn, ConnState::Held(OTHER));
+    // Arming survives the transfer untouched, and no failsafe latches: a
+    // preemption hands the conn to someone who answers for the vessel, it
+    // does not abandon it.
+    assert_eq!(d.arming, ArmingState::Armed);
+    assert_eq!(d.failsafe, None);
+}
+
+#[test]
+fn ex_holder_release_after_preemption_is_a_noop() {
+    let cfg = config_with_priorities(ConnGrantDefault::Autonomy, &[(OTHER, 10)]);
+    let mut sup = Supervisor::new(&cfg);
+    sup.register(OTHER, ts(0)).unwrap();
+    sup.request_conn(OTHER, ts(1)).unwrap();
+    assert_eq!(sup.conn(), ConnState::Held(OTHER));
+    // AUTONOMY no longer holds the conn; release_conn checks holder
+    // identity, so its release fails and OTHER keeps the conn.
+    assert_eq!(sup.release_conn(AUTONOMY), Err(ClaimError::NotHolder));
+    assert_eq!(sup.conn(), ConnState::Held(OTHER));
+}
+
+#[test]
+fn grant_after_claimant_lost_clears_the_latch_for_any_new_holder() {
+    // request_conn's Held(_) and Unheld branches both clear claimant_lost on
+    // a grant; claimant_lost is only ever set alongside conn going Unheld
+    // (release-while-armed, or heartbeat staleness in tick), so a fresh
+    // grant always arrives through the Unheld branch. Priorities do not
+    // change that: what matters here is that the grant goes to a claimant
+    // other than the one that was lost, exercising the general "someone
+    // answers for the vessel again" rule rather than mere self-renewal.
+    let cfg = config_with_priorities(ConnGrantDefault::Autonomy, &[(OTHER, 10)]);
+    let mut sup = Supervisor::new(&cfg);
+    sup.register(OTHER, ts(0)).unwrap();
+    sup.heartbeat(AUTONOMY, ts(0)).unwrap();
+
+    // AUTONOMY goes stale; the conn is revoked and ClaimantLost latches.
+    let d = nominal_tick(&mut sup, ts(2 * HB_MS));
+    assert_eq!(d.conn, ConnState::Unheld);
+    assert_eq!(d.failsafe, Some(FailsafeCause::ClaimantLost));
+
+    // OTHER, not AUTONOMY, claims the now-unheld conn.
+    sup.request_conn(OTHER, ts(2 * HB_MS)).unwrap();
+    let d = nominal_tick(&mut sup, ts(2 * HB_MS + 10));
+    assert_eq!(d.conn, ConnState::Held(OTHER));
+    assert_eq!(d.failsafe, None);
 }
 
 // ------------------------------------------------------------------ arming

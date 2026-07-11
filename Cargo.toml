@@ -7,6 +7,8 @@ members = [
     "crates/coxswain-guidance",
     "crates/coxswain-supervisor",
     "crates/coxswain-manifest",
+    "crates/coxswain-nmea0183",
+    "crates/coxswain-crsf",
     "crates/coxswain-drivers",
     "crates/coxswain-sim",
     "crates/coxswain-keelson",
