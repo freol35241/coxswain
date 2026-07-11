@@ -7,6 +7,10 @@ pub enum Error {
     /// Structurally valid protobuf that violates the protocol: missing
     /// fields, out-of-range ids, over-capacity paths. Strict by default.
     Protocol(&'static str),
+    /// A setpoint numeric field decoded as NaN or infinite. Caught here so a
+    /// remote claimant streaming garbage never reaches guidance or the
+    /// actuators as a contract `Setpoint`.
+    NonFinite(&'static str),
     /// An RPC produced no reply within the timeout.
     Timeout,
 }
@@ -17,6 +21,7 @@ impl fmt::Display for Error {
             Error::Zenoh(e) => write!(f, "zenoh: {e}"),
             Error::Decode(e) => write!(f, "protobuf decode: {e}"),
             Error::Protocol(msg) => write!(f, "protocol: {msg}"),
+            Error::NonFinite(field) => write!(f, "setpoint field {field} is not finite"),
             Error::Timeout => f.write_str("rpc timeout"),
         }
     }

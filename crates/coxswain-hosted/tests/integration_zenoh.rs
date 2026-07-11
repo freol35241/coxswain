@@ -418,6 +418,24 @@ fn grant_revoke_failsafe_end_to_end() {
     let moved = dist_m(first_pos, last.position().unwrap());
     assert!(moved > 10.0, "moved only {moved:.1} m in 20 s");
 
+    // Direct remote control also crosses Keelson (D-025 overruled): a raw
+    // surge force demand drives the vessel same as HeadingSpeed, bypassing
+    // guidance's control law but not the supervisor or arming.
+    pump.set(Setpoint::DirectEffort(coxswain_contract::ForceDemand {
+        surge_n: 150.0,
+        sway_n: 0.0,
+        yaw_nm: 0.0,
+    }));
+    let direct = h.collect_for(Duration::from_secs(8));
+    let direct_last = direct
+        .last()
+        .expect("no status lines during direct effort leg");
+    assert_eq!(
+        direct_last.conn, "held:7",
+        "conn not held during direct effort leg"
+    );
+    assert!(direct_last.armed, "not armed during direct effort leg");
+
     // Silence. Within claimant_heartbeat (1 s) plus a couple of 100 ms ticks
     // the supervisor revokes the conn and latches ClaimantLost; the 1 Hz
     // status cadence and the pump's 500 ms phase add up to a few seconds of

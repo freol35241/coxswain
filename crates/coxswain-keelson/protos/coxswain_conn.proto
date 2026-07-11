@@ -58,11 +58,21 @@ message SetpointMsg {
     double speed_mps = 2;
   }
 
+  // A remote teleoperator's raw generalized-force demand, subject to the
+  // same conn/arming authority as any other setpoint (D-025 overruled: this
+  // is no longer local-only to the conn node's RC input).
+  message DirectEffort {
+    double surge_n = 1;
+    double sway_n = 2;
+    double yaw_nm = 3;
+  }
+
   oneof setpoint {
     Idle idle = 2;
     HeadingSpeed heading_speed = 3;
     StationKeep station_keep = 4;
     FollowPath follow_path = 5;
+    DirectEffort direct_effort = 6;
   }
 }
 

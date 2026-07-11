@@ -65,8 +65,8 @@ pub fn ned_cov_to_enu(cov: &Covariance) -> [f64; 9] {
     ]
 }
 
-pub fn setpoint_to_proto(sp: &Setpoint) -> Result<setpoint_msg::Setpoint, Error> {
-    Ok(match *sp {
+pub fn setpoint_to_proto(sp: &Setpoint) -> setpoint_msg::Setpoint {
+    match *sp {
         Setpoint::Idle => setpoint_msg::Setpoint::Idle(setpoint_msg::Idle {}),
         Setpoint::HeadingSpeed {
             heading_rad,
@@ -94,15 +94,28 @@ pub fn setpoint_to_proto(sp: &Setpoint) -> Result<setpoint_msg::Setpoint, Error>
                 speed_mps,
             })
         }
-        // Manual helm's raw force demand is local to the conn node (RC
-        // bypasses guidance, not the supervisor or arming, D-025) and never
-        // crosses Keelson; the wire schema deliberately has no case for it.
-        Setpoint::DirectEffort(_) => {
-            return Err(Error::Protocol(
-                "direct_effort setpoint is not wire-representable",
-            ));
+        // Direct remote control is a supported claimant story, not just the
+        // conn node's local RC input (D-025 overruled): a teleoperator's raw
+        // force demand crosses Keelson like any other setpoint.
+        Setpoint::DirectEffort(tau) => {
+            setpoint_msg::Setpoint::DirectEffort(setpoint_msg::DirectEffort {
+                surge_n: tau.surge_n,
+                sway_n: tau.sway_n,
+                yaw_nm: tau.yaw_nm,
+            })
         }
-    })
+    }
+}
+
+/// Rejects NaN and infinite values. Any of them reaching a contract
+/// `Setpoint` means a remote claimant's garbage input steers guidance or,
+/// for `DirectEffort`, the actuators directly.
+fn finite(v: f64, field: &'static str) -> Result<f64, Error> {
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        Err(Error::NonFinite(field))
+    }
 }
 
 pub fn setpoint_from_proto(msg: &SetpointMsg) -> Result<Setpoint, Error> {
@@ -116,14 +129,14 @@ pub fn setpoint_from_proto(msg: &SetpointMsg) -> Result<Setpoint, Error> {
             heading_rad,
             speed_mps,
         }) => Setpoint::HeadingSpeed {
-            heading_rad,
-            speed_mps,
+            heading_rad: finite(heading_rad, "heading_speed.heading_rad")?,
+            speed_mps: finite(speed_mps, "heading_speed.speed_mps")?,
         },
         setpoint_msg::Setpoint::StationKeep(setpoint_msg::StationKeep { lat_deg, lon_deg }) => {
             Setpoint::StationKeep {
                 position: GeoPoint {
-                    lat_rad: lat_deg.to_radians(),
-                    lon_rad: lon_deg.to_radians(),
+                    lat_rad: finite(lat_deg, "station_keep.lat_deg")?.to_radians(),
+                    lon_rad: finite(lon_deg, "station_keep.lon_deg")?.to_radians(),
                 },
             }
         }
@@ -131,16 +144,25 @@ pub fn setpoint_from_proto(msg: &SetpointMsg) -> Result<Setpoint, Error> {
             let mut path = BoundedList::new();
             for wp in &fp.waypoints {
                 path.push(GeoPoint {
-                    lat_rad: wp.lat_deg.to_radians(),
-                    lon_rad: wp.lon_deg.to_radians(),
+                    lat_rad: finite(wp.lat_deg, "follow_path.waypoints[].lat_deg")?.to_radians(),
+                    lon_rad: finite(wp.lon_deg, "follow_path.waypoints[].lon_deg")?.to_radians(),
                 })
                 .map_err(|_| Error::Protocol("follow_path over capacity"))?;
             }
             Setpoint::FollowPath {
                 path,
-                speed_mps: fp.speed_mps,
+                speed_mps: finite(fp.speed_mps, "follow_path.speed_mps")?,
             }
         }
+        setpoint_msg::Setpoint::DirectEffort(setpoint_msg::DirectEffort {
+            surge_n,
+            sway_n,
+            yaw_nm,
+        }) => Setpoint::DirectEffort(coxswain_contract::ForceDemand {
+            surge_n: finite(surge_n, "direct_effort.surge_n")?,
+            sway_n: finite(sway_n, "direct_effort.sway_n")?,
+            yaw_nm: finite(yaw_nm, "direct_effort.yaw_nm")?,
+        }),
     })
 }
 
@@ -189,6 +211,11 @@ mod tests {
                     assert!((p1.lon_rad - p2.lon_rad).abs() < TOL);
                 }
             }
+            // No unit conversion in either direction, so the roundtrip is
+            // bit-exact.
+            (Setpoint::DirectEffort(t1), Setpoint::DirectEffort(t2)) => {
+                assert_eq!(t1, t2);
+            }
             _ => panic!("variant mismatch: {a:?} vs {b:?}"),
         }
     }
@@ -196,7 +223,7 @@ mod tests {
     fn roundtrip(sp: Setpoint) {
         let msg = SetpointMsg {
             timestamp: Some(wall_to_proto(SystemTime::now())),
-            setpoint: Some(setpoint_to_proto(&sp).unwrap()),
+            setpoint: Some(setpoint_to_proto(&sp)),
         };
         // Through the actual wire bytes, not just the structs.
         let decoded = SetpointMsg::decode(msg.encode_to_vec().as_slice()).unwrap();
@@ -235,19 +262,49 @@ mod tests {
             path,
             speed_mps: 2.0,
         });
+        roundtrip(Setpoint::DirectEffort(coxswain_contract::ForceDemand {
+            surge_n: 120.0,
+            sway_n: -30.0,
+            yaw_nm: 4.5,
+        }));
     }
 
     #[test]
-    fn direct_effort_is_not_wire_representable() {
-        // D-025: manual helm never crosses Keelson, so the wire schema has
-        // no case for it; the conversion refuses rather than silently
-        // dropping or misrepresenting the setpoint.
-        let sp = Setpoint::DirectEffort(coxswain_contract::ForceDemand {
-            surge_n: 1.0,
-            sway_n: 0.0,
-            yaw_nm: 0.0,
-        });
-        assert!(matches!(setpoint_to_proto(&sp), Err(Error::Protocol(_))));
+    fn direct_effort_nan_surge_rejected() {
+        // A remote teleoperator's garbage input must not become a contract
+        // Setpoint: DirectEffort feeds the actuators directly, no guidance
+        // law in between to catch it.
+        let msg = SetpointMsg {
+            timestamp: None,
+            setpoint: Some(setpoint_msg::Setpoint::DirectEffort(
+                setpoint_msg::DirectEffort {
+                    surge_n: f64::NAN,
+                    sway_n: 0.0,
+                    yaw_nm: 0.0,
+                },
+            )),
+        };
+        assert!(matches!(
+            setpoint_from_proto(&msg),
+            Err(Error::NonFinite(_))
+        ));
+    }
+
+    #[test]
+    fn heading_speed_infinite_heading_rejected() {
+        let msg = SetpointMsg {
+            timestamp: None,
+            setpoint: Some(setpoint_msg::Setpoint::HeadingSpeed(
+                setpoint_msg::HeadingSpeed {
+                    heading_rad: f64::INFINITY,
+                    speed_mps: 1.0,
+                },
+            )),
+        };
+        assert!(matches!(
+            setpoint_from_proto(&msg),
+            Err(Error::NonFinite(_))
+        ));
     }
 
     #[test]
