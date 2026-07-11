@@ -114,7 +114,7 @@ Bring-up transports per D-021. Chosen for time-to-water, superseded in Phase 7.
       timestamping policy (acquisition time, monotonic source injected).
 - [x] NMEA 0183 parser crate: strict, sentence subset (GGA, RMC, HDT, VTG to
       start), quirk flags from manifest. Fuzz the parser.
-- [ ] GNSS driver over 0183. Covariance from HDOP and fix quality, which is
+- [x] GNSS driver over 0183. Covariance from HDOP and fix quality, which is
       crude and known to be crude; the estimator's declared noise parameters
       carry the weight until SBF lands.
 - [x] EKF predict safeguard: substep the Euler predict (or guard the
@@ -125,22 +125,27 @@ Bring-up transports per D-021. Chosen for time-to-water, superseded in Phase 7.
       Off the first-water critical path: the 2026-07-10 replay experiment
       shows a 5 Hz 0183 heading source suffices (heading RMSE ~1.5 deg, NEES
       healthy). Returns if trial data disagrees or higher speeds demand it.
-- [ ] PWM/serial actuator backend behind the driver trait. The conn/actuator
+- [x] PWM/serial actuator backend behind the driver trait. The conn/actuator
       role split (D-010) is preserved in software; the second firmware project
       is not yet required.
-- [ ] docs/hardware.md: the supported device list. Name what is on Seahorse and
+- [x] docs/hardware.md: the supported device list. Name what is on Seahorse and
       nothing else. "Quirks in configuration, not code" invites an unbounded
       device zoo; this doc is the fence.
-- [ ] coxswain-hosted on real /dev ports, systemd unit example.
+- [x] coxswain-hosted on real /dev ports, systemd unit example.
 - [x] RC receiver driver crate: CRSF frame parser (SBUS fallback if the
       hardware dictates), strict, fuzzed like the 0183 parser (D-025).
-- [ ] RC kill channel: switch position mapped to disarm at the conn node.
+- [x] RC kill channel: switch position mapped to disarm at the conn node.
       Lands before RC can hold the conn (D-025 sequencing).
 - [x] Claimant priority and preemption in the supervisor; priority declared
       per claimant in the manifest (v0.3). Direct-effort Setpoint variant in
       the contract for manual helm (D-025).
-- [ ] RC claimant adapter: transmitter switch to claimant verbs, sticks to
+- [x] RC claimant adapter: transmitter switch to claimant verbs, sticks to
       direct effort setpoints.
+- [ ] CRSF real baud: the hosted termios path sets standard POSIX bauds
+      only; 420000 needs termios2/BOTHER. Ptys mask this (hardware.md gap).
+- [ ] Power monitoring input path for the hosted real-serial mode; the
+      failsafe matrix currently sees a healthy default. Blocks armed
+      on-water operation (hardware.md gap). Mechanism decided on the bench.
 - [ ] First water trial behind a manual claimant (RC or teleop). Autonomy conn
       grant only after the failsafe matrix has both simulator and bench mileage.
 
