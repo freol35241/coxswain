@@ -13,7 +13,7 @@
 
 mod common;
 
-use coxswain_n2k::{DecodeError, decode_frame};
+use coxswain_n2k::{DecodeError, DecodedFrame, FastPacketAssembler, Outcome, decode_frame};
 
 const ITERATIONS: u64 = 5_000;
 
@@ -48,11 +48,16 @@ impl Rng {
 
 fn never_panics_and_typed(can_id: u32, data: &[u8]) {
     // The assertion is that this call returns at all, and that any error
-    // is the crate's one known variant; a panic fails the test on its own
-    // via unwind.
+    // is one of the crate's known variants; a panic fails the test on its
+    // own via unwind. FastPacketLength/FastPacketSequence are unreachable
+    // through decode_frame (single-frame path only, see lib.rs), but
+    // DecodeError is one enum shared with the fast-packet assembler, so
+    // the match stays exhaustive over all of it.
     match decode_frame(can_id, data) {
         Ok(_) => {}
         Err(DecodeError::PayloadLength) => {}
+        Err(DecodeError::FastPacketLength) => {}
+        Err(DecodeError::FastPacketSequence) => {}
     }
 }
 
@@ -143,4 +148,66 @@ fn mutate(base: &[u8], rng: &mut Rng) -> Vec<u8> {
         }
     }
     out
+}
+
+// --- FastPacketAssembler ----------------------------------------------
+
+/// The assertion is that this call returns at all (a panic fails the test
+/// via unwind, same as `never_panics_and_typed` above), and that a
+/// completed frame is never a phantom `Unknown` for the assembler's own
+/// registered PGN (129029): that would mean the reassembler synthesized a
+/// completion it had no business producing. `Unknown` for any other PGN is
+/// legitimate (the single-frame `decode_frame` delegation for routine
+/// unrecognized traffic).
+fn never_panics_and_never_phantom(out: Result<Option<DecodedFrame>, DecodeError>) {
+    match out {
+        Ok(Some(frame)) => {
+            if let Outcome::Unknown { pgn } = frame.outcome {
+                assert_ne!(
+                    pgn, 129029,
+                    "fast-packet reassembly produced Unknown for its own PGN"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(DecodeError::PayloadLength) => {}
+        Err(DecodeError::FastPacketLength) => {}
+        Err(DecodeError::FastPacketSequence) => {}
+    }
+}
+
+/// Random byte soup fed to the assembler instead of `decode_frame`
+/// directly: no structural relationship to a valid fast-packet transfer.
+#[test]
+fn fuzz_assembler_random_ids_and_payloads() {
+    let mut rng = Rng::new(10);
+    let mut assembler = FastPacketAssembler::new();
+    for _ in 0..ITERATIONS {
+        let can_id = rng.u32();
+        let len = rng.below(16);
+        let data: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+        never_panics_and_never_phantom(assembler.push(can_id, &data));
+    }
+}
+
+/// `can_id` fixed to PGN 129029 (this crate's one fast-packet PGN) with a
+/// random source address, 8-byte frame contents fully random: stresses the
+/// reassembler's own state machine (byte0 sequence/counter, slot matching,
+/// restart, eviction) far harder than pure random ids do, since every
+/// frame actually reaches the fast-packet code path. More sources (8) than
+/// the pool holds (4), so eviction is exercised continuously.
+#[test]
+fn fuzz_assembler_fast_packet_state_machine() {
+    let mut rng = Rng::new(11);
+    let mut assembler = FastPacketAssembler::new();
+    for _ in 0..ITERATIONS {
+        let priority = (rng.below(8)) as u8;
+        let source = (rng.below(8)) as u8;
+        let can_id = common::pack_can_id(priority, 129029, source, 0);
+        let mut data = [0u8; 8];
+        for b in data.iter_mut() {
+            *b = rng.byte();
+        }
+        never_panics_and_never_phantom(assembler.push(can_id, &data));
+    }
 }

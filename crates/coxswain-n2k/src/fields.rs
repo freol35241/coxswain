@@ -30,6 +30,19 @@ pub(crate) fn i32_le_at(data: &[u8], offset: usize) -> i32 {
     ])
 }
 
+pub(crate) fn i64_le_at(data: &[u8], offset: usize) -> i64 {
+    i64::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+    ])
+}
+
 /// `u8` sentinel (`0xFF`), no scaling: the raw code kept as-is (e.g. SID).
 pub(crate) fn opt_u8_raw(raw: u8) -> Option<u8> {
     if raw == u8::MAX { None } else { Some(raw) }
@@ -52,6 +65,12 @@ pub(crate) fn opt_u16_scaled(raw: u16, resolution: f64) -> Option<f64> {
     }
 }
 
+/// `u16` sentinel (`0xFFFF`), no scaling: the raw code kept as-is (e.g.
+/// Date, a day count rather than a physical quantity).
+pub(crate) fn opt_u16_raw(raw: u16) -> Option<u16> {
+    if raw == u16::MAX { None } else { Some(raw) }
+}
+
 pub(crate) fn opt_i16_scaled(raw: i16, resolution: f64) -> Option<f64> {
     if raw == i16::MAX {
         None
@@ -70,6 +89,14 @@ pub(crate) fn opt_u32_scaled(raw: u32, resolution: f64) -> Option<f64> {
 
 pub(crate) fn opt_i32_scaled(raw: i32, resolution: f64) -> Option<f64> {
     if raw == i32::MAX {
+        None
+    } else {
+        Some(raw as f64 * resolution)
+    }
+}
+
+pub(crate) fn opt_i64_scaled(raw: i64, resolution: f64) -> Option<f64> {
+    if raw == i64::MAX {
         None
     } else {
         Some(raw as f64 * resolution)

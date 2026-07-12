@@ -8,10 +8,9 @@
 //! D-011's second bus); this crate is handed frames already pulled off the
 //! wire by whatever transport layer lands then.
 //!
-//! Scope, per docs/TASKS.md Phase 7 and D-011: the initial PGN set, single
-//! CAN frame only. Fast-packet reassembly (needed for e.g. PGN 129029 GNSS
-//! Position Data, which spans several frames) is a documented follow-up,
-//! not built here.
+//! Scope, per docs/TASKS.md Phase 7 and D-011: the initial PGN set, plus
+//! fast-packet reassembly (`fast_packet::FastPacketAssembler`) for the one
+//! PGN that needs it so far, 129029 GNSS Position Data.
 //!
 //! **Enrichment only.** D-011: N2K is listen-only in the MVP, the second
 //! CAN bus, with no authority model of its own. Everything this crate
@@ -23,15 +22,17 @@
 #![no_std]
 
 mod error;
+mod fast_packet;
 mod fields;
 mod id;
 mod message;
 
 pub use error::DecodeError;
+pub use fast_packet::FastPacketAssembler;
 pub use id::{CanId, decode_can_id};
 pub use message::{
-    CogSogRapidUpdate, DirectionReference, Message, Outcome, PositionRapidUpdate, RateOfTurn,
-    VesselHeading, WaterDepth, WindData, WindReference,
+    CogSogRapidUpdate, DirectionReference, GnssMethod, GnssPositionData, Message, Outcome,
+    PositionRapidUpdate, RateOfTurn, VesselHeading, WaterDepth, WindData, WindReference,
 };
 
 /// A decoded frame's bus metadata (priority, source address) alongside its
