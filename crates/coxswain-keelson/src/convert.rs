@@ -118,6 +118,31 @@ fn finite(v: f64, field: &'static str) -> Result<f64, Error> {
     }
 }
 
+/// Wire-side geodetic bound: latitude degrees, checked before conversion to
+/// radians since StationKeep/Waypoint carry degrees on the wire.
+const LAT_DEG_MAX: f64 = 90.0;
+/// Wire-side geodetic bound: longitude degrees, same reasoning as
+/// `LAT_DEG_MAX`.
+const LON_DEG_MAX: f64 = 180.0;
+/// Heading bound in radians: HeadingSpeed carries radians on the wire
+/// already (no deg/rad conversion for that field), so the bound applies
+/// directly. A legitimate sender always sends a wrapped heading well inside
+/// one turn; the real failure this catches is unit confusion (degrees sent
+/// where the wire expects radians), which lands an order of magnitude past
+/// a full turn.
+const HEADING_RAD_MAX: f64 = 2.0 * core::f64::consts::PI;
+
+/// Rejects a value outside `[-bound, bound]`. A value that passes `finite`
+/// can still describe a geometrically impossible position or an
+/// implausible heading; this is the second, independent gate.
+fn bounded(v: f64, bound: f64, field: &'static str) -> Result<f64, Error> {
+    if v.abs() <= bound {
+        Ok(v)
+    } else {
+        Err(Error::OutOfRange(field))
+    }
+}
+
 pub fn setpoint_from_proto(msg: &SetpointMsg) -> Result<Setpoint, Error> {
     let oneof = msg
         .setpoint
@@ -129,14 +154,28 @@ pub fn setpoint_from_proto(msg: &SetpointMsg) -> Result<Setpoint, Error> {
             heading_rad,
             speed_mps,
         }) => Setpoint::HeadingSpeed {
-            heading_rad: finite(heading_rad, "heading_speed.heading_rad")?,
+            heading_rad: bounded(
+                finite(heading_rad, "heading_speed.heading_rad")?,
+                HEADING_RAD_MAX,
+                "heading_speed.heading_rad",
+            )?,
             speed_mps: finite(speed_mps, "heading_speed.speed_mps")?,
         },
         setpoint_msg::Setpoint::StationKeep(setpoint_msg::StationKeep { lat_deg, lon_deg }) => {
             Setpoint::StationKeep {
                 position: GeoPoint {
-                    lat_rad: finite(lat_deg, "station_keep.lat_deg")?.to_radians(),
-                    lon_rad: finite(lon_deg, "station_keep.lon_deg")?.to_radians(),
+                    lat_rad: bounded(
+                        finite(lat_deg, "station_keep.lat_deg")?,
+                        LAT_DEG_MAX,
+                        "station_keep.lat_deg",
+                    )?
+                    .to_radians(),
+                    lon_rad: bounded(
+                        finite(lon_deg, "station_keep.lon_deg")?,
+                        LON_DEG_MAX,
+                        "station_keep.lon_deg",
+                    )?
+                    .to_radians(),
                 },
             }
         }
@@ -144,8 +183,18 @@ pub fn setpoint_from_proto(msg: &SetpointMsg) -> Result<Setpoint, Error> {
             let mut path = BoundedList::new();
             for wp in &fp.waypoints {
                 path.push(GeoPoint {
-                    lat_rad: finite(wp.lat_deg, "follow_path.waypoints[].lat_deg")?.to_radians(),
-                    lon_rad: finite(wp.lon_deg, "follow_path.waypoints[].lon_deg")?.to_radians(),
+                    lat_rad: bounded(
+                        finite(wp.lat_deg, "follow_path.waypoints[].lat_deg")?,
+                        LAT_DEG_MAX,
+                        "follow_path.waypoints[].lat_deg",
+                    )?
+                    .to_radians(),
+                    lon_rad: bounded(
+                        finite(wp.lon_deg, "follow_path.waypoints[].lon_deg")?,
+                        LON_DEG_MAX,
+                        "follow_path.waypoints[].lon_deg",
+                    )?
+                    .to_radians(),
                 })
                 .map_err(|_| Error::Protocol("follow_path over capacity"))?;
             }
@@ -304,6 +353,143 @@ mod tests {
         assert!(matches!(
             setpoint_from_proto(&msg),
             Err(Error::NonFinite(_))
+        ));
+    }
+
+    /// A heading a full order of magnitude past one turn is the unit-
+    /// confusion case the bound exists to catch (e.g. degrees sent where
+    /// the wire expects radians); a legitimate wrapped heading never gets
+    /// close.
+    #[test]
+    fn heading_speed_past_bound_rejected() {
+        let msg = SetpointMsg {
+            timestamp: None,
+            setpoint: Some(setpoint_msg::Setpoint::HeadingSpeed(
+                setpoint_msg::HeadingSpeed {
+                    heading_rad: 2.0 * core::f64::consts::PI + 1e-9,
+                    speed_mps: 1.0,
+                },
+            )),
+        };
+        assert!(matches!(
+            setpoint_from_proto(&msg),
+            Err(Error::OutOfRange("heading_speed.heading_rad"))
+        ));
+    }
+
+    #[test]
+    fn heading_speed_at_bound_accepted() {
+        let msg = SetpointMsg {
+            timestamp: None,
+            setpoint: Some(setpoint_msg::Setpoint::HeadingSpeed(
+                setpoint_msg::HeadingSpeed {
+                    heading_rad: 2.0 * core::f64::consts::PI,
+                    speed_mps: 1.0,
+                },
+            )),
+        };
+        assert!(setpoint_from_proto(&msg).is_ok());
+    }
+
+    #[test]
+    fn station_keep_latitude_past_bound_rejected() {
+        let msg = SetpointMsg {
+            timestamp: None,
+            setpoint: Some(setpoint_msg::Setpoint::StationKeep(
+                setpoint_msg::StationKeep {
+                    lat_deg: 90.0 + 1e-9,
+                    lon_deg: 11.0,
+                },
+            )),
+        };
+        assert!(matches!(
+            setpoint_from_proto(&msg),
+            Err(Error::OutOfRange("station_keep.lat_deg"))
+        ));
+    }
+
+    #[test]
+    fn station_keep_latitude_at_bound_accepted() {
+        let msg = SetpointMsg {
+            timestamp: None,
+            setpoint: Some(setpoint_msg::Setpoint::StationKeep(
+                setpoint_msg::StationKeep {
+                    lat_deg: 90.0,
+                    lon_deg: 11.0,
+                },
+            )),
+        };
+        assert!(setpoint_from_proto(&msg).is_ok());
+    }
+
+    #[test]
+    fn station_keep_longitude_past_bound_rejected() {
+        let msg = SetpointMsg {
+            timestamp: None,
+            setpoint: Some(setpoint_msg::Setpoint::StationKeep(
+                setpoint_msg::StationKeep {
+                    lat_deg: 58.0,
+                    lon_deg: 180.0 + 1e-9,
+                },
+            )),
+        };
+        assert!(matches!(
+            setpoint_from_proto(&msg),
+            Err(Error::OutOfRange("station_keep.lon_deg"))
+        ));
+    }
+
+    #[test]
+    fn station_keep_longitude_at_bound_accepted() {
+        let msg = SetpointMsg {
+            timestamp: None,
+            setpoint: Some(setpoint_msg::Setpoint::StationKeep(
+                setpoint_msg::StationKeep {
+                    lat_deg: 58.0,
+                    lon_deg: 180.0,
+                },
+            )),
+        };
+        assert!(setpoint_from_proto(&msg).is_ok());
+    }
+
+    #[test]
+    fn follow_path_waypoint_latitude_past_bound_rejected() {
+        let msg = SetpointMsg {
+            timestamp: None,
+            setpoint: Some(setpoint_msg::Setpoint::FollowPath(
+                setpoint_msg::FollowPath {
+                    waypoints: vec![setpoint_msg::Waypoint {
+                        lat_deg: -90.0 - 1e-9,
+                        lon_deg: 11.0,
+                    }],
+                    speed_mps: 1.0,
+                },
+            )),
+        };
+        assert!(matches!(
+            setpoint_from_proto(&msg),
+            Err(Error::OutOfRange("follow_path.waypoints[].lat_deg"))
+        ));
+    }
+
+    #[test]
+    fn follow_path_waypoint_longitude_past_bound_rejected() {
+        let msg = SetpointMsg {
+            timestamp: None,
+            setpoint: Some(setpoint_msg::Setpoint::FollowPath(
+                setpoint_msg::FollowPath {
+                    waypoints: vec![setpoint_msg::Waypoint {
+                        lat_deg: 58.0,
+                        lon_deg: -180.0 - 1e-9,
+                    }],
+                    speed_mps: 1.0,
+                },
+            )),
+        };
+        assert!(matches!(
+            setpoint_from_proto(&msg),
+            Err(Error::OutOfRange("follow_path.waypoints[].lon_deg"))
         ));
     }
 

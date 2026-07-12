@@ -11,6 +11,11 @@ pub enum Error {
     /// remote claimant streaming garbage never reaches guidance or the
     /// actuators as a contract `Setpoint`.
     NonFinite(&'static str),
+    /// A setpoint geodetic or heading field decoded finite but outside its
+    /// geometric bound. Caught here so a geometrically impossible position,
+    /// or a heading far enough past a full turn to signal unit confusion,
+    /// never reaches guidance as a contract `Setpoint`.
+    OutOfRange(&'static str),
     /// An RPC produced no reply within the timeout.
     Timeout,
 }
@@ -22,6 +27,7 @@ impl fmt::Display for Error {
             Error::Decode(e) => write!(f, "protobuf decode: {e}"),
             Error::Protocol(msg) => write!(f, "protocol: {msg}"),
             Error::NonFinite(field) => write!(f, "setpoint field {field} is not finite"),
+            Error::OutOfRange(field) => write!(f, "setpoint field {field} is out of range"),
             Error::Timeout => f.write_str("rpc timeout"),
         }
     }

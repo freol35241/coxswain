@@ -8,6 +8,7 @@ mod ekf;
 // simulator anchor the model's local NED state to geodetic truth (D-020).
 pub use coxswain_model::LocalFrame;
 
+use core::f64::consts::{FRAC_PI_2, PI};
 use core::time::Duration;
 
 use coxswain_contract::{
@@ -23,13 +24,19 @@ use ekf::{Ekf, ProcessModel};
 /// list, or no sensor entry at all. `NotLicensed`: listed, but the license is
 /// not `InnerLoop`. `OutOfOrder`: timestamp behind the filter. `NonFinite`: a
 /// value or declared std is NaN/infinite; caught at the boundary so one bad
-/// sample cannot poison the filter through the Kalman gain.
+/// sample cannot poison the filter through the Kalman gain. `InvalidStd`: a
+/// declared std is finite but not strictly positive; zero or negative reaches
+/// the Kalman gain as a division and would poison the filter the same way a
+/// non-finite one does. `OutOfRange`: a GNSS position's lat/lon is finite but
+/// geometrically impossible.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Rejection {
     UnknownSensor,
     NotLicensed,
     OutOfOrder,
     NonFinite,
+    InvalidStd,
+    OutOfRange,
 }
 
 /// The three fused measurement roles, named for what is measured rather than
@@ -128,13 +135,21 @@ impl Estimator {
     }
 
     /// Predict to m.t, then update. Rejects a non-finite value or declared
-    /// std before anything else runs (NonFinite), then measurements from
-    /// sensors not in the config's fusion lists (UnknownSensor), sensors
+    /// std before anything else runs (NonFinite), then a declared std that
+    /// is finite but not strictly positive (InvalidStd), then a GNSS
+    /// position outside the geodetic bounds (OutOfRange), then measurements
+    /// from sensors not in the config's fusion lists (UnknownSensor), sensors
     /// whose license is not InnerLoop (NotLicensed), and timestamps behind
     /// the filter (OutOfOrder).
     pub fn handle(&mut self, m: &Measurement) -> Result<(), Rejection> {
         if !Self::values_finite(&m.kind) {
             return Err(Rejection::NonFinite);
+        }
+        if !Self::std_positive(&m.kind) {
+            return Err(Rejection::InvalidStd);
+        }
+        if !Self::position_in_range(&m.kind) {
+            return Err(Rejection::OutOfRange);
         }
         let role = match m.kind {
             MeasurementKind::GnssPosition { .. } => Role::Gnss,
@@ -315,6 +330,29 @@ impl Estimator {
         }
     }
 
+    /// True when kind's declared std is strictly positive. A zero or
+    /// negative std would otherwise reach the Kalman gain as a division,
+    /// poisoning the filter the same way a non-finite std does.
+    fn std_positive(kind: &MeasurementKind) -> bool {
+        match *kind {
+            MeasurementKind::GnssPosition { std_m, .. } => std_m > 0.0,
+            MeasurementKind::Heading { std_rad, .. } => std_rad > 0.0,
+            MeasurementKind::YawRate { std_radps, .. } => std_radps > 0.0,
+        }
+    }
+
+    /// True unless a GNSS fix's lat/lon is finite but geometrically
+    /// impossible (|lat| > pi/2 or |lon| > pi). Heading and yaw rate carry
+    /// no positional bound.
+    fn position_in_range(kind: &MeasurementKind) -> bool {
+        match *kind {
+            MeasurementKind::GnssPosition { position, .. } => {
+                position.lat_rad.abs() <= FRAC_PI_2 && position.lon_rad.abs() <= PI
+            }
+            MeasurementKind::Heading { .. } | MeasurementKind::YawRate { .. } => true,
+        }
+    }
+
     /// Test-only seam: pokes NaN directly into the filter state, bypassing
     /// intake (which now rejects non-finite measurements before they reach
     /// here). Exists so the health backstop stays exercised for the case it
@@ -450,6 +488,17 @@ mod tests {
         }
     }
 
+    fn yaw_rate_at(t: f64, sensor: SensorId) -> Measurement {
+        Measurement {
+            sensor,
+            t: ts(t),
+            kind: MeasurementKind::YawRate {
+                yaw_rate_radps: 0.05,
+                std_radps: 0.01,
+            },
+        }
+    }
+
     fn initialized() -> Estimator {
         let mut est = Estimator::new(&config());
         est.handle(&gnss_at(1.0)).unwrap();
@@ -556,6 +605,106 @@ mod tests {
             *std_rad = f64::NAN;
         }
         assert_eq!(est.handle(&bad), Err(Rejection::NonFinite));
+    }
+
+    /// A finite but geometrically impossible GNSS latitude is rejected,
+    /// distinct from NonFinite.
+    #[test]
+    fn out_of_range_gnss_latitude_is_rejected() {
+        let mut est = initialized();
+        let mut bad = gnss_at(1.3);
+        if let MeasurementKind::GnssPosition { position, .. } = &mut bad.kind {
+            position.lat_rad = FRAC_PI_2 + 0.01;
+        }
+        assert_eq!(est.handle(&bad), Err(Rejection::OutOfRange));
+    }
+
+    #[test]
+    fn out_of_range_gnss_longitude_is_rejected() {
+        let mut est = initialized();
+        let mut bad = gnss_at(1.3);
+        if let MeasurementKind::GnssPosition { position, .. } = &mut bad.kind {
+            position.lon_rad = PI + 0.01;
+        }
+        assert_eq!(est.handle(&bad), Err(Rejection::OutOfRange));
+    }
+
+    /// The geodetic bound is inclusive: exactly pi/2 is a legitimate pole
+    /// fix, not a rejection.
+    #[test]
+    fn gnss_latitude_at_the_bound_is_accepted() {
+        let mut est = initialized();
+        let mut boundary = gnss_at(1.3);
+        if let MeasurementKind::GnssPosition { position, .. } = &mut boundary.kind {
+            position.lat_rad = FRAC_PI_2;
+        }
+        assert_eq!(est.handle(&boundary), Ok(()));
+    }
+
+    /// A zero declared std is rejected for every MeasurementKind: it would
+    /// otherwise divide the Kalman gain by zero.
+    #[test]
+    fn zero_std_is_rejected_for_every_measurement_kind() {
+        let mut est = initialized();
+
+        let mut bad_gnss = gnss_at(1.3);
+        if let MeasurementKind::GnssPosition { std_m, .. } = &mut bad_gnss.kind {
+            *std_m = 0.0;
+        }
+        assert_eq!(est.handle(&bad_gnss), Err(Rejection::InvalidStd));
+
+        let mut bad_heading = heading_at(1.3, COMPASS);
+        if let MeasurementKind::Heading { std_rad, .. } = &mut bad_heading.kind {
+            *std_rad = 0.0;
+        }
+        assert_eq!(est.handle(&bad_heading), Err(Rejection::InvalidStd));
+
+        let mut bad_yaw = yaw_rate_at(1.3, GYRO);
+        if let MeasurementKind::YawRate { std_radps, .. } = &mut bad_yaw.kind {
+            *std_radps = 0.0;
+        }
+        assert_eq!(est.handle(&bad_yaw), Err(Rejection::InvalidStd));
+    }
+
+    /// A negative declared std is rejected the same way as zero: `> 0.0`
+    /// catches sign, not just magnitude.
+    #[test]
+    fn negative_std_is_rejected() {
+        let mut est = initialized();
+        let mut bad = gnss_at(1.3);
+        if let MeasurementKind::GnssPosition { std_m, .. } = &mut bad.kind {
+            *std_m = -2.0;
+        }
+        assert_eq!(est.handle(&bad), Err(Rejection::InvalidStd));
+    }
+
+    /// One bad sample costs nothing, whatever the rejection reason: state
+    /// and health after the attempt match a run that never saw it (same
+    /// property as the NonFinite case above).
+    #[test]
+    fn out_of_range_and_invalid_std_leave_filter_unchanged() {
+        let baseline = initialized();
+
+        let mut with_bad_range = initialized();
+        let mut bad_range = gnss_at(1.3);
+        if let MeasurementKind::GnssPosition { position, .. } = &mut bad_range.kind {
+            position.lat_rad = FRAC_PI_2 + 0.01;
+        }
+        assert_eq!(
+            with_bad_range.handle(&bad_range),
+            Err(Rejection::OutOfRange)
+        );
+        assert_eq!(with_bad_range.state(ts(2.0)), baseline.state(ts(2.0)));
+        assert_eq!(with_bad_range.health(ts(2.0)), baseline.health(ts(2.0)));
+
+        let mut with_bad_std = initialized();
+        let mut bad_std = heading_at(1.3, COMPASS);
+        if let MeasurementKind::Heading { std_rad, .. } = &mut bad_std.kind {
+            *std_rad = 0.0;
+        }
+        assert_eq!(with_bad_std.handle(&bad_std), Err(Rejection::InvalidStd));
+        assert_eq!(with_bad_std.state(ts(2.0)), baseline.state(ts(2.0)));
+        assert_eq!(with_bad_std.health(ts(2.0)), baseline.health(ts(2.0)));
     }
 
     #[test]
