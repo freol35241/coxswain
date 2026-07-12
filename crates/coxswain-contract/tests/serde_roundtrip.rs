@@ -4,10 +4,10 @@
 use core::time::Duration;
 
 use coxswain_contract::{
-    AUTONOMY, BodyVelocity, BoundedList, ClaimantId, ClaimantPriority, ConnGrantDefault,
-    EstimatorConfig, Fossen3DofParams, GeoPoint, GeofenceAction, GeofenceConfig, License,
-    ModelParams, Pose, SensorConfig, SensorId, SensorRole, SupervisorConfig, Timestamp,
-    VesselConfig, VesselState,
+    AUTONOMY, ActuatorOutputs, BodyVelocity, BoundedList, ClaimantId, ClaimantPriority,
+    ConnGrantDefault, EffectorConfig, EffectorId, EffectorKind, EstimatorConfig, Fossen3DofParams,
+    GeoPoint, GeofenceAction, GeofenceConfig, License, ModelParams, Pose, SensorConfig, SensorId,
+    SensorRole, SupervisorConfig, Timestamp, VesselConfig, VesselState,
 };
 
 fn geo(lon_deg: f64, lat_deg: f64) -> GeoPoint {
@@ -79,6 +79,28 @@ fn seahorse_config() -> VesselConfig {
             }])
             .unwrap(),
         },
+        effectors: BoundedList::from_slice(&[
+            EffectorConfig {
+                id: EffectorId(0),
+                kind: EffectorKind::FixedThruster {
+                    pos_x_m: -1.5,
+                    pos_y_m: 0.4,
+                    azimuth_rad: 0.0,
+                    max_thrust_fwd_n: 400.0,
+                    max_thrust_rev_n: 250.0,
+                },
+            },
+            EffectorConfig {
+                id: EffectorId(1),
+                kind: EffectorKind::Rudder {
+                    pos_x_m: -1.8,
+                    side_force_n_per_rad_mps2: 400.0,
+                    max_angle_rad: 0.6,
+                    min_effective_speed_mps: 0.5,
+                },
+            },
+        ])
+        .unwrap(),
     }
 }
 
@@ -140,4 +162,15 @@ fn vessel_state_roundtrip() {
 fn bounded_list_over_capacity_fails_to_deserialize() {
     let result: Result<BoundedList<u16, 4>, _> = serde_json::from_str("[1, 2, 3, 4, 5]");
     assert!(result.is_err());
+}
+
+#[test]
+fn actuator_outputs_roundtrip() {
+    let outputs = ActuatorOutputs {
+        t: Timestamp::from_nanos(42_000_000),
+        values: BoundedList::from_slice(&[180.0, -0.35]).unwrap(),
+    };
+    let json = serde_json::to_string(&outputs).unwrap();
+    let back: ActuatorOutputs = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, outputs);
 }

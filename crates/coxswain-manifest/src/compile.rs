@@ -502,6 +502,9 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
             sensors: sensor_configs,
             estimator,
             supervisor,
+            // The effector table is manifest v0.4 schema work (D-026); the
+            // compiler emits an empty list until it lands.
+            effectors: BoundedList::new(),
         },
         buses,
         sensors,

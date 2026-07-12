@@ -326,6 +326,7 @@ mod tests {
                 },
                 claimant_priorities: BoundedList::new(),
             },
+            effectors: BoundedList::new(),
         }
     }
 

@@ -365,6 +365,7 @@ pub fn test_config(model: ModelParams) -> VesselConfig {
             },
             claimant_priorities: BoundedList::new(),
         },
+        effectors: BoundedList::new(),
     }
 }
 

@@ -100,6 +100,7 @@ fn config(geofence: GeofenceConfig) -> VesselConfig {
             }])
             .unwrap(),
         },
+        effectors: BoundedList::new(),
     }
 }
 

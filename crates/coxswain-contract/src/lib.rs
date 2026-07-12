@@ -8,6 +8,7 @@ mod actuator;
 mod bounded;
 mod config;
 mod conn;
+mod effector;
 mod geo;
 mod guidance;
 mod health;
@@ -24,6 +25,9 @@ pub use config::{
     VesselConfig,
 };
 pub use conn::{AUTONOMY, ArmingState, ClaimantId, ConnState};
+pub use effector::{
+    ActuationCapability, ActuatorOutputs, EffectorConfig, EffectorId, EffectorKind, MAX_EFFECTORS,
+};
 pub use geo::GeoPoint;
 pub use guidance::Setpoint;
 pub use health::{EstimatorHealth, HealthLevel};

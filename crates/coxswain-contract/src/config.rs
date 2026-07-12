@@ -5,6 +5,7 @@ use core::time::Duration;
 
 use crate::bounded::BoundedList;
 use crate::conn::ClaimantId;
+use crate::effector::{EffectorConfig, MAX_EFFECTORS};
 use crate::geo::GeoPoint;
 
 /// Declared trust level of a sensor. `InnerLoop` may be fused and participates
@@ -165,4 +166,7 @@ pub struct VesselConfig {
     pub sensors: BoundedList<SensorConfig, 16>,
     pub estimator: EstimatorConfig,
     pub supervisor: SupervisorConfig,
+    /// Empty means no allocation stage: guidance tau goes to the backend
+    /// directly (the pre-D-026 sim behavior).
+    pub effectors: BoundedList<EffectorConfig, MAX_EFFECTORS>,
 }

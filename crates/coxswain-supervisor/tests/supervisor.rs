@@ -91,6 +91,7 @@ fn config_with_fence(grant: ConnGrantDefault, fence: GeofenceConfig) -> VesselCo
             geofence: fence,
             claimant_priorities: BoundedList::new(),
         },
+        effectors: BoundedList::new(),
     }
 }
 
