@@ -16,3 +16,6 @@ libm = "0.2"
 [dev-dependencies]
 # The closed-loop plant is the only honest test bench for guidance (D-020).
 coxswain-sim = { path = "../coxswain-sim" }
+# Closed-loop underactuation tests need the allocator in the loop: guidance
+# tau alone does not exercise the drift-and-reapproach hold honestly.
+coxswain-allocation = { path = "../coxswain-allocation" }

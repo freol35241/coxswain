@@ -6,8 +6,10 @@
 use core::f64::consts::PI;
 use core::time::Duration;
 
+use coxswain_allocation::{Allocator, capability};
 use coxswain_contract::{
-    ActuatorCommand, BodyVelocity, BoundedList, ConnGrantDefault, EstimatorConfig, ForceDemand,
+    ActuationCapability, ActuatorCommand, ActuatorOutputs, BodyVelocity, BoundedList,
+    ConnGrantDefault, EffectorConfig, EffectorId, EffectorKind, EstimatorConfig, ForceDemand,
     Fossen3DofParams, GeoPoint, GeofenceAction, GeofenceConfig, ModelParams, Setpoint,
     SupervisorConfig, Timestamp, VesselConfig, VesselState,
 };
@@ -74,7 +76,7 @@ impl Bench {
     fn new(seed: u64) -> Self {
         Self {
             sim: Simulator::new(&seahorse(), origin(), Timestamp::from_nanos(0), seed).unwrap(),
-            guidance: Guidance::new(&config()),
+            guidance: Guidance::new(&config(), ActuationCapability::FULL),
             frame: LocalFrame::new(origin()),
         }
     }
@@ -286,4 +288,207 @@ fn determinism() {
         (0..1000).map(|_| bench.tick(&sp).1).collect::<Vec<_>>()
     };
     assert_eq!(run(), run());
+}
+
+// ---------------------------------------------- underactuated hull (D-026)
+//
+// A hull with no sway authority gets guidance's drift-and-reapproach hold
+// instead of the DP-style point hold. These benches run the honest loop:
+// guidance's tau goes through coxswain-allocation's Allocator onto the
+// effector table, and the simulator is driven by the achieved tau
+// (`apply_outputs`), not the raw demand, so saturation and the rudder's
+// speed-scheduled authority are actually in play.
+
+/// Guidance's drift-and-reapproach radii (D-026), mirrored here so the test
+/// can assert against them independently of the guidance crate's private
+/// constants.
+const DRIFT_RADIUS_M: f64 = 4.0;
+const REAPPROACH_RADIUS_M: f64 = 10.0;
+
+const ZERO_DEMAND: ForceDemand = ForceDemand {
+    surge_n: 0.0,
+    sway_n: 0.0,
+    yaw_nm: 0.0,
+};
+
+/// ESC (centerline thruster) plus a rudder astern: no sway authority, no
+/// yaw authority at rest (rudder lift needs speed), the shape the
+/// drift-and-reapproach hold exists for.
+fn esc_and_rudder() -> [EffectorConfig; 2] {
+    [
+        EffectorConfig {
+            id: EffectorId(0),
+            kind: EffectorKind::FixedThruster {
+                pos_x_m: 1.0,
+                pos_y_m: 0.0,
+                azimuth_rad: 0.0,
+                max_thrust_fwd_n: 200.0,
+                max_thrust_rev_n: 120.0,
+            },
+        },
+        EffectorConfig {
+            id: EffectorId(1),
+            kind: EffectorKind::Rudder {
+                pos_x_m: -1.5,
+                side_force_n_per_rad_mps2: 400.0,
+                max_angle_rad: 0.6,
+                min_effective_speed_mps: 0.5,
+            },
+        },
+    ]
+}
+
+struct UnderactuatedBench {
+    sim: Simulator,
+    guidance: Guidance,
+    allocator: Allocator,
+    frame: LocalFrame,
+}
+
+impl UnderactuatedBench {
+    fn new(seed: u64) -> Self {
+        let effectors = esc_and_rudder();
+        let mut sim =
+            Simulator::new(&seahorse(), origin(), Timestamp::from_nanos(0), seed).unwrap();
+        sim.set_effectors(&effectors);
+        Self {
+            // Capability derived from the same table the allocator uses,
+            // not hand-typed, so guidance and allocator cannot disagree
+            // about what the hull can do.
+            guidance: Guidance::new(&config(), capability(&effectors)),
+            allocator: Allocator::new(&effectors).unwrap(),
+            sim,
+            frame: LocalFrame::new(origin()),
+        }
+    }
+
+    /// One tick through the honest loop: guidance tau -> allocator ->
+    /// achieved tau applied to the plant.
+    fn tick(&mut self, sp: &Setpoint) -> (VesselState, ForceDemand) {
+        let state = self.sim.truth();
+        let demand = self.guidance.tick(sp, &state);
+        let alloc = self.allocator.allocate(demand, state.velocity.surge_mps);
+        self.sim.apply_outputs(&ActuatorOutputs {
+            t: self.sim.now(),
+            values: alloc.values,
+        });
+        self.sim.step(TICK);
+        (state, demand)
+    }
+
+    fn local(&self, state: &VesselState) -> (f64, f64) {
+        self.frame.to_local(state.pose.position)
+    }
+}
+
+#[test]
+fn underactuated_station_keep_drifts_then_reapproaches_after_displacement() {
+    let mut bench = UnderactuatedBench::new(11);
+    let target_local = (40.0, 0.0);
+    let target = bench.frame.to_geo(target_local.0, target_local.1);
+    let sp = Setpoint::StationKeep { position: target };
+
+    let dist_to_target = |bench: &UnderactuatedBench, state: &VesselState| {
+        let (n, e) = bench.local(state);
+        ((n - target_local.0).powi(2) + (e - target_local.1).powi(2)).sqrt()
+    };
+
+    // Phase 1: transit from 40 m out, enter the drift radius, go quiet.
+    let mut entered_drift = false;
+    for i in 0..3000 {
+        let (state, demand) = bench.tick(&sp);
+        let dist = dist_to_target(&bench, &state);
+        if dist < DRIFT_RADIUS_M {
+            entered_drift = true;
+        }
+        if entered_drift {
+            assert_eq!(
+                demand, ZERO_DEMAND,
+                "tick {i}: dist {dist:.2} m, demand {demand:?}"
+            );
+        }
+        assert!(
+            dist <= REAPPROACH_RADIUS_M || demand != ZERO_DEMAND,
+            "tick {i}: idled outside REAPPROACH_RADIUS_M, dist {dist:.2} m"
+        );
+    }
+    assert!(
+        entered_drift,
+        "never entered the drift radius from 40 m out"
+    );
+
+    // Phase 2: bump the vessel 15 m off the drift point, well outside
+    // REAPPROACH_RADIUS_M, and confirm it reapproaches and goes quiet again.
+    bench.sim.displace(15.0, 0.0);
+    let mut redisplaced_drift = false;
+    for i in 0..3000 {
+        let (state, demand) = bench.tick(&sp);
+        let dist = dist_to_target(&bench, &state);
+        if dist < DRIFT_RADIUS_M {
+            redisplaced_drift = true;
+        }
+        if redisplaced_drift {
+            assert_eq!(
+                demand, ZERO_DEMAND,
+                "post-displacement tick {i}: dist {dist:.2} m, demand {demand:?}"
+            );
+        }
+        assert!(
+            dist <= REAPPROACH_RADIUS_M || demand != ZERO_DEMAND,
+            "post-displacement tick {i}: idled outside REAPPROACH_RADIUS_M, dist {dist:.2} m"
+        );
+    }
+    assert!(
+        redisplaced_drift,
+        "never re-entered the drift radius after displacement"
+    );
+}
+
+/// Stands in for the supervisor's ClaimantLost directive, which latches
+/// StationKeep at the vessel's current position (the honest
+/// supervisor-in-the-loop version lives in coxswain-hosted's tests).
+#[test]
+fn underactuated_claimant_lost_latches_and_holds() {
+    let mut bench = UnderactuatedBench::new(23);
+    let transit_sp = Setpoint::HeadingSpeed {
+        heading_rad: 0.0,
+        speed_mps: 1.2,
+    };
+    for _ in 0..150 {
+        bench.tick(&transit_sp);
+    }
+    let latch_state = bench.sim.truth();
+    let latch_local = bench.local(&latch_state);
+    let hold_sp = Setpoint::StationKeep {
+        position: latch_state.pose.position,
+    };
+
+    let mut settled = false;
+    let mut max_excursion_after_settle = 0.0_f64;
+    for _ in 0..3000 {
+        let (state, _demand) = bench.tick(&hold_sp);
+        let (n, e) = bench.local(&state);
+        let dist = ((n - latch_local.0).powi(2) + (e - latch_local.1).powi(2)).sqrt();
+        if dist < DRIFT_RADIUS_M {
+            settled = true;
+        }
+        if settled {
+            max_excursion_after_settle = max_excursion_after_settle.max(dist);
+        }
+    }
+    println!("claimant-lost hold: max excursion after settling {max_excursion_after_settle:.2} m");
+    assert!(
+        settled,
+        "never came to rest inside the drift radius after claimant loss"
+    );
+    // The run is deterministic (truth is fed straight back, no sensor
+    // noise in the loop) and settles with an observed excursion of 7.81 m:
+    // coasting distance under drag after guidance goes quiet at the drift
+    // boundary. 9 m gives margin over that observed value while staying
+    // comfortably inside REAPPROACH_RADIUS_M so hysteresis cannot flip back
+    // to approaching.
+    assert!(
+        max_excursion_after_settle <= 9.0,
+        "excursion {max_excursion_after_settle:.2} m past the latch point"
+    );
 }

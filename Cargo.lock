@@ -380,6 +380,7 @@ dependencies = [
 name = "coxswain-guidance"
 version = "0.1.0"
 dependencies = [
+ "coxswain-allocation",
  "coxswain-contract",
  "coxswain-model",
  "coxswain-sim",

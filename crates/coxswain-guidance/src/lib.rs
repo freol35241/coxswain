@@ -3,15 +3,21 @@
 //! Allocation to physical actuators is downstream (D-021).
 //!
 //! LOS path following with waypoint sequencing, heading and speed control,
-//! two-zone station-keeping. Pure except for path progress: the current
-//! segment index and the station-keeping hold heading persist across ticks,
-//! and a changed setpoint resets both.
+//! station-keeping licensed by the vessel's actuation capability (D-026): a
+//! hull with sway authority gets the two-zone DP-style point hold, one
+//! without gets drift-and-reapproach instead, since chasing a point hold it
+//! cannot deliver just wastes the analysis. Pure except for path progress:
+//! the current segment index, the station-keeping hold heading, and the
+//! drift/approach regime persist across ticks, and a changed setpoint resets
+//! all three.
 
 #![no_std]
 
 use core::f64::consts::PI;
 
-use coxswain_contract::{ForceDemand, GeoPoint, ModelParams, Setpoint, VesselConfig, VesselState};
+use coxswain_contract::{
+    ActuationCapability, ForceDemand, GeoPoint, ModelParams, Setpoint, VesselConfig, VesselState,
+};
 use coxswain_model::LocalFrame;
 
 // Provisional v1 constants at Seahorse scale, one block so retuning after
@@ -52,6 +58,21 @@ const NEAR_ZONE_M: f64 = 5.0;
 const APPROACH_GAIN_PER_S: f64 = 0.3;
 const APPROACH_MAX_MPS: f64 = 1.5;
 
+/// Drift-and-reapproach hold for a hull without sway authority (D-026).
+/// Inside this radius, guidance goes quiet and lets the vessel drift rather
+/// than fight for a point hold it cannot deliver; set inside ACCEPT_RADIUS_M
+/// so a vessel arriving under the ordinary waypoint-acceptance story is
+/// already close enough to drift sensibly.
+const DRIFT_RADIUS_M: f64 = 4.0;
+/// Outside this radius, drifting hands back to an active transit leg. Kept
+/// well clear of DRIFT_RADIUS_M so hysteresis between the two prevents
+/// limit-cycling between quiet and transit at a single boundary.
+const REAPPROACH_RADIUS_M: f64 = 10.0;
+/// Minimum commanded surge speed while approaching an underactuated
+/// station-keep target. Rudder authority scales with u^2 (D-026): arriving
+/// at creep speed means arriving with no flow over the rudder to steer.
+const STEERAGE_MPS: f64 = 0.4;
+
 /// Near-zone position P gain and velocity damping. Sized against the
 /// Seahorse surge inertia (m - X_udot = 228 kg) for ~0.3 rad/s and roughly
 /// critical damping; sway leans on the plant's own strong damping.
@@ -77,16 +98,24 @@ struct Gains {
 
 pub struct Guidance {
     gains: Gains,
-    /// Last setpoint seen; a change resets path progress and hold heading.
+    /// What the effector table can deliver (D-026); carried data, not
+    /// derived here, so guidance stays testable with hand-built values.
+    capability: ActuationCapability,
+    /// Last setpoint seen; a change resets path progress, hold heading, and
+    /// the drift/approach regime.
     last: Option<Setpoint>,
     /// FollowPath progress: the active segment runs path[seg] -> path[seg+1].
     seg: usize,
     /// Station-keeping near zone: heading captured on zone entry and held.
     hold_heading: Option<f64>,
+    /// Drift-and-reapproach regime for a hull without sway authority: true
+    /// once inside DRIFT_RADIUS_M, false once outside REAPPROACH_RADIUS_M,
+    /// unchanged between the two (hysteresis).
+    drifting: bool,
 }
 
 impl Guidance {
-    pub fn new(config: &VesselConfig) -> Self {
+    pub fn new(config: &VesselConfig, capability: ActuationCapability) -> Self {
         let gains = match config.estimator.model {
             ModelParams::Fossen3Dof(p) => {
                 // Yaw loop N = kp e - kd r on I r_dot = N + N_r r with
@@ -120,9 +149,11 @@ impl Guidance {
         };
         Self {
             gains,
+            capability,
             last: None,
             seg: 0,
             hold_heading: None,
+            drifting: false,
         }
     }
 
@@ -133,6 +164,7 @@ impl Guidance {
             self.last = Some(*setpoint);
             self.seg = 0;
             self.hold_heading = None;
+            self.drifting = false;
         }
         let demand = match setpoint {
             Setpoint::Idle => ZERO_DEMAND,
@@ -173,6 +205,9 @@ impl Guidance {
         let frame = LocalFrame::new(state.pose.position);
         let (tn, te) = frame.to_local(target);
         let dist = libm::hypot(tn, te);
+        if !self.capability.sway_authority {
+            return self.station_keep_drift_reapproach(dist, tn, te, state);
+        }
         if dist > NEAR_ZONE_M {
             // Far zone: an ordinary transit leg toward the target.
             self.hold_heading = None;
@@ -200,6 +235,37 @@ impl Guidance {
                 sway_n: KP_POS_N_PER_M * cross - KD_SWAY_N_PER_MPS * state.velocity.sway_mps,
                 yaw_nm: self.yaw_demand(psi_hold, state),
             }
+        }
+    }
+
+    /// Station-keep for a hull without sway authority (D-026): no point
+    /// hold is possible, so drift quietly near the target and reapproach
+    /// when blown clear of it, with hysteresis between DRIFT_RADIUS_M and
+    /// REAPPROACH_RADIUS_M so the regime does not flap at one boundary.
+    fn station_keep_drift_reapproach(
+        &mut self,
+        dist: f64,
+        tn: f64,
+        te: f64,
+        state: &VesselState,
+    ) -> ForceDemand {
+        if dist < DRIFT_RADIUS_M {
+            self.drifting = true;
+        } else if dist > REAPPROACH_RADIUS_M {
+            self.drifting = false;
+        }
+        if self.drifting {
+            // A rudder hull has no useful heading authority at rest
+            // (capability.yaw_authority_at_rest false), so chasing a hold
+            // heading here would just waste the analysis: go fully quiet.
+            return ZERO_DEMAND;
+        }
+        let bearing = libm::atan2(te, tn);
+        let u_ref = approach_speed_ref(dist);
+        ForceDemand {
+            surge_n: self.surge_demand(u_ref, state.velocity.surge_mps),
+            sway_n: 0.0,
+            yaw_nm: self.yaw_demand(bearing, state),
         }
     }
 
@@ -259,6 +325,17 @@ impl Guidance {
             }
         }
     }
+}
+
+/// Far-zone approach speed law with the drift-and-reapproach steerage floor
+/// (D-026): rudder authority scales with u^2, so without the floor the
+/// ordinary clamp(0.3*dist, 0, 1.5) law would let commanded speed decay
+/// toward zero on a close approach, arriving with no flow over the rudder
+/// to steer.
+fn approach_speed_ref(dist: f64) -> f64 {
+    (APPROACH_GAIN_PER_S * dist)
+        .clamp(0.0, APPROACH_MAX_MPS)
+        .max(STEERAGE_MPS)
 }
 
 fn saturate(d: ForceDemand) -> ForceDemand {
@@ -353,9 +430,34 @@ mod tests {
         }
     }
 
+    /// A capability with no sway authority, no yaw authority at rest: the
+    /// rudder-hull shape the drift-and-reapproach hold is for (D-026).
+    const NO_SWAY: ActuationCapability = ActuationCapability {
+        sway_authority: false,
+        yaw_authority_at_rest: false,
+    };
+
+    /// Vessel state `dist_m` north of `origin()`, for drift/reapproach tests
+    /// that need the vessel (not the station-keep target) to move.
+    fn state_at_distance(dist_m: f64, heading_rad: f64, u: f64) -> VesselState {
+        VesselState {
+            t: Timestamp::from_nanos(0),
+            pose: Pose {
+                position: LocalFrame::new(origin()).to_geo(dist_m, 0.0),
+                heading_rad,
+            },
+            velocity: BodyVelocity {
+                surge_mps: u,
+                sway_mps: 0.0,
+                yaw_rate_radps: 0.0,
+            },
+            covariance: [[0.0; 6]; 6],
+        }
+    }
+
     #[test]
     fn heading_error_wraps_the_short_way() {
-        let mut g = Guidance::new(&config());
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
         let sp = Setpoint::HeadingSpeed {
             heading_rad: 170_f64.to_radians(),
             speed_mps: 0.0,
@@ -368,7 +470,7 @@ mod tests {
 
     #[test]
     fn outputs_saturate() {
-        let mut g = Guidance::new(&config());
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
         let sp = Setpoint::HeadingSpeed {
             heading_rad: 3.0,
             speed_mps: 10.0,
@@ -387,14 +489,14 @@ mod tests {
 
     #[test]
     fn idle_is_zero() {
-        let mut g = Guidance::new(&config());
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
         let d = g.tick(&Setpoint::Idle, &state(1.0, 2.0, 0.5));
         assert_eq!(d, ZERO_DEMAND);
     }
 
     #[test]
     fn direct_effort_passes_tau_straight_through() {
-        let mut g = Guidance::new(&config());
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
         let tau = ForceDemand {
             surge_n: 50.0,
             sway_n: -20.0,
@@ -406,7 +508,7 @@ mod tests {
 
     #[test]
     fn direct_effort_clamps_like_any_other_setpoint() {
-        let mut g = Guidance::new(&config());
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
         let tau = ForceDemand {
             surge_n: 10_000.0,
             sway_n: -10_000.0,
@@ -420,7 +522,7 @@ mod tests {
 
     #[test]
     fn empty_path_is_idle() {
-        let mut g = Guidance::new(&config());
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
         let sp = Setpoint::FollowPath {
             path: BoundedList::new(),
             speed_mps: 1.0,
@@ -433,7 +535,7 @@ mod tests {
     fn single_point_path_station_keeps() {
         let target = LocalFrame::new(origin()).to_geo(100.0, 0.0);
         let s = state(0.0, 0.0, 0.0);
-        let mut a = Guidance::new(&config());
+        let mut a = Guidance::new(&config(), ActuationCapability::FULL);
         let d_path = a.tick(
             &Setpoint::FollowPath {
                 path: BoundedList::from_slice(&[target]).unwrap(),
@@ -441,7 +543,7 @@ mod tests {
             },
             &s,
         );
-        let mut b = Guidance::new(&config());
+        let mut b = Guidance::new(&config(), ActuationCapability::FULL);
         let d_keep = b.tick(&Setpoint::StationKeep { position: target }, &s);
         assert_eq!(d_path, d_keep);
         // Far zone: transiting toward the point, not idling.
@@ -455,7 +557,7 @@ mod tests {
         let far = frame.to_geo(100.0, 0.0);
         let far2 = frame.to_geo(100.0, 100.0);
         let s = state(0.0, 0.0, 0.0);
-        let mut g = Guidance::new(&config());
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
         g.tick(
             &Setpoint::FollowPath {
                 path: BoundedList::from_slice(&[origin(), near, far]).unwrap(),
@@ -474,5 +576,61 @@ mod tests {
             &s,
         );
         assert_eq!(g.seg, 0);
+    }
+
+    // ------------------------------------------- drift-and-reapproach hold
+
+    #[test]
+    fn drift_reapproach_enters_drift_under_radius() {
+        let mut g = Guidance::new(&config(), NO_SWAY);
+        let sp = Setpoint::StationKeep { position: origin() };
+        let d = g.tick(&sp, &state_at_distance(3.0, 0.0, 1.0));
+        assert_eq!(d, ZERO_DEMAND);
+    }
+
+    #[test]
+    fn drift_reapproach_hysteresis_holds_between_radii() {
+        let mut g = Guidance::new(&config(), NO_SWAY);
+        let sp = Setpoint::StationKeep { position: origin() };
+        // Close in: enters drift.
+        assert_eq!(g.tick(&sp, &state_at_distance(3.0, 0.0, 0.5)), ZERO_DEMAND);
+        // Drifted out to 7 m, inside REAPPROACH_RADIUS_M: hysteresis keeps
+        // the regime drifting rather than resuming approach.
+        assert_eq!(g.tick(&sp, &state_at_distance(7.0, 0.0, 0.5)), ZERO_DEMAND);
+        // Past REAPPROACH_RADIUS_M: regime flips back to approaching.
+        let d = g.tick(&sp, &state_at_distance(11.0, 0.0, 0.0));
+        assert_ne!(d, ZERO_DEMAND);
+        assert!(d.surge_n > 0.0, "{d:?}");
+    }
+
+    #[test]
+    fn drift_reapproach_stays_approaching_above_drift_radius() {
+        // Never having entered drift, distance sitting between the two
+        // radii should still command an ordinary approach, not go quiet.
+        let mut g = Guidance::new(&config(), NO_SWAY);
+        let sp = Setpoint::StationKeep { position: origin() };
+        let d = g.tick(&sp, &state_at_distance(7.0, 0.0, 0.0));
+        assert_ne!(d, ZERO_DEMAND);
+        assert!(d.surge_n > 0.0, "{d:?}");
+    }
+
+    #[test]
+    fn full_capability_station_keep_unaffected_by_drift_radius() {
+        // A sway-capable hull takes the pre-existing near/far zone law at
+        // the same range that would put a NO_SWAY hull into drift; it must
+        // not go quiet.
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
+        let sp = Setpoint::StationKeep { position: origin() };
+        let d = g.tick(&sp, &state_at_distance(3.0, 0.0, 0.0));
+        assert_ne!(d, ZERO_DEMAND);
+    }
+
+    #[test]
+    fn approach_speed_ref_has_steerage_floor() {
+        // 0.3 * 0.5 = 0.15 m/s, below STEERAGE_MPS: the floor binds.
+        assert_eq!(approach_speed_ref(0.5), STEERAGE_MPS);
+        // Above the floor's crossover, the ordinary clamp law dominates.
+        assert!(approach_speed_ref(5.0) > STEERAGE_MPS);
+        assert!(approach_speed_ref(5.0) <= APPROACH_MAX_MPS);
     }
 }

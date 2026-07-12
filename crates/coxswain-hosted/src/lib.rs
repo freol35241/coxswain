@@ -9,8 +9,8 @@
 //! is the Phase 4 verification instrument.
 
 use coxswain_contract::{
-    ActuatorCommand, ArmingState, ClaimantId, ConnState, EstimatorHealth, ForceDemand, Measurement,
-    PowerStatus, Setpoint, Timestamp, VesselConfig, VesselState,
+    ActuationCapability, ActuatorCommand, ArmingState, ClaimantId, ConnState, EstimatorHealth,
+    ForceDemand, Measurement, PowerStatus, Setpoint, Timestamp, VesselConfig, VesselState,
 };
 use coxswain_estimator::Estimator;
 use coxswain_guidance::Guidance;
@@ -46,7 +46,9 @@ impl Core {
     pub fn new(config: &VesselConfig) -> Self {
         Self {
             estimator: Estimator::new(config),
-            guidance: Guidance::new(config),
+            // Full actuation until the hosted task derives the capability
+            // from the manifest effector table (D-026).
+            guidance: Guidance::new(config, ActuationCapability::FULL),
             supervisor: Supervisor::new(config),
             // Nominal 13.0 V rather than 0 V: a zero default would trip
             // critical voltage before the first report. Real deployments
