@@ -232,6 +232,68 @@ and what first water trials actually need), RC as a conn-holding claimant
 second. Manual helm issues direct effort setpoints, a contract Setpoint
 addition; RC bypasses guidance, never the supervisor or arming.
 
+## D-026: Allocation at the conn node from a manifest-declared effector table
+
+Guidance keeps producing generalized tau; a new no_std allocation stage maps
+it onto per-effector outputs. Rationale: allocation geometry and coefficients
+shape control behavior, so D-018 puts them inside the signed blob, and the
+code that consumes them is the audited core. This retires the far end's
+allocation role from the D-021 bring-up link: the actuator MCU becomes a
+dumb, watchdogged PWM bridge (D-010's thin node, thinner), and the wire
+carries per-channel outputs ($CXOUT, same dead-man doctrine) instead of tau.
+
+The effector table generalizes layouts instead of enumerating them: tau = B f,
+one column per effector. v1 kinds are fixed_thruster (position, mounting
+azimuth, asymmetric thrust limits) and rudder (speed-scheduled effectiveness,
+yaw moment ~ k u^2 delta, authority floor at low speed); azimuth and sail are
+schema-visible kinds rejected at compile until implemented. Solver is a
+weighted pseudo-inverse with saturation redistribution under axis priority
+yaw, then surge, then sway: steerage loss is the dangerous failure. A QP
+earns its place only when a test shows the pseudo-inverse failing.
+
+Two consequences ride along. The effector table implies an actuation
+capability, and guidance behavior is licensed by it, the sensor-trust pattern
+extended to actuation: a hull without sway authority gets a
+drift-and-reapproach hold instead of the DP-style point hold, landing
+together with allocation so failsafe station-keep is safe on a rudder boat.
+And the simulator consumes achieved tau mapped back through the effector
+model, so saturation and underactuation are testable before hardware (D-020).
+
+Sailing is recorded as a future vessel class, not an effector kind:
+achievable sail force depends on wind, speed stops being a free variable,
+and tacking is a maneuver above the control law, so the changes land in
+guidance (polar, no-go zone) plus a slow trim loop. The only obligation on
+this design is that the effector table tolerates effectors that do not
+consume tau. Effector schema fields are manifest v0.4 business and freeze
+after the allocator exists, per D-022's sequencing logic.
+
+## D-027: Output termination is declared per effector; a failsafe path must survive conn-process death
+
+Symmetry with the sensor side: effector outputs reference a manifest bus the
+way sensors do, and each bus kind has an output backend. Three are named: the
+$CXOUT serial bridge (bring-up, Phase 6b), Cyphal actuator nodes (reference
+deployment, Phase 7), and direct PWM from conn-node timer pins (new bus kind
+"pwm"). The admission rule is that every effector needs a failsafe path that
+survives death of the control process: the bridge MCU watches line silence, a
+Cyphal node watches heartbeats, and direct PWM has only what the platform
+provides. On the H7 that is the hardware watchdog plus safe timer defaults,
+so the H7 profile implements pwm in Phase 8; the hosted profile has no
+independent path to zero and refuses a pwm bus at boot. On Linux, directly
+connected means the serial bridge, whose MCU is the watchdog.
+
+Calibration placement follows D-018: what shapes control sits under the blob
+hash. Direct PWM has no far end, so its calibration is manifest data by
+necessity. The serial bridge commands final per-channel microseconds rendered
+at the conn node from manifest calibration (thrust curve, endpoints,
+direction), keeping the bridge firmware truly dumb: copy fields to channels,
+fail safe on silence, never reflash when propellers change. Cyphal nodes are
+commanded in physical units and own their local servo calibration, audited
+through command-then-report rather than the hash.
+
+The output backend trait is deliberately not built with the first backend:
+one implementation is a single-use abstraction. It crystallizes when the
+Cyphal backend lands in Phase 7, one phase away.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest

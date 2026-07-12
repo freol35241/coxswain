@@ -344,3 +344,12 @@ on it out of band.
    carries the public key. It does not settle who holds the private key, how it rotates,
    or whether a vessel accepts more than one signer. Key management is the cost here,
    not the code.
+4. **Effector geometry for conn-node allocation** (D-026, D-027): per-effector
+   kind (fixed_thruster, rudder; azimuth and sail schema-visible but rejected
+   until implemented), position, mounting azimuth, thrust/angle limits, rudder
+   effectiveness, plus output routing per D-027: each effector references an
+   output bus, calibration (thrust curve, endpoints, direction) is manifest
+   data for the serial bridge and pwm kinds, and a "pwm" bus is refused on
+   profiles without a failsafe path that survives conn-process death (the
+   hosted profile refuses it; the H7 profile accepts it). Fields freeze after
+   the allocator exists, per D-022.
