@@ -8,6 +8,10 @@ publish = false
 [dependencies]
 coxswain-contract = { path = "../coxswain-contract" }
 coxswain-model = { path = "../coxswain-model" }
+# D-020 pattern: the effector forward map (tau = B f) has one implementation
+# and two consumers, the allocator and the plant; the simulator drives its
+# plant from achieved tau through the same code the allocator uses (D-026).
+coxswain-allocation = { path = "../coxswain-allocation" }
 # Same nalgebra configuration as the rest of the workspace so the graph
 # resolves to one build of the crate, even though this crate is host-only.
 nalgebra = { version = "0.34", default-features = false, features = ["libm"] }

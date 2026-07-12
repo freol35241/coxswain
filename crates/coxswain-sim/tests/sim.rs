@@ -5,9 +5,11 @@
 use std::f64::consts::FRAC_PI_2;
 use std::time::Duration;
 
+use coxswain_allocation::achieved_tau;
 use coxswain_contract::{
-    ActuatorCommand, BodyVelocity, ForceDemand, Fossen3DofParams, GeoPoint, Measurement,
-    MeasurementKind, SensorId, Timestamp,
+    ActuatorCommand, ActuatorOutputs, BodyVelocity, BoundedList, EffectorConfig, EffectorId,
+    EffectorKind, ForceDemand, Fossen3DofParams, GeoPoint, Measurement, MeasurementKind, SensorId,
+    Timestamp,
 };
 use coxswain_model::LocalFrame;
 use coxswain_sim::{GnssModel, HeadingModel, Simulator, YawRateModel};
@@ -72,6 +74,155 @@ fn heading(m: &Measurement) -> f64 {
         MeasurementKind::Heading { heading_rad, .. } => heading_rad,
         _ => panic!("not a heading"),
     }
+}
+
+fn outputs(t: Timestamp, values: &[f64]) -> ActuatorOutputs {
+    ActuatorOutputs {
+        t,
+        values: BoundedList::from_slice(values).unwrap(),
+    }
+}
+
+fn thruster(
+    id: u16,
+    pos_x_m: f64,
+    pos_y_m: f64,
+    azimuth_rad: f64,
+    fwd: f64,
+    rev: f64,
+) -> EffectorConfig {
+    EffectorConfig {
+        id: EffectorId(id),
+        kind: EffectorKind::FixedThruster {
+            pos_x_m,
+            pos_y_m,
+            azimuth_rad,
+            max_thrust_fwd_n: fwd,
+            max_thrust_rev_n: rev,
+        },
+    }
+}
+
+fn rudder(id: u16, pos_x_m: f64, k: f64, max_angle_rad: f64, min_speed: f64) -> EffectorConfig {
+    EffectorConfig {
+        id: EffectorId(id),
+        kind: EffectorKind::Rudder {
+            pos_x_m,
+            side_force_n_per_rad_mps2: k,
+            max_angle_rad,
+            min_effective_speed_mps: min_speed,
+        },
+    }
+}
+
+/// Twin differential thrusters at (0, +-1), azimuth 0, symmetric limits.
+fn twin_thrusters() -> [EffectorConfig; 2] {
+    [
+        thruster(0, 0.0, 1.0, 0.0, 150.0, 150.0),
+        thruster(1, 0.0, -1.0, 0.0, 150.0, 150.0),
+    ]
+}
+
+/// ESC (centerline thruster) plus a rudder astern.
+fn esc_and_rudder() -> [EffectorConfig; 2] {
+    [
+        thruster(0, 1.0, 0.0, 0.0, 200.0, 120.0),
+        rudder(1, -1.5, 50.0, 0.5, 0.5),
+    ]
+}
+
+/// Symmetric thrust through `apply_outputs` produces the identical
+/// trajectory as feeding the same table's `achieved_tau` straight through
+/// `apply_command`: `apply_outputs` is that composition, not a separate
+/// model. Symmetric values also carry no yaw.
+#[test]
+fn twin_thruster_outputs_match_achieved_tau_trajectory() {
+    let table = twin_thrusters();
+    let values = [60.0, 60.0];
+
+    let mut via_outputs = sim(1);
+    via_outputs.set_effectors(&table);
+    via_outputs.apply_outputs(&outputs(T0, &values));
+    run(&mut via_outputs, 50, Duration::from_millis(100));
+
+    let tau = achieved_tau(&table, &values, 0.0);
+    let mut via_tau = sim(1);
+    via_tau.apply_command(&cmd(tau.surge_n, tau.sway_n, tau.yaw_nm));
+    run(&mut via_tau, 50, Duration::from_millis(100));
+
+    let a = via_outputs.truth();
+    let b = via_tau.truth();
+    assert_eq!(a.velocity, b.velocity);
+    assert_eq!(a.pose, b.pose);
+
+    // Symmetric thrust: straight-line surge from rest heading north, no
+    // yaw, no cross-track drift.
+    assert!(a.velocity.surge_mps > 0.0, "{}", a.velocity.surge_mps);
+    assert_eq!(a.velocity.yaw_rate_radps, 0.0);
+    let frame = LocalFrame::new(origin());
+    let (n, e) = frame.to_local(a.pose.position);
+    assert!(n > 0.0, "expected north progress: {n}");
+    assert_eq!(e, 0.0, "unexpected cross-track drift");
+}
+
+/// The rudder's authority is speed-scheduled (D-026): the same deflection
+/// develops a real yaw rate at cruise speed, and only a fraction of that at
+/// a near-zero truth speed, because `achieved_tau` evaluates u_eff at the
+/// truth surge speed captured when `apply_outputs` was called, clamped no
+/// lower than the effector's own authority floor. This is the
+/// underactuation-at-low-speed honesty D-026 asks the simulator for.
+#[test]
+fn rudder_authority_scales_with_truth_speed() {
+    let yaw_rate_after = |u0: f64| {
+        let mut sim = sim(1);
+        sim.set_effectors(&esc_and_rudder());
+        sim.set_truth(
+            0.0,
+            BodyVelocity {
+                surge_mps: u0,
+                sway_mps: 0.0,
+                yaw_rate_radps: 0.0,
+            },
+        );
+        sim.apply_outputs(&outputs(T0, &[0.0, 0.05]));
+        run(&mut sim, 20, Duration::from_millis(50));
+        sim.truth().velocity.yaw_rate_radps
+    };
+
+    let cruise = yaw_rate_after(3.0);
+    let dead_stop = yaw_rate_after(0.0);
+    assert!(cruise.abs() > 0.1, "cruise yaw rate too small: {cruise}");
+    assert!(
+        dead_stop.abs() < 0.1 * cruise.abs(),
+        "dead-stop yaw rate {dead_stop} not small relative to cruise {cruise}"
+    );
+}
+
+/// Zero rudder angle contributes nothing to `achieved_tau` regardless of
+/// the rudder's coefficients, and the ESC's own thrust axis is fore-aft
+/// only, so surge-only propulsion develops no sway.
+#[test]
+fn esc_only_thrust_produces_no_sway() {
+    let mut sim = sim(1);
+    sim.set_effectors(&esc_and_rudder());
+    sim.apply_outputs(&outputs(T0, &[100.0, 0.0]));
+    run(&mut sim, 40, Duration::from_millis(50));
+    assert_eq!(sim.truth().velocity.sway_mps, 0.0);
+}
+
+#[test]
+#[should_panic(expected = "no effector table set")]
+fn apply_outputs_without_a_table_panics() {
+    let mut sim = sim(1);
+    sim.apply_outputs(&outputs(T0, &[1.0]));
+}
+
+#[test]
+#[should_panic(expected = "does not match effector table")]
+fn apply_outputs_length_mismatch_panics() {
+    let mut sim = sim(1);
+    sim.set_effectors(&twin_thrusters());
+    sim.apply_outputs(&outputs(T0, &[1.0]));
 }
 
 /// Constant surge force from rest converges to force / damping; after 8

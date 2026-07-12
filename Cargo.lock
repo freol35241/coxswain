@@ -452,6 +452,7 @@ version = "0.1.0"
 name = "coxswain-sim"
 version = "0.1.0"
 dependencies = [
+ "coxswain-allocation",
  "coxswain-contract",
  "coxswain-model",
  "nalgebra",

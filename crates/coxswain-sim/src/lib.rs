@@ -15,9 +15,10 @@ mod rng;
 use core::f64::consts::PI;
 use core::time::Duration;
 
+use coxswain_allocation::achieved_tau;
 use coxswain_contract::{
-    ActuatorCommand, BodyVelocity, ForceDemand, Fossen3DofParams, GeoPoint, Measurement,
-    MeasurementKind, Pose, SensorId, Timestamp, VesselState,
+    ActuatorCommand, ActuatorOutputs, BodyVelocity, EffectorConfig, ForceDemand, Fossen3DofParams,
+    GeoPoint, Measurement, MeasurementKind, Pose, SensorId, Timestamp, VesselState,
 };
 use coxswain_model::{Fossen3Dof, LocalFrame, ModelError};
 use nalgebra::Vector3;
@@ -143,6 +144,10 @@ pub struct Simulator {
     /// measurement keeps its acquisition timestamp.
     pending: Vec<(Timestamp, Measurement)>,
     voltage_v: f64,
+    /// Manifest-declared effector table for `apply_outputs` (D-026); empty
+    /// is the legacy tau-direct convention, driven through `apply_command`
+    /// instead.
+    effectors: Vec<EffectorConfig>,
 }
 
 impl Simulator {
@@ -169,7 +174,14 @@ impl Simulator {
             sensors: Vec::new(),
             pending: Vec::new(),
             voltage_v: 13.0,
+            effectors: Vec::new(),
         })
+    }
+
+    /// Set the effector table `apply_outputs` maps physical outputs through.
+    /// Replaces any table set earlier.
+    pub fn set_effectors(&mut self, effectors: &[EffectorConfig]) {
+        self.effectors = effectors.to_vec();
     }
 
     pub fn add_gnss(&mut self, id: SensorId, model: GnssModel) {
@@ -212,6 +224,32 @@ impl Simulator {
     /// constant, matching how the conn node drives actuators).
     pub fn apply_command(&mut self, cmd: &ActuatorCommand) {
         self.tau = cmd.demand;
+    }
+
+    /// Map physical per-effector outputs through the effector table
+    /// (`set_effectors`) at the plant's current truth surge speed, and hold
+    /// the achieved tau until the next command, exactly as `apply_command`
+    /// holds the demanded tau (D-020/D-026: the plant is driven by what the
+    /// effectors can actually deliver, not by the demand).
+    ///
+    /// The rudder's achieved force depends on u, which itself changes over
+    /// the step; v1 policy evaluates achieved tau once, at truth u at apply
+    /// time, and holds it piecewise-constant, the same simplification
+    /// `apply_command` already makes for tau.
+    ///
+    /// Panics if no effector table is set, or if `outputs` has a different
+    /// length than the table.
+    pub fn apply_outputs(&mut self, outputs: &ActuatorOutputs) {
+        assert!(
+            !self.effectors.is_empty(),
+            "apply_outputs called with no effector table set"
+        );
+        assert_eq!(
+            outputs.values.len(),
+            self.effectors.len(),
+            "actuator output count does not match effector table"
+        );
+        self.tau = achieved_tau(&self.effectors, outputs.values.as_slice(), self.nu[0]);
     }
 
     /// Advance sim time by `dt`, sampling every sensor whose schedule
@@ -282,6 +320,16 @@ impl Simulator {
             velocity.sway_mps,
             velocity.yaw_rate_radps,
         );
+    }
+
+    /// Displace truth position by a local offset (meters, north/east),
+    /// keeping heading and velocity. For mid-run disturbance scenarios
+    /// (guidance's drift-and-reapproach hold needs the vessel bumped off a
+    /// station-keep point to exercise reapproach) rather than restarting a
+    /// scenario with `set_truth`'s position-preserving initial condition.
+    pub fn displace(&mut self, dn_m: f64, de_m: f64) {
+        self.eta[0] += dn_m;
+        self.eta[1] += de_m;
     }
 
     /// An active dropout emits nothing; the schedule keeps advancing, so
