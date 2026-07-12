@@ -155,26 +155,26 @@ Gates first water for underactuated hulls (ESC + rudder); a twin-differential
 hull could sail on Phase 6 alone, but the wire format changes here, so land
 this before freezing far-end firmware.
 
-- [ ] coxswain-contract: ActuatorOutputs (bounded per-channel outputs) and the
+- [x] coxswain-contract: ActuatorOutputs (bounded per-channel outputs) and the
       effector config types the manifest compiles onto (D-022 pattern:
       allocation is testable with hand-built values before the schema lands).
-- [ ] coxswain-allocation crate (no_std, no alloc): B matrix from the effector
+- [x] coxswain-allocation crate (no_std, no alloc): B matrix from the effector
       table, weighted pseudo-inverse, saturation redistribution with
       yaw > surge > sway priority, rudder speed scheduling with a low-speed
       authority floor. Napkin verification first: twin-thruster round-trip
       identity, closed-form rudder authority against u^2, symbolic check of
       the redistribution logic.
-- [ ] coxswain-sim: consume achieved tau mapped back through the effector
+- [x] coxswain-sim: consume achieved tau mapped back through the effector
       model instead of demanded tau; underactuated plant scenarios.
-- [ ] coxswain-guidance: actuation-capability licensing; drift-and-reapproach
+- [x] coxswain-guidance: actuation-capability licensing; drift-and-reapproach
       hold mode for hulls without sway authority, asserted closed-loop against
       the underactuated plant including the ClaimantLost failsafe path.
-- [ ] Manifest v0.4: [[effector]] geometry table with per-effector output bus
+- [x] Manifest v0.4: [[effector]] geometry table with per-effector output bus
       reference and calibration (thrust curve, endpoints, direction; D-027),
       compile checks (kinds implemented, references, limits sane, pwm bus
       refused on the hosted profile), schema doc updated after the allocator
       exists (D-022).
-- [ ] coxswain-hosted: $CXOUT per-channel wire format replacing $CXACT,
+- [x] coxswain-hosted: $CXOUT per-channel wire format replacing $CXACT,
       carrying final per-channel microseconds rendered from manifest
       calibration (D-027), same dead-man doctrine; desk-rig pty test;
       hardware.md far-end contract updated in the same change.

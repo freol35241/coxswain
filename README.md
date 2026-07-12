@@ -36,6 +36,11 @@ for who is allowed to command it at any moment.
     NMEA 0183 / 2000 (listen-only)                (actuator nodes)
 ```
 
+(Between guidance and the actuator backend sits a conn-node allocation
+stage, not drawn above: it maps guidance's generalized force onto the
+vessel's manifest-declared effectors, and the backend carries the
+resulting per-channel outputs, not the force demand itself.)
+
 Everything above the line enriches the vessel: perception, mission
 autonomy, teleoperation, fleet and shore systems. All of it reaches the
 vessel through interface adapters at the process boundary;
@@ -100,14 +105,27 @@ STM32H7, and CI enforces the embedded build on every commit.
 
 ## Status
 
-The simulation MVP is complete: a simulated vessel holds the conn against
-a live remote claimant over zenoh, with grant, revoke, preemption,
-arming, and the full failsafe matrix exercised end to end in CI,
-including a test that kills the zenoh router mid-scenario and asserts the
-vessel keeps station. The first hardware-facing pieces exist (the driver
-trait and strict parsers for NMEA 0183 and CRSF), but no device is
-supported yet; device drivers, real transports (NMEA 0183/2000, Cyphal),
-and the H7 conn-node firmware are sequenced in
+The simulation MVP is complete and CI-locked: a simulated vessel holds
+the conn against a live remote claimant over zenoh, with grant, revoke,
+preemption, arming, and the full failsafe matrix exercised end to end,
+including a test that kills the zenoh router mid-scenario and asserts
+the vessel keeps station.
+
+Phase 6 and 7 software is done except what needs a bench or a device.
+Landed: NMEA 0183 over serial and UDP feeding the estimator (GNSS fix,
+heading), a CRSF RC claimant with a hardware kill switch, power
+monitoring from the actuator link into the failsafe matrix, and NMEA
+2000 listen-only decode for the initial PGN set (enrichment only, not
+yet wired to a CAN interface). Phase 6b added control allocation
+(D-026/D-027): a conn-node allocation stage maps guidance's generalized
+force onto a manifest-declared effector table (thrusters, rudder), the
+actuator wire carries per-channel outputs (`$CXOUT`, replacing the
+tau-carrying `$CXACT`), and a hull without sway authority gets a
+drift-and-reapproach hold in place of a point hold.
+
+What remains needs hardware: IMU/mag drivers, CAN wiring for Cyphal and
+NMEA 2000, Cyphal actuator nodes, Septentrio SBF, the H7 conn-node
+firmware, and the water itself. Sequenced in
 [docs/TASKS.md](docs/TASKS.md).
 
 ## Layout
@@ -117,15 +135,17 @@ and the H7 conn-node firmware are sequenced in
 | `coxswain-contract` | Internal types shared by every core crate. no_std, dependency-free. |
 | `coxswain-model` | Fossen 3-DOF vessel model. One crate, two consumers: the estimator's process model and the simulator's plant. |
 | `coxswain-estimator` | EKF with per-sensor licensing, staleness handling, and a hydrodynamic prior. Developed against a replay harness. |
-| `coxswain-guidance` | LOS path following, waypoint sequencing, speed control, station-keeping, direct effort passthrough. |
+| `coxswain-guidance` | LOS path following, waypoint sequencing, speed control, station-keeping (drift-and-reapproach when the effector table has no sway authority), direct effort passthrough. |
+| `coxswain-allocation` | Control allocation (D-026): weighted pseudo-inverse from the manifest effector table, saturation redistribution under yaw > surge > sway priority. no_std, no alloc. |
 | `coxswain-supervisor` | Conn/claimant state machine with priority preemption, arming, failsafe matrix. |
 | `coxswain-manifest` | Manifest validation, compilation, signing; no_std blob reader; host tool. |
 | `coxswain-sim` | Plant simulator and sensor models with fault injection. Host-only. |
 | `coxswain-keelson` | [Keelson](https://github.com/RISE-Maritime/keelson) adapter and claimant client at the process boundary. |
-| `coxswain-hosted` | The Linux profile binary: manifest in, simulator as I/O backend, zenoh session up. |
-| `coxswain-drivers` | The driver trait and timestamping policy; device drivers arrive with hardware support. |
+| `coxswain-hosted` | The Linux profile binary: manifest in, simulator or real serial ports as I/O backend, zenoh session up. |
+| `coxswain-drivers` | The driver trait and timestamping policy, plus the drivers built on it: NMEA 0183 GNSS/heading, CRSF RC, and the `$CXOUT` actuator serial backend. |
 | `coxswain-nmea0183` | Strict no_std NMEA 0183 parser (GGA, RMC, HDT, VTG). Zero dependencies. |
 | `coxswain-crsf` | Strict no_std CRSF parser (RC channels, link statistics) for the hand controller link. Zero dependencies. |
+| `coxswain-n2k` | Strict no_std NMEA 2000 decoder for the initial single-frame PGN set. Listen-only enrichment, zero dependencies. |
 
 `docs/DECISIONS.md` records the settled architecture and the reasoning;
 `docs/manifest-schema.md` is the manifest schema; `diary/` is the running
