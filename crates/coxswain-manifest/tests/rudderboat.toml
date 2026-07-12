@@ -6,12 +6,12 @@
 # ============================================================
 
 [manifest]
-schema_version = 3
+schema_version = 4
 vessel_id      = "se-rise-rudderboat-01"
 name           = "Rudderboat"
 revision       = 1
 author         = "freol"
-date           = "2026-07-11"
+date           = "2026-07-12"
 
 [conn_node]
 board          = "nucleo-h753zi"
@@ -33,6 +33,13 @@ kind     = "nmea0183_uart"
 port     = "uart7"
 baud     = 4800
 checksum = "required"
+
+[[bus]]
+id       = "rc_link"
+kind     = "crsf_uart"
+port     = "uart5"
+# baud omitted: defaults to 420000, CRSF's real link rate (termios2/BOTHER
+# territory, not a POSIX Bxxxx rate)
 
 # ------------------------------------------------------------
 # Sensors
@@ -94,6 +101,26 @@ us_center = 1500
 us_max    = 1900
 
 # ------------------------------------------------------------
+# RC hand controller (D-025): the first-water hull's manual claimant.
+# Channel mapping and shaping match coxswain-drivers::rc::Config field for
+# field; claimant is authored directly, same out-of-band-agreement
+# convention as [[claimant]].id below.
+# ------------------------------------------------------------
+
+[rc]
+bus                = "rc_link"
+claimant           = 1
+kill_channel       = 4
+takeover_channel   = 5
+surge_channel      = 2
+yaw_channel        = 3
+switch_low_us      = 1300
+switch_high_us     = 1700
+stick_deadband_us  = 12
+max_surge_n        = 150.0
+max_yaw_nm         = 60.0
+
+# ------------------------------------------------------------
 # Claimants
 # ------------------------------------------------------------
 
@@ -101,6 +128,11 @@ us_max    = 1900
 name     = "autonomy"
 id       = 0
 priority = 0
+
+[[claimant]]
+name     = "rc"
+id       = 1
+priority = 100        # the hand controller outranks autonomy on request
 
 # ------------------------------------------------------------
 # Estimator
@@ -132,6 +164,7 @@ conn_grant_default         = "none"
 position_degraded_after_ms = 3000
 low_voltage_v               = 12.0
 critical_voltage_v          = 11.4
+power_stale_after_ms        = 4000
 
 [supervisor.geofence]
 enabled = true

@@ -3,8 +3,10 @@
 //! Seahorse (golden.rs) deliberately carries no `[[effector]]` table, so
 //! these rules need their own fixture.
 
+use core::time::Duration;
+
 use coxswain_contract::{EffectorConfig, EffectorId, EffectorKind};
-use coxswain_manifest::{CompileError, ValidateError};
+use coxswain_manifest::{CompileError, RcEntry, ValidateError};
 
 const RUDDERBOAT: &str = include_str!("rudderboat.toml");
 
@@ -33,11 +35,38 @@ fn expect_invalid(source: &str) -> ValidateError {
 fn rudderboat_compiles_and_roundtrips() {
     let manifest = coxswain_manifest::compile(RUDDERBOAT).expect("rudderboat compiles");
     assert_eq!(manifest.vessel_id.as_str(), "se-rise-rudderboat-01");
-    assert_eq!(manifest.schema_version, 3);
-    assert_eq!(manifest.buses.len(), 2);
+    assert_eq!(manifest.schema_version, 4);
+    assert_eq!(manifest.buses.len(), 3);
     assert_eq!(manifest.sensors.len(), 2);
     assert_eq!(manifest.actuator_nodes.len(), 0);
     assert_eq!(manifest.effectors.len(), 2);
+
+    // power_stale_after_ms overrides the compiler's 3000ms default (D-025
+    // follow-up: the schema now carries this constant explicitly).
+    assert_eq!(
+        manifest.config.supervisor.power_stale_after,
+        Duration::from_millis(4000)
+    );
+
+    // [rc] (D-025): the hand controller, field for field with
+    // coxswain-drivers::rc::Config, plus bus and claimant.
+    let rc = manifest.rc.expect("rudderboat declares [rc]");
+    assert_eq!(
+        rc,
+        RcEntry {
+            bus: coxswain_manifest::FixedStr32::new("rc_link").unwrap(),
+            claimant: 1,
+            kill_channel: 4,
+            takeover_channel: 5,
+            surge_channel: 2,
+            yaw_channel: 3,
+            switch_low_us: 1300,
+            switch_high_us: 1700,
+            stick_deadband_us: 12,
+            max_surge_n: 150.0,
+            max_yaw_nm: 60.0,
+        }
+    );
 
     let expected = [
         EffectorConfig {
@@ -229,6 +258,96 @@ fn rejects_pwm_bus_on_hosted() {
         expect_invalid(&src),
         ValidateError::PwmBusOnHosted {
             bus: "helm".to_string(),
+        }
+    );
+}
+
+// Per output bus, [[effector]] channels must be exactly 0..n, no gaps
+// (compile-time graduation of the hosted profile's boot check).
+#[test]
+fn rejects_effector_channel_gap() {
+    let src = patched("channel = 1", "channel = 2");
+    assert_eq!(
+        expect_invalid(&src),
+        ValidateError::EffectorChannelGap {
+            bus: "actuator_bridge".to_string(),
+            expected: 1,
+            found: 2,
+        }
+    );
+}
+
+// -------------------------------------------------------------- [rc] rules
+
+// [rc].bus must reference a declared bus.
+#[test]
+fn rejects_rc_bus_missing() {
+    let src = patched(
+        "bus                = \"rc_link\"",
+        "bus                = \"nope\"",
+    );
+    assert_eq!(
+        expect_invalid(&src),
+        ValidateError::UnknownBus {
+            owner: "rc".to_string(),
+            bus: "nope".to_string(),
+        }
+    );
+}
+
+// [rc].bus must be a crsf_uart bus, not e.g. the GNSS input bus.
+#[test]
+fn rejects_rc_bus_wrong_kind() {
+    let src = patched(
+        "bus                = \"rc_link\"",
+        "bus                = \"gnss_serial\"",
+    );
+    assert_eq!(
+        expect_invalid(&src),
+        ValidateError::RcBusWrongKind {
+            bus: "gnss_serial".to_string(),
+        }
+    );
+}
+
+// The four channel fields must be distinct.
+#[test]
+fn rejects_rc_duplicate_channel() {
+    let src = patched("surge_channel      = 2", "surge_channel      = 4");
+    assert_eq!(
+        expect_invalid(&src),
+        ValidateError::RcDuplicateChannel { channel: 4 }
+    );
+}
+
+// Every channel field must be below 16, CRSF's channel count.
+#[test]
+fn rejects_rc_channel_out_of_range() {
+    let src = patched("yaw_channel        = 3", "yaw_channel        = 16");
+    assert_eq!(
+        expect_invalid(&src),
+        ValidateError::RcChannelOutOfRange { channel: 16 }
+    );
+}
+
+// switch_low_us must be strictly below switch_high_us.
+#[test]
+fn rejects_rc_switch_bounds_inverted() {
+    let src = patched(
+        "switch_low_us      = 1300\nswitch_high_us     = 1700",
+        "switch_low_us      = 1700\nswitch_high_us     = 1300",
+    );
+    assert_eq!(expect_invalid(&src), ValidateError::RcSwitchBoundsInverted);
+}
+
+// max_surge_n/max_yaw_nm must be strictly positive.
+#[test]
+fn rejects_rc_nonpositive_maximum() {
+    let src = patched("max_surge_n        = 150.0", "max_surge_n        = 0.0");
+    assert_eq!(
+        expect_invalid(&src),
+        ValidateError::RcMaximumNotPositive {
+            field: "max_surge_n",
         }
     );
 }

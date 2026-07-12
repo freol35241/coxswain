@@ -16,19 +16,24 @@ use coxswain_contract::{
 use crate::toml_model::{
     BusKindToml, BusToml, ChecksumToml, ClaimantToml, ConnGrantToml, EffectorToml, EstimatorToml,
     FailsafeToml, FunctionToml, GeofenceActionToml, GeofenceToml, LicenseToml, ManifestToml,
-    PwmCalibrationToml, RoleToml, SensorToml,
+    PwmCalibrationToml, RcToml, RoleToml, SensorToml,
 };
 use crate::types::{
     ActuatorFailsafe, ActuatorFunction, ActuatorNodeEntry, BusEntry, BusKind, ChecksumMode,
     CompiledManifest, ConnNodeEntry, EffectorEntry, FixedStr32, Nmea0183Quirks, Nmea2000Quirks,
-    PwmCalibration, SCHEMA_VERSION, SensorEntry,
+    PwmCalibration, RcEntry, SCHEMA_VERSION, SensorEntry,
 };
 
 /// Board profiles (D-016): the ports a manifest may reference. A sensor's
 /// `pps` input counts as a port. The "hosted" profile allows any port.
+/// `uart5` added alongside `uart4`/`uart7` for the RC receiver link
+/// (D-025): a third UART on the same H753 reference, distinct from the
+/// GNSS and legacy-instrument ports.
 const BOARD_PROFILES: &[(&str, &[&str])] = &[(
     "nucleo-h753zi",
-    &["can1", "can2", "uart4", "uart7", "spi1", "eth0", "pps1"],
+    &[
+        "can1", "can2", "uart4", "uart5", "uart7", "spi1", "eth0", "pps1",
+    ],
 )];
 const BOARD_HOSTED: &str = "hosted";
 
@@ -46,6 +51,18 @@ const MAX_AGE_OTHER_MS: u64 = 5000;
 /// nonstandard servos while still catching swapped or garbage values.
 const PWM_US_MIN: u16 = 500;
 const PWM_US_MAX: u16 = 2500;
+
+/// `supervisor.power_stale_after_ms` default when the field is absent.
+const POWER_STALE_AFTER_DEFAULT_MS: u64 = 3000;
+
+/// `crsf_uart` bus `baud` default: CRSF's real link rate, not a POSIX
+/// `Bxxxx` rate (termios2/BOTHER territory, see coxswain-hosted's
+/// `serial::open_serial`).
+const CRSF_BAUD_DEFAULT: u32 = 420_000;
+
+/// CRSF carries 16 channels; every RC channel index must be strictly below
+/// this (D-025).
+const RC_CHANNEL_COUNT: u16 = 16;
 
 /// Exactly the fields `estimator.params` must carry for `fossen_3dof`.
 const FOSSEN_FIELDS: [&str; 8] = [
@@ -184,6 +201,34 @@ pub enum ValidateError {
     PwmBusOnHosted {
         bus: String,
     },
+    /// `[rc].bus` names a bus that is not `crsf_uart` (D-025).
+    RcBusWrongKind {
+        bus: String,
+    },
+    /// Two of `[rc]`'s four channel fields (kill/takeover/surge/yaw) name
+    /// the same channel.
+    RcDuplicateChannel {
+        channel: u16,
+    },
+    /// An `[rc]` channel field is >= 16, the CRSF channel count.
+    RcChannelOutOfRange {
+        channel: u16,
+    },
+    /// `[rc].switch_low_us` is not strictly below `switch_high_us`.
+    RcSwitchBoundsInverted,
+    /// `[rc].max_surge_n` or `max_yaw_nm` is not strictly positive and
+    /// finite.
+    RcMaximumNotPositive {
+        field: &'static str,
+    },
+    /// Per output bus, `[[effector]]` channels must be exactly `0..n` with
+    /// no gaps: they are positional on the wire (compile-time graduation of
+    /// the hosted profile's boot check).
+    EffectorChannelGap {
+        bus: String,
+        expected: u16,
+        found: u16,
+    },
 }
 
 impl std::fmt::Display for ValidateError {
@@ -192,7 +237,7 @@ impl std::fmt::Display for ValidateError {
             Self::UnsupportedSchemaVersion(v) => {
                 write!(
                     f,
-                    "schema_version {v} unsupported, this tool compiles version 3"
+                    "schema_version {v} unsupported, this tool compiles version 4"
                 )
             }
             Self::UnknownBoard(b) => write!(f, "unknown conn_node.board profile {b:?}"),
@@ -335,6 +380,39 @@ impl std::fmt::Display for ValidateError {
                     f,
                     "bus {bus:?}: kind \"pwm\" is refused on the hosted profile, no failsafe \
                      path survives conn-process death on Linux (D-027)"
+                )
+            }
+            Self::RcBusWrongKind { bus } => {
+                write!(f, "rc references bus {bus:?}, which is not crsf_uart")
+            }
+            Self::RcDuplicateChannel { channel } => {
+                write!(
+                    f,
+                    "rc: channel {channel} is assigned to more than one function"
+                )
+            }
+            Self::RcChannelOutOfRange { channel } => {
+                write!(
+                    f,
+                    "rc: channel {channel} is out of range, CRSF carries {RC_CHANNEL_COUNT} \
+                     channels (0..{RC_CHANNEL_COUNT})"
+                )
+            }
+            Self::RcSwitchBoundsInverted => {
+                write!(f, "rc: switch_low_us must be strictly below switch_high_us")
+            }
+            Self::RcMaximumNotPositive { field } => {
+                write!(f, "rc.{field} must be strictly positive and finite")
+            }
+            Self::EffectorChannelGap {
+                bus,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "bus {bus:?}: effector channels must be contiguous from 0 (found channel \
+                     {found} at position {expected})"
                 )
             }
         }
@@ -560,10 +638,11 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         position_degraded_after: Duration::from_millis(m.supervisor.position_degraded_after_ms),
         low_voltage_v: m.supervisor.low_voltage_v,
         critical_voltage_v: m.supervisor.critical_voltage_v,
-        // Not yet an authored field: the schema bump to add it is a
-        // follow-up task in this queue. Hardcoded to a reasonable default
-        // until then.
-        power_stale_after: Duration::from_millis(3000),
+        power_stale_after: Duration::from_millis(
+            m.supervisor
+                .power_stale_after_ms
+                .unwrap_or(POWER_STALE_AFTER_DEFAULT_MS),
+        ),
         geofence: build_geofence(m.supervisor.geofence.as_ref())?,
         claimant_priorities: claimant_priorities(&m.claimants)?,
     };
@@ -670,6 +749,32 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
             .map_err(too_many)?;
     }
 
+    // Channel contiguity, per output bus: channels must be exactly 0..n,
+    // no gaps. Positional on the wire ($CXOUT's fields are field i for
+    // channel i); graduates the hosted profile's boot check into a typed
+    // compile-time error.
+    let mut channels_by_bus: HashMap<&str, Vec<u16>> = HashMap::new();
+    for e in &m.effectors {
+        channels_by_bus
+            .entry(e.bus.as_str())
+            .or_default()
+            .push(e.channel);
+    }
+    for (bus, mut channels) in channels_by_bus {
+        channels.sort_unstable();
+        for (expected, &channel) in channels.iter().enumerate() {
+            if channel != expected as u16 {
+                return Err(ValidateError::EffectorChannelGap {
+                    bus: bus.to_string(),
+                    expected: expected as u16,
+                    found: channel,
+                });
+            }
+        }
+    }
+
+    let rc = build_rc(m.rc.as_ref(), &bus_by_id)?;
+
     Ok(CompiledManifest {
         schema_version: m.manifest.schema_version,
         vessel_id: fx("manifest.vessel_id", &m.manifest.vessel_id)?,
@@ -689,6 +794,7 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         sensors,
         actuator_nodes,
         effectors,
+        rc,
     })
 }
 
@@ -950,9 +1056,17 @@ fn bus_entry(bus: &BusToml) -> Result<BusEntry, ValidateError> {
             BusKindToml::Uart => BusKind::Uart,
             BusKindToml::ActuatorUart => BusKind::ActuatorUart,
             BusKindToml::Pwm => BusKind::Pwm,
+            BusKindToml::CrsfUart => BusKind::CrsfUart,
         },
         port: fx("bus.port", &bus.port)?,
-        rate: bus.bitrate.or(bus.baud).unwrap_or(0),
+        rate: bus
+            .bitrate
+            .or(bus.baud)
+            .unwrap_or(if bus.kind == BusKindToml::CrsfUart {
+                CRSF_BAUD_DEFAULT
+            } else {
+                0
+            }),
         listen_port: bus.listen_port.unwrap_or(0),
         source_ip,
         segment: match &bus.segment {
@@ -1214,4 +1328,76 @@ fn pwm_calibration(id: &str, p: &PwmCalibrationToml) -> Result<PwmCalibration, V
         us_max: p.us_max,
         reversed: p.reversed,
     })
+}
+
+/// Compiles `[rc]` (D-025): the vessel's RC hand controller, absent when the
+/// manifest declares none (`[rc]` is optional and, being a single TOML
+/// table rather than an array-of-tables, at most one by construction).
+/// `bus` must reference a declared `crsf_uart` bus; the four channel
+/// fields must be distinct and each below CRSF's channel count;
+/// `switch_low_us` must be strictly below `switch_high_us`; both force/
+/// moment maxima must be strictly positive and finite.
+fn build_rc(
+    rc: Option<&RcToml>,
+    bus_by_id: &HashMap<&str, &BusToml>,
+) -> Result<Option<RcEntry>, ValidateError> {
+    let Some(rc) = rc else {
+        return Ok(None);
+    };
+    let Some(bus) = bus_by_id.get(rc.bus.as_str()) else {
+        return Err(ValidateError::UnknownBus {
+            owner: "rc".to_string(),
+            bus: rc.bus.clone(),
+        });
+    };
+    if bus.kind != BusKindToml::CrsfUart {
+        return Err(ValidateError::RcBusWrongKind {
+            bus: rc.bus.clone(),
+        });
+    }
+
+    let channels = [
+        rc.kill_channel,
+        rc.takeover_channel,
+        rc.surge_channel,
+        rc.yaw_channel,
+    ];
+    for &channel in &channels {
+        if channel >= RC_CHANNEL_COUNT {
+            return Err(ValidateError::RcChannelOutOfRange { channel });
+        }
+    }
+    let mut seen: HashSet<u16> = HashSet::new();
+    for &channel in &channels {
+        if !seen.insert(channel) {
+            return Err(ValidateError::RcDuplicateChannel { channel });
+        }
+    }
+
+    if !(rc.switch_low_us < rc.switch_high_us) {
+        return Err(ValidateError::RcSwitchBoundsInverted);
+    }
+
+    for (field, value) in [
+        ("max_surge_n", rc.max_surge_n),
+        ("max_yaw_nm", rc.max_yaw_nm),
+    ] {
+        if !(value.is_finite() && value > 0.0) {
+            return Err(ValidateError::RcMaximumNotPositive { field });
+        }
+    }
+
+    Ok(Some(RcEntry {
+        bus: fx("rc.bus", &rc.bus)?,
+        claimant: rc.claimant,
+        kill_channel: rc.kill_channel,
+        takeover_channel: rc.takeover_channel,
+        surge_channel: rc.surge_channel,
+        yaw_channel: rc.yaw_channel,
+        switch_low_us: rc.switch_low_us,
+        switch_high_us: rc.switch_high_us,
+        stick_deadband_us: rc.stick_deadband_us,
+        max_surge_n: rc.max_surge_n,
+        max_yaw_nm: rc.max_yaw_nm,
+    }))
 }

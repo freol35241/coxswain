@@ -12,7 +12,7 @@ pub use blob::{ReadError, manifest_hash, read};
 pub use types::{
     ActuatorFailsafe, ActuatorFunction, ActuatorNodeEntry, BusEntry, BusKind, ChecksumMode,
     CompiledManifest, ConnNodeEntry, EffectorEntry, FixedStr32, Nmea0183Quirks, Nmea2000Quirks,
-    PwmCalibration, SCHEMA_VERSION, SensorEntry,
+    PwmCalibration, RcEntry, SCHEMA_VERSION, SensorEntry,
 };
 
 #[cfg(feature = "std")]

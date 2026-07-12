@@ -46,7 +46,7 @@ fn seahorse_compiles_and_roundtrips() {
     assert_eq!(manifest.vessel_id.as_str(), "se-rise-seahorse-01");
     assert_eq!(manifest.name.as_str(), "Seahorse");
     assert_eq!(manifest.revision, 7);
-    assert_eq!(manifest.schema_version, 3);
+    assert_eq!(manifest.schema_version, 4);
     assert_eq!(manifest.buses.len(), 6);
     assert_eq!(manifest.sensors.len(), 7);
     assert_eq!(manifest.actuator_nodes.len(), 3);
@@ -56,6 +56,13 @@ fn seahorse_compiles_and_roundtrips() {
     // behavior (D-026 fallback), not an error.
     assert!(manifest.effectors.is_empty());
     assert!(manifest.config.effectors.is_empty());
+    // Seahorse declares no [rc] section (optional, D-025); and no
+    // power_stale_after_ms, so it takes the compiler's default.
+    assert!(manifest.rc.is_none());
+    assert_eq!(
+        manifest.config.supervisor.power_stale_after,
+        Duration::from_millis(3000)
+    );
     // D-025: autonomy default, rc outranking it.
     let priorities = manifest.config.supervisor.claimant_priorities.as_slice();
     assert_eq!(
@@ -411,14 +418,14 @@ fn rejects_inner_loop_on_udp_bus_outside_conn_segment() {
     ));
 }
 
-// Rule 10: schema_version must be 3. A v0.3 manifest (schema_version 2) is
-// rejected outright now, same doctrine as the 1 -> 2 bump (D-025).
+// Rule 10: schema_version must be 4. A v0.4 manifest (schema_version 3) is
+// rejected outright now, same doctrine as every prior bump.
 #[test]
 fn rejects_unknown_schema_version() {
-    let src = patched("schema_version = 3", "schema_version = 2");
+    let src = patched("schema_version = 4", "schema_version = 3");
     assert_eq!(
         expect_invalid(&src),
-        ValidateError::UnsupportedSchemaVersion(2)
+        ValidateError::UnsupportedSchemaVersion(3)
     );
 }
 
@@ -485,16 +492,16 @@ fn wrong_header_version_is_rejected() {
     );
 }
 
-// The pre-bump v0.3 wire version (2) is not just "some other version": it
+// The pre-bump v0.4 wire version (3) is not just "some other version": it
 // used to be valid, so it gets its own case rather than riding on the
 // generic wrong-version test above.
 #[test]
 fn old_schema_version_blob_is_rejected() {
     let mut blob = seahorse_blob();
-    blob[4] = 2;
+    blob[4] = 3;
     assert_eq!(
         coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed())),
-        Err(ReadError::BadVersion(2))
+        Err(ReadError::BadVersion(3))
     );
 }
 

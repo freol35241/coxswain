@@ -165,7 +165,7 @@ fn origin() -> GeoPoint {
 /// self-documenting without inventing a second indirection just for tests.
 const MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 3
+schema_version = 4
 vessel_id      = "cx-desk-rig-01"
 name           = "Desk Rig"
 revision       = 1
@@ -284,7 +284,7 @@ fn build_blob() -> (Vec<u8>, String) {
 /// (this scenario only needs teleop's DirectEffort path).
 const RUDDERBOAT_MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 3
+schema_version = 4
 vessel_id      = "cx-desk-rig-rudderboat-01"
 name           = "Desk Rig Rudderboat"
 revision       = 1

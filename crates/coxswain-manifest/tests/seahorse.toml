@@ -3,7 +3,7 @@
 # ============================================================
 
 [manifest]
-schema_version = 3          # firmware refuses unknown major versions
+schema_version = 4          # firmware refuses unknown major versions
 vessel_id      = "se-rise-seahorse-01"
 name           = "Seahorse"
 revision       = 7          # monotonically increasing per vessel

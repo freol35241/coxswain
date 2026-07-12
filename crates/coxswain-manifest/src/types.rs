@@ -14,10 +14,11 @@ use serde::{Deserialize, Serialize};
 /// Wire-facing manifest schema version. The blob header and the payload both
 /// carry it; the reader refuses anything else.
 ///
-/// Bumped 2 -> 3 for the effector table (D-026/D-027, schema v0.4).
-/// Deliberate: pre-release, so old readers simply reject new blobs and new
-/// readers reject old ones, no migration path needed.
-pub const SCHEMA_VERSION: u16 = 3;
+/// Bumped 3 -> 4 for `supervisor.power_stale_after_ms` and the `[rc]`
+/// section (D-025, schema v0.5). Deliberate: pre-release, so old readers
+/// simply reject new blobs and new readers reject old ones, no migration
+/// path needed.
+pub const SCHEMA_VERSION: u16 = 4;
 
 /// Fixed-capacity UTF-8 string, zero-padded. Exists so the blob needs no
 /// allocator; 32 bytes fits every identifier the schema doc uses.
@@ -72,6 +73,9 @@ pub enum BusKind {
     /// Conn-node timer pins, direct PWM (D-027). Refused on the hosted
     /// profile: no failsafe path survives conn-process death on Linux.
     Pwm,
+    /// The RC receiver link (D-025): CRSF/ELRS at its real 420000 baud rate,
+    /// termios2/BOTHER territory on Linux (not a POSIX `Bxxxx` rate).
+    CrsfUart,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -266,6 +270,31 @@ impl Default for EffectorEntry {
     }
 }
 
+/// The vessel's RC hand controller (D-025): hosted-profile data, like
+/// `EffectorEntry`, not part of `VesselConfig`. The supervisor never knows
+/// RC from any other claimant (D-025); this table exists only so the
+/// adapter that turns CRSF frames into claimant verbs and setpoints has
+/// somewhere manifest-authored to read its wiring from. Field for field
+/// with `coxswain_drivers::rc::Config`, plus `bus` and `claimant`.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RcEntry {
+    /// References a `BusEntry::id` of kind `crsf_uart`.
+    pub bus: FixedStr32,
+    /// The runtime `ClaimantId` the RC adapter registers as; authored
+    /// directly, same out-of-band-agreement convention as
+    /// `[[claimant]].id` (D-025).
+    pub claimant: u16,
+    pub kill_channel: u16,
+    pub takeover_channel: u16,
+    pub surge_channel: u16,
+    pub yaw_channel: u16,
+    pub switch_low_us: u16,
+    pub switch_high_us: u16,
+    pub stick_deadband_us: u16,
+    pub max_surge_n: f64,
+    pub max_yaw_nm: f64,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConnNodeEntry {
     /// Hardware profile name, not necessarily fabricated hardware (D-016).
@@ -290,4 +319,6 @@ pub struct CompiledManifest {
     pub sensors: BoundedList<SensorEntry, 16>,
     pub actuator_nodes: BoundedList<ActuatorNodeEntry, 8>,
     pub effectors: BoundedList<EffectorEntry, MAX_EFFECTORS>,
+    /// The vessel's RC hand controller, absent if the manifest declares none.
+    pub rc: Option<RcEntry>,
 }

@@ -22,6 +22,9 @@ pub struct ManifestToml {
     pub claimants: Vec<ClaimantToml>,
     pub estimator: EstimatorToml,
     pub supervisor: SupervisorToml,
+    /// The vessel's RC hand controller (D-025), optional and at most one:
+    /// a single `[rc]` table, not an array-of-tables.
+    pub rc: Option<RcToml>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +60,7 @@ pub enum BusKindToml {
     Uart,
     ActuatorUart,
     Pwm,
+    CrsfUart,
 }
 
 #[derive(Copy, Clone, Deserialize)]
@@ -274,5 +278,30 @@ pub struct SupervisorToml {
     pub position_degraded_after_ms: u64,
     pub low_voltage_v: f64,
     pub critical_voltage_v: f64,
+    /// Power report staleness bound; defaults to 3000ms when absent
+    /// (replaces the compiler's former hardcoded stopgap).
+    pub power_stale_after_ms: Option<u64>,
     pub geofence: Option<GeofenceToml>,
+}
+
+/// The vessel's RC hand controller (D-025): claimant declaration, channel
+/// mapping, and stick/switch shaping, field for field with
+/// `coxswain_drivers::rc::Config` (plus `bus` and `claimant`, which the
+/// driver config does not carry). `claimant` is authored directly, same
+/// out-of-band-agreement convention as `[[claimant]].id` (D-025): it is the
+/// runtime `ClaimantId` the RC adapter registers with, not compiler-assigned.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RcToml {
+    pub bus: String,
+    pub claimant: u16,
+    pub kill_channel: u16,
+    pub takeover_channel: u16,
+    pub surge_channel: u16,
+    pub yaw_channel: u16,
+    pub switch_low_us: u16,
+    pub switch_high_us: u16,
+    pub stick_deadband_us: u16,
+    pub max_surge_n: f64,
+    pub max_yaw_nm: f64,
 }

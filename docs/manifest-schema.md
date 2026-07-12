@@ -1,14 +1,14 @@
-# Coxswain Vessel Manifest: Schema Draft v0.4
+# Coxswain Vessel Manifest: Schema Draft v0.5
 
 The manifest is the per-vessel statement of what exists, where it terminates, and what
 the estimator is licensed to trust. It is authored as TOML, validated and compiled
 host-side to a signed, CRC-protected binary blob (postcard), and written to an A/B flash
 region on the conn node during commissioning. The firmware treats it as pure data.
 
-Doc revision is v0.4. The wire-facing `manifest.schema_version` bumps 2 -> 3 for the
-`[[effector]]` table (D-026/D-027); the bump is deliberate and pre-release, same doctrine
-as the 1 -> 2 bump, so a v0.3 reader rejects a v0.4 blob outright rather than attempting
-to interpret it.
+Doc revision is v0.5. The wire-facing `manifest.schema_version` bumps 3 -> 4 for
+`supervisor.power_stale_after_ms` and the `[rc]` section (D-025); the bump is deliberate
+and pre-release, same doctrine as every prior bump, so a v0.4 reader rejects a v0.5 blob
+outright rather than attempting to interpret it.
 
 Design rules encoded in this schema:
 
@@ -32,7 +32,7 @@ Design rules encoded in this schema:
 # ============================================================
 
 [manifest]
-schema_version = 3          # firmware refuses unknown major versions
+schema_version = 4          # firmware refuses unknown major versions
 vessel_id      = "se-rise-seahorse-01"
 name           = "Seahorse"
 revision       = 7          # monotonically increasing per vessel
@@ -51,7 +51,7 @@ watchdog_ms    = 250                 # hardware watchdog kick interval
 # ------------------------------------------------------------
 # Buses: every sensor/actuator references one of these by id.
 # Kinds: cyphal_can | nmea2000_can | nmea0183_uart | nmea0183_udp | spi | i2c | uart
-#      | actuator_uart | pwm
+#      | actuator_uart | pwm | crsf_uart
 # ------------------------------------------------------------
 
 [[bus]]
@@ -252,6 +252,7 @@ conn_grant_default      = "none"  # none | autonomy: who may hold conn at boot
 position_degraded_after_ms = 3000 # GNSS silence before degraded mode
 low_voltage_v           = 12.4
 critical_voltage_v      = 11.8
+# power_stale_after_ms  = 3000    # optional, defaults to 3000: power report staleness bound
 
 [supervisor.geofence]
 enabled = true
@@ -325,6 +326,35 @@ us_center = 1500
 us_max    = 1900
 ```
 
+**`[rc]` is the vessel's RC hand controller (D-025).** Optional, and at most one:
+a single table, not an array-of-tables. `bus` references a declared `crsf_uart`
+bus; `claimant` is the runtime `ClaimantId` the RC adapter registers as, authored
+directly like `[[claimant]].id` (manifest and adapter must agree on it out of
+band). The remaining fields match `coxswain-drivers::rc::Config` field for field:
+`kill_channel`/`takeover_channel`/`surge_channel`/`yaw_channel` index into the 16
+CRSF channels, `switch_low_us`/`switch_high_us` set the kill/takeover switch
+hysteresis, `stick_deadband_us` is shared by the surge and yaw sticks (there is
+no sway stick), and `max_surge_n`/`max_yaw_nm` are the force/moment at full
+stick deflection. Compiled into `CompiledManifest` as a typed `RcEntry`,
+hosted-profile data like `[[effector]]`'s render table rather than part of
+`VesselConfig`: the supervisor never knows RC from any other claimant (D-025).
+An absent `[rc]` compiles to `rc = None`, no hand controller declared.
+
+```toml
+[rc]
+bus                = "rc_link"       # references a crsf_uart bus
+claimant           = 1
+kill_channel       = 4
+takeover_channel   = 5
+surge_channel      = 2
+yaw_channel        = 3
+switch_low_us      = 1300
+switch_high_us     = 1700
+stick_deadband_us  = 12
+max_surge_n        = 150.0
+max_yaw_nm         = 60.0
+```
+
 **Compile-time checks (host tool, not firmware):**
 - Every referenced bus/port exists on the declared `conn_node.board` profile
   (a profile per D-016: the hosted profile and dev boards are legitimate values)
@@ -349,6 +379,12 @@ us_max    = 1900
   `coxswain-allocation`'s own config checks so a bad table fails at compile
   rather than at the allocator's boot self-test
 - A `pwm` bus is refused when `conn_node.board = "hosted"` (D-027)
+- Per output bus, `[[effector]]` channels are exactly `0..n`, no gaps: they are
+  positional on the wire
+- `[rc].bus` references a declared `crsf_uart` bus; `kill_channel`,
+  `takeover_channel`, `surge_channel`, and `yaw_channel` are distinct and each
+  below 16 (CRSF's channel count); `switch_low_us < switch_high_us`;
+  `max_surge_n` and `max_yaw_nm` are finite and strictly positive (D-025)
 
 **Boot-time checks (firmware):**
 - Signature + CRC + schema version on the active bank, else fall back / safe mode
@@ -400,7 +436,16 @@ kinds since both are PWM-terminated, and a `pwm` bus is refused on profiles with
 failsafe path that survives conn-process death (the hosted profile refuses it, the H7
 profile accepts it). An empty table stays valid and means tau-direct legacy behavior.
 
-## Open questions for v0.5
+**Settled since v0.4:** `supervisor.power_stale_after_ms` (optional, defaults to
+3000), replacing the compiler's former hardcoded stopgap. The `[rc]` section
+(D-025): the vessel's RC hand controller, replacing what the hosted profile
+hardcoded before this bump. Compiled as a typed `RcEntry`, hosted-profile data
+like the effector render table rather than part of `VesselConfig`: the
+supervisor never knows RC from any other claimant. Effector channel
+contiguity (per output bus, `[[effector]]` channels are exactly `0..n`)
+graduates from a hosted-profile boot check to a compile-time rule.
+
+## Open questions for v0.6
 
 1. **Fusion priority vs weights.** `heading = [a, b]` as priority order is simple but
    crude; explicit per-sensor noise parameters may belong in the manifest once the
