@@ -95,7 +95,7 @@ fn origin() -> GeoPoint {
 /// self-documenting without inventing a second indirection just for tests.
 const MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 2
+schema_version = 3
 vessel_id      = "cx-desk-rig-01"
 name           = "Desk Rig"
 revision       = 1

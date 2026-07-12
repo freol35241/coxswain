@@ -7,20 +7,21 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use coxswain_contract::{
-    BoundedList, ClaimantId, ClaimantPriority, ConnGrantDefault, EstimatorConfig, Fossen3DofParams,
-    GeoPoint, GeofenceAction, GeofenceConfig, License, ModelParams, SensorConfig, SensorId,
-    SensorRole, SupervisorConfig, VesselConfig,
+    BoundedList, ClaimantId, ClaimantPriority, ConnGrantDefault, EffectorConfig, EffectorId,
+    EffectorKind, EstimatorConfig, Fossen3DofParams, GeoPoint, GeofenceAction, GeofenceConfig,
+    License, MAX_EFFECTORS, ModelParams, SensorConfig, SensorId, SensorRole, SupervisorConfig,
+    VesselConfig,
 };
 
 use crate::toml_model::{
-    BusKindToml, BusToml, ChecksumToml, ClaimantToml, ConnGrantToml, EstimatorToml, FailsafeToml,
-    FunctionToml, GeofenceActionToml, GeofenceToml, LicenseToml, ManifestToml, RoleToml,
-    SensorToml,
+    BusKindToml, BusToml, ChecksumToml, ClaimantToml, ConnGrantToml, EffectorToml, EstimatorToml,
+    FailsafeToml, FunctionToml, GeofenceActionToml, GeofenceToml, LicenseToml, ManifestToml,
+    PwmCalibrationToml, RoleToml, SensorToml,
 };
 use crate::types::{
     ActuatorFailsafe, ActuatorFunction, ActuatorNodeEntry, BusEntry, BusKind, ChecksumMode,
-    CompiledManifest, ConnNodeEntry, FixedStr32, Nmea0183Quirks, Nmea2000Quirks, SCHEMA_VERSION,
-    SensorEntry,
+    CompiledManifest, ConnNodeEntry, EffectorEntry, FixedStr32, Nmea0183Quirks, Nmea2000Quirks,
+    PwmCalibration, SCHEMA_VERSION, SensorEntry,
 };
 
 /// Board profiles (D-016): the ports a manifest may reference. A sensor's
@@ -39,6 +40,12 @@ const MAX_AGE_GNSS_MS: u64 = 3000;
 const MAX_AGE_HEADING_MS: u64 = 1000; // heading and compass alike
 const MAX_AGE_IMU_MS: u64 = 500;
 const MAX_AGE_OTHER_MS: u64 = 5000;
+
+/// Plausibility window for `[effector.pwm]` microsecond fields (D-027).
+/// Standard RC PWM is 1000-2000 us; the window leaves headroom for
+/// nonstandard servos while still catching swapped or garbage values.
+const PWM_US_MIN: u16 = 500;
+const PWM_US_MAX: u16 = 2500;
 
 /// Exactly the fields `estimator.params` must carry for `fossen_3dof`.
 const FOSSEN_FIELDS: [&str; 8] = [
@@ -127,6 +134,56 @@ pub enum ValidateError {
         what: &'static str,
         max: usize,
     },
+    /// "azimuth" and "sail" are schema-visible effector kinds, rejected
+    /// until implemented (D-026).
+    EffectorKindNotImplemented {
+        effector: String,
+        kind: &'static str,
+    },
+    UnknownEffectorKind(String),
+    /// A kind-specific geometry/limit field was absent for the effector's
+    /// `kind`.
+    EffectorFieldMissing {
+        effector: String,
+        field: &'static str,
+    },
+    /// An effector's `bus` names a bus that is not `actuator_uart` or `pwm`
+    /// (D-027: not every bus kind is an output).
+    EffectorBusWrongKind {
+        effector: String,
+        bus: String,
+    },
+    DuplicateEffectorChannel {
+        bus: String,
+        channel: u16,
+    },
+    /// `[effector.pwm]` field outside the 500..=2500 us plausibility window.
+    EffectorCalibrationRange {
+        effector: String,
+        field: &'static str,
+        us: u16,
+    },
+    /// `[effector.pwm]` fields not in strict `us_min < us_center < us_max`
+    /// order.
+    EffectorCalibrationOrder {
+        effector: String,
+    },
+    /// A geometry or coefficient field is NaN or infinite (mirrors
+    /// `coxswain_allocation::ConfigError::NonFinite`).
+    EffectorNonFinite {
+        effector: String,
+    },
+    /// A limit, effectiveness, or the rudder's low-speed floor that must be
+    /// strictly positive is zero or negative (mirrors
+    /// `coxswain_allocation::ConfigError::NonPositiveLimit`).
+    EffectorNonPositiveLimit {
+        effector: String,
+    },
+    /// A `pwm` bus on the hosted profile: no failsafe path survives
+    /// conn-process death on Linux (D-027).
+    PwmBusOnHosted {
+        bus: String,
+    },
 }
 
 impl std::fmt::Display for ValidateError {
@@ -135,7 +192,7 @@ impl std::fmt::Display for ValidateError {
             Self::UnsupportedSchemaVersion(v) => {
                 write!(
                     f,
-                    "schema_version {v} unsupported, this tool compiles version 2"
+                    "schema_version {v} unsupported, this tool compiles version 3"
                 )
             }
             Self::UnknownBoard(b) => write!(f, "unknown conn_node.board profile {b:?}"),
@@ -221,6 +278,65 @@ impl std::fmt::Display for ValidateError {
                 write!(f, "{field} {value:?} exceeds 32 bytes")
             }
             Self::TooMany { what, max } => write!(f, "too many {what}, the blob holds {max}"),
+            Self::EffectorKindNotImplemented { effector, kind } => {
+                write!(
+                    f,
+                    "effector {effector:?}: kind {kind:?} is schema-visible but not implemented \
+                     (D-026)"
+                )
+            }
+            Self::UnknownEffectorKind(k) => write!(f, "unknown effector kind {k:?}"),
+            Self::EffectorFieldMissing { effector, field } => {
+                write!(f, "effector {effector:?} is missing field {field:?}")
+            }
+            Self::EffectorBusWrongKind { effector, bus } => {
+                write!(
+                    f,
+                    "effector {effector:?} references bus {bus:?}, which is not an output bus \
+                     (actuator_uart or pwm)"
+                )
+            }
+            Self::DuplicateEffectorChannel { bus, channel } => {
+                write!(f, "channel {channel} appears twice on bus {bus:?}")
+            }
+            Self::EffectorCalibrationRange {
+                effector,
+                field,
+                us,
+            } => {
+                write!(
+                    f,
+                    "effector {effector:?}: {field} = {us} us outside the plausibility window \
+                     {PWM_US_MIN}..={PWM_US_MAX}"
+                )
+            }
+            Self::EffectorCalibrationOrder { effector } => {
+                write!(
+                    f,
+                    "effector {effector:?}: pwm calibration must satisfy us_min < us_center < \
+                     us_max"
+                )
+            }
+            Self::EffectorNonFinite { effector } => {
+                write!(
+                    f,
+                    "effector {effector:?}: a geometry or limit field is not finite"
+                )
+            }
+            Self::EffectorNonPositiveLimit { effector } => {
+                write!(
+                    f,
+                    "effector {effector:?}: a limit, effectiveness, or speed floor is not \
+                     strictly positive"
+                )
+            }
+            Self::PwmBusOnHosted { bus } => {
+                write!(
+                    f,
+                    "bus {bus:?}: kind \"pwm\" is refused on the hosted profile, no failsafe \
+                     path survives conn-process death on Linux (D-027)"
+                )
+            }
         }
     }
 }
@@ -302,6 +418,13 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         if !ports.insert(&bus.port) {
             return Err(ValidateError::DuplicatePort {
                 port: bus.port.clone(),
+            });
+        }
+        // D-027: direct PWM has no failsafe path that survives conn-process
+        // death on the hosted profile.
+        if bus.kind == BusKindToml::Pwm && board == BOARD_HOSTED {
+            return Err(ValidateError::PwmBusOnHosted {
+                bus: bus.id.clone(),
             });
         }
     }
@@ -489,6 +612,60 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
             })?;
     }
 
+    // Effector table (D-026/D-027): bus exists and is an output kind,
+    // channel unique per bus, kind resolved (or rejected), geometry/limits
+    // finite and positive, pwm calibration ordered and in-window. An empty
+    // table is valid and means tau-direct legacy behavior (the contract
+    // convention); Cyphal-actuated vessels keep using `[[actuator_node]]`
+    // without an effector table until Phase 7/9 allocation wiring lands.
+    let mut effectors: BoundedList<EffectorEntry, MAX_EFFECTORS> = BoundedList::new();
+    let mut effector_configs: BoundedList<EffectorConfig, MAX_EFFECTORS> = BoundedList::new();
+    let mut effector_channels: HashSet<(&str, u16)> = HashSet::new();
+    for (i, e) in m.effectors.iter().enumerate() {
+        let Some(bus) = bus_by_id.get(e.bus.as_str()) else {
+            return Err(ValidateError::UnknownBus {
+                owner: e.id.clone(),
+                bus: e.bus.clone(),
+            });
+        };
+        if !matches!(bus.kind, BusKindToml::ActuatorUart | BusKindToml::Pwm) {
+            return Err(ValidateError::EffectorBusWrongKind {
+                effector: e.id.clone(),
+                bus: e.bus.clone(),
+            });
+        }
+        if !effector_channels.insert((e.bus.as_str(), e.channel)) {
+            return Err(ValidateError::DuplicateEffectorChannel {
+                bus: e.bus.clone(),
+                channel: e.channel,
+            });
+        }
+
+        let kind = effector_kind(&e.id, e)?;
+        effector_finite_and_positive(&e.id, &kind)?;
+        let pwm = pwm_calibration(&e.id, &e.pwm)?;
+
+        let too_many = |_| ValidateError::TooMany {
+            what: "effectors",
+            max: MAX_EFFECTORS,
+        };
+        effectors
+            .push(EffectorEntry {
+                id: EffectorId(i as u16),
+                name: fx("effector.id", &e.id)?,
+                bus: fx("effector.bus", &e.bus)?,
+                channel: e.channel,
+                pwm,
+            })
+            .map_err(too_many)?;
+        effector_configs
+            .push(EffectorConfig {
+                id: EffectorId(i as u16),
+                kind,
+            })
+            .map_err(too_many)?;
+    }
+
     Ok(CompiledManifest {
         schema_version: m.manifest.schema_version,
         vessel_id: fx("manifest.vessel_id", &m.manifest.vessel_id)?,
@@ -502,13 +679,12 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
             sensors: sensor_configs,
             estimator,
             supervisor,
-            // The effector table is manifest v0.4 schema work (D-026); the
-            // compiler emits an empty list until it lands.
-            effectors: BoundedList::new(),
+            effectors: effector_configs,
         },
         buses,
         sensors,
         actuator_nodes,
+        effectors,
     })
 }
 
@@ -768,6 +944,8 @@ fn bus_entry(bus: &BusToml) -> Result<BusEntry, ValidateError> {
             BusKindToml::Spi => BusKind::Spi,
             BusKindToml::I2c => BusKind::I2c,
             BusKindToml::Uart => BusKind::Uart,
+            BusKindToml::ActuatorUart => BusKind::ActuatorUart,
+            BusKindToml::Pwm => BusKind::Pwm,
         },
         port: fx("bus.port", &bus.port)?,
         rate: bus.bitrate.or(bus.baud).unwrap_or(0),
@@ -899,4 +1077,137 @@ fn sensor_entry(
         max_age: Duration::from_millis(max_age_ms),
     };
     Ok((entry, config))
+}
+
+/// Resolves `effector.kind`. "azimuth" and "sail" are schema-visible but
+/// rejected until implemented (D-026); any other unrecognized string is the
+/// ordinary unknown-kind error, the same pattern as `model_params`'s
+/// `UnknownModel`.
+fn effector_kind(id: &str, e: &EffectorToml) -> Result<EffectorKind, ValidateError> {
+    let field = |name: &'static str, v: Option<f64>| {
+        v.ok_or_else(|| ValidateError::EffectorFieldMissing {
+            effector: id.to_string(),
+            field: name,
+        })
+    };
+    match e.kind.as_str() {
+        "fixed_thruster" => Ok(EffectorKind::FixedThruster {
+            pos_x_m: field("pos_x_m", e.pos_x_m)?,
+            pos_y_m: field("pos_y_m", e.pos_y_m)?,
+            azimuth_rad: field("azimuth_rad", e.azimuth_rad)?,
+            max_thrust_fwd_n: field("max_thrust_fwd_n", e.max_thrust_fwd_n)?,
+            max_thrust_rev_n: field("max_thrust_rev_n", e.max_thrust_rev_n)?,
+        }),
+        "rudder" => Ok(EffectorKind::Rudder {
+            pos_x_m: field("pos_x_m", e.pos_x_m)?,
+            side_force_n_per_rad_mps2: field(
+                "side_force_n_per_rad_mps2",
+                e.side_force_n_per_rad_mps2,
+            )?,
+            max_angle_rad: field("max_angle_rad", e.max_angle_rad)?,
+            min_effective_speed_mps: field("min_effective_speed_mps", e.min_effective_speed_mps)?,
+        }),
+        "azimuth" => Err(ValidateError::EffectorKindNotImplemented {
+            effector: id.to_string(),
+            kind: "azimuth",
+        }),
+        "sail" => Err(ValidateError::EffectorKindNotImplemented {
+            effector: id.to_string(),
+            kind: "sail",
+        }),
+        other => Err(ValidateError::UnknownEffectorKind(other.to_string())),
+    }
+}
+
+/// Mirrors `coxswain_allocation::ConfigError`'s conditions exactly, so a bad
+/// effector table fails at compile time rather than at the allocator's boot
+/// self-test.
+fn effector_finite_and_positive(id: &str, kind: &EffectorKind) -> Result<(), ValidateError> {
+    let non_finite = || ValidateError::EffectorNonFinite {
+        effector: id.to_string(),
+    };
+    let non_positive = || ValidateError::EffectorNonPositiveLimit {
+        effector: id.to_string(),
+    };
+    match *kind {
+        EffectorKind::FixedThruster {
+            pos_x_m,
+            pos_y_m,
+            azimuth_rad,
+            max_thrust_fwd_n,
+            max_thrust_rev_n,
+        } => {
+            if ![
+                pos_x_m,
+                pos_y_m,
+                azimuth_rad,
+                max_thrust_fwd_n,
+                max_thrust_rev_n,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+            {
+                return Err(non_finite());
+            }
+            if !(max_thrust_fwd_n > 0.0 && max_thrust_rev_n > 0.0) {
+                return Err(non_positive());
+            }
+        }
+        EffectorKind::Rudder {
+            pos_x_m,
+            side_force_n_per_rad_mps2,
+            max_angle_rad,
+            min_effective_speed_mps,
+        } => {
+            if ![
+                pos_x_m,
+                side_force_n_per_rad_mps2,
+                max_angle_rad,
+                min_effective_speed_mps,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+            {
+                return Err(non_finite());
+            }
+            // min_effective_speed_mps is a divisor floor in the allocator:
+            // strictly positive, not merely non-negative.
+            if !(side_force_n_per_rad_mps2 > 0.0
+                && max_angle_rad > 0.0
+                && min_effective_speed_mps > 0.0)
+            {
+                return Err(non_positive());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `[effector.pwm]`: strict ordering and the 500..=2500 us plausibility
+/// window (D-027).
+fn pwm_calibration(id: &str, p: &PwmCalibrationToml) -> Result<PwmCalibration, ValidateError> {
+    for (field, us) in [
+        ("us_min", p.us_min),
+        ("us_center", p.us_center),
+        ("us_max", p.us_max),
+    ] {
+        if !(PWM_US_MIN..=PWM_US_MAX).contains(&us) {
+            return Err(ValidateError::EffectorCalibrationRange {
+                effector: id.to_string(),
+                field,
+                us,
+            });
+        }
+    }
+    if !(p.us_min < p.us_center && p.us_center < p.us_max) {
+        return Err(ValidateError::EffectorCalibrationOrder {
+            effector: id.to_string(),
+        });
+    }
+    Ok(PwmCalibration {
+        us_min: p.us_min,
+        us_center: p.us_center,
+        us_max: p.us_max,
+        reversed: p.reversed,
+    })
 }

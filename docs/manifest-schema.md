@@ -1,13 +1,14 @@
-# Coxswain Vessel Manifest: Schema Draft v0.3
+# Coxswain Vessel Manifest: Schema Draft v0.4
 
 The manifest is the per-vessel statement of what exists, where it terminates, and what
 the estimator is licensed to trust. It is authored as TOML, validated and compiled
 host-side to a signed, CRC-protected binary blob (postcard), and written to an A/B flash
 region on the conn node during commissioning. The firmware treats it as pure data.
 
-Doc revision is v0.3. The wire-facing `manifest.schema_version` bumps 1 -> 2 for the
-claimant priority table (D-025); the bump is deliberate and pre-release, so a v0.2
-reader rejects a v0.3 blob outright rather than attempting to interpret it.
+Doc revision is v0.4. The wire-facing `manifest.schema_version` bumps 2 -> 3 for the
+`[[effector]]` table (D-026/D-027); the bump is deliberate and pre-release, same doctrine
+as the 1 -> 2 bump, so a v0.3 reader rejects a v0.4 blob outright rather than attempting
+to interpret it.
 
 Design rules encoded in this schema:
 
@@ -31,7 +32,7 @@ Design rules encoded in this schema:
 # ============================================================
 
 [manifest]
-schema_version = 2          # firmware refuses unknown major versions
+schema_version = 3          # firmware refuses unknown major versions
 vessel_id      = "se-rise-seahorse-01"
 name           = "Seahorse"
 revision       = 7          # monotonically increasing per vessel
@@ -50,6 +51,7 @@ watchdog_ms    = 250                 # hardware watchdog kick interval
 # ------------------------------------------------------------
 # Buses: every sensor/actuator references one of these by id.
 # Kinds: cyphal_can | nmea2000_can | nmea0183_uart | nmea0183_udp | spi | i2c | uart
+#      | actuator_uart | pwm
 # ------------------------------------------------------------
 
 [[bus]]
@@ -278,6 +280,51 @@ per D-022; today `max_age_ms` exists only in the 0183 quirk table and is
 provisional. `enrichment` sensors are pass-through: decoded, timestamped,
 published to Keelson, invisible to control.
 
+**`[[effector]]` is what D-026/D-027 govern.** Where `license` declares sensor trust,
+the effector table declares actuation capability: guidance's tau is only as real as
+the effectors the allocator can drive it through (D-026). Each entry names a `kind`
+(`fixed_thruster` | `rudder`; `azimuth` and `sail` are schema-visible but rejected at
+compile until implemented, D-026), the kind-specific geometry and limits the contract's
+`EffectorKind` carries, and an output `bus` + `channel`. `[effector.pwm]` calibration is
+required for every effector: both output bus kinds (`actuator_uart`, `pwm`) are
+PWM-terminated, and per D-018 calibration is manifest data because it shapes control,
+not a runtime setting. The mapping is piecewise linear through center: physical zero
+(no thrust, amidships) maps to `us_center`, the negative limit to `us_min`, the positive
+limit to `us_max`; `reversed` swaps the endpoints. An empty `[[effector]]` table is
+valid and means tau-direct legacy behavior: no allocation stage, guidance's demand goes
+to the backend directly (today's Cyphal `[[actuator_node]]` story, e.g. Seahorse).
+
+```toml
+[[effector]]
+id      = "esc_main"
+kind    = "fixed_thruster"
+bus     = "actuator_bridge"       # references an actuator_uart or pwm bus
+channel = 0
+pos_x_m           = -1.20
+pos_y_m           = 0.00
+azimuth_rad       = 0.0
+max_thrust_fwd_n  = 300.0
+max_thrust_rev_n  = 180.0
+[effector.pwm]
+us_min    = 1100
+us_center = 1500
+us_max    = 1900
+
+[[effector]]
+id      = "rudder_main"
+kind    = "rudder"
+bus     = "actuator_bridge"
+channel = 1
+pos_x_m                    = -1.80
+side_force_n_per_rad_mps2  = 400.0
+max_angle_rad              = 0.6
+min_effective_speed_mps    = 0.5
+[effector.pwm]
+us_min    = 1100
+us_center = 1500
+us_max    = 1900
+```
+
 **Compile-time checks (host tool, not firmware):**
 - Every referenced bus/port exists on the declared `conn_node.board` profile
   (a profile per D-016: the hosted profile and dev boards are legitimate values)
@@ -291,6 +338,17 @@ published to Keelson, invisible to control.
 - Schema version compatible with target firmware version
 - `driver` strings are not resolved here; a manifest may name drivers the target
   firmware lacks, and that surfaces at boot self-test, not at compile
+- Every `[[effector]]` references a declared bus of an output kind
+  (`actuator_uart` or `pwm`); `channel` is unique per bus; at most 8 effectors
+  (see `[[effector]]` below)
+- `[effector.pwm]` satisfies `us_min < us_center < us_max`, all three within the
+  500-2500 us plausibility window (standard RC PWM is 1000-2000 us; the window
+  leaves headroom for nonstandard servos while catching swapped or garbage values)
+- Effector geometry/limits are finite, and thrust/angle/effectiveness/min-speed
+  limits are strictly positive where `EffectorKind` requires it, mirroring
+  `coxswain-allocation`'s own config checks so a bad table fails at compile
+  rather than at the allocator's boot self-test
+- A `pwm` bus is refused when `conn_node.board = "hosted"` (D-027)
 
 **Boot-time checks (firmware):**
 - Signature + CRC + schema version on the active bank, else fall back / safe mode
@@ -332,7 +390,17 @@ is authored directly rather than compiler-assigned: it is the runtime `ClaimantI
 the claimant registers with, so the manifest and the running claimant must agree
 on it out of band.
 
-## Open questions for v0.4
+**Settled since v0.3:** the `[[effector]]` table (D-026, D-027). Per-effector kind
+(`fixed_thruster`, `rudder`; `azimuth` and `sail` schema-visible but rejected until
+implemented), position, mounting azimuth, thrust/angle limits, and rudder
+effectiveness match the contract's `EffectorKind` fields exactly. Output routing per
+D-027: each effector references an output bus (`actuator_uart` or `pwm`), calibration
+(endpoints, direction; piecewise linear through center) is manifest data for both
+kinds since both are PWM-terminated, and a `pwm` bus is refused on profiles without a
+failsafe path that survives conn-process death (the hosted profile refuses it, the H7
+profile accepts it). An empty table stays valid and means tau-direct legacy behavior.
+
+## Open questions for v0.5
 
 1. **Fusion priority vs weights.** `heading = [a, b]` as priority order is simple but
    crude; explicit per-sensor noise parameters may belong in the manifest once the
@@ -344,12 +412,7 @@ on it out of band.
    carries the public key. It does not settle who holds the private key, how it rotates,
    or whether a vessel accepts more than one signer. Key management is the cost here,
    not the code.
-4. **Effector geometry for conn-node allocation** (D-026, D-027): per-effector
-   kind (fixed_thruster, rudder; azimuth and sail schema-visible but rejected
-   until implemented), position, mounting azimuth, thrust/angle limits, rudder
-   effectiveness, plus output routing per D-027: each effector references an
-   output bus, calibration (thrust curve, endpoints, direction) is manifest
-   data for the serial bridge and pwm kinds, and a "pwm" bus is refused on
-   profiles without a failsafe path that survives conn-process death (the
-   hosted profile refuses it; the H7 profile accepts it). Fields freeze after
-   the allocator exists, per D-022.
+4. **Nonlinear thrust curve.** `[effector.pwm]` calibration is piecewise linear
+   through center (two segments, three points). A real ESC/prop pair is rarely
+   linear across its full range; a proper curve (more points, or a fitted
+   function) is a recorded later refinement, not guessed now.

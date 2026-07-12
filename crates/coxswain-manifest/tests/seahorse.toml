@@ -3,7 +3,7 @@
 # ============================================================
 
 [manifest]
-schema_version = 2          # firmware refuses unknown major versions
+schema_version = 3          # firmware refuses unknown major versions
 vessel_id      = "se-rise-seahorse-01"
 name           = "Seahorse"
 revision       = 7          # monotonically increasing per vessel
@@ -22,6 +22,7 @@ watchdog_ms    = 250                 # hardware watchdog kick interval
 # ------------------------------------------------------------
 # Buses: every sensor/actuator references one of these by id.
 # Kinds: cyphal_can | nmea2000_can | nmea0183_uart | nmea0183_udp | spi | i2c | uart
+#      | actuator_uart | pwm
 # ------------------------------------------------------------
 
 [[bus]]

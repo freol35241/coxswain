@@ -6,16 +6,18 @@
 //! Driver names survive as fixed strings: boot self-test resolves them, not
 //! the compiler (schema doc: driver strings are not resolved at compile).
 
-use coxswain_contract::{BoundedList, License, SensorId, SensorRole, VesselConfig};
+use coxswain_contract::{
+    BoundedList, EffectorId, License, MAX_EFFECTORS, SensorId, SensorRole, VesselConfig,
+};
 use serde::{Deserialize, Serialize};
 
 /// Wire-facing manifest schema version. The blob header and the payload both
 /// carry it; the reader refuses anything else.
 ///
-/// Bumped 1 -> 2 for the claimant priority table (D-025, schema v0.3).
+/// Bumped 2 -> 3 for the effector table (D-026/D-027, schema v0.4).
 /// Deliberate: pre-release, so old readers simply reject new blobs and new
 /// readers reject old ones, no migration path needed.
-pub const SCHEMA_VERSION: u16 = 2;
+pub const SCHEMA_VERSION: u16 = 3;
 
 /// Fixed-capacity UTF-8 string, zero-padded. Exists so the blob needs no
 /// allocator; 32 bytes fits every identifier the schema doc uses.
@@ -65,6 +67,11 @@ pub enum BusKind {
     Spi,
     I2c,
     Uart,
+    /// The $CXOUT serial bridge link (D-027).
+    ActuatorUart,
+    /// Conn-node timer pins, direct PWM (D-027). Refused on the hosted
+    /// profile: no failsafe path survives conn-process death on Linux.
+    Pwm,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -217,6 +224,48 @@ impl Default for ActuatorNodeEntry {
     }
 }
 
+/// Physical-to-signal PWM mapping, piecewise linear through center (D-027):
+/// thrust/angle 0 -> `us_center`, -max -> `us_min`, +max -> `us_max`.
+/// `reversed` swaps `us_min` and `us_max`. Manifest data by necessity for a
+/// `pwm` bus (no far end); rendered at the conn node for `actuator_uart` too,
+/// keeping the bridge firmware dumb (D-027).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PwmCalibration {
+    pub us_min: u16,
+    pub us_center: u16,
+    pub us_max: u16,
+    pub reversed: bool,
+}
+
+/// What the hosted profile needs to render one effector's output: which bus
+/// and channel, and the calibration. Geometry and limits live in
+/// `VesselConfig::effectors` (the allocator's input), indexed by the same
+/// `EffectorId`; this table does not repeat them.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EffectorEntry {
+    /// Compiler-assigned, in order of appearance, same scheme as `SensorId`.
+    pub id: EffectorId,
+    /// The authored string id.
+    pub name: FixedStr32,
+    /// References a `BusEntry::id`.
+    pub bus: FixedStr32,
+    pub channel: u16,
+    pub pwm: PwmCalibration,
+}
+
+// Dead-tail filler only, as for BusEntry.
+impl Default for EffectorEntry {
+    fn default() -> Self {
+        Self {
+            id: EffectorId(0),
+            name: FixedStr32::empty(),
+            bus: FixedStr32::empty(),
+            channel: 0,
+            pwm: PwmCalibration::default(),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConnNodeEntry {
     /// Hardware profile name, not necessarily fabricated hardware (D-016).
@@ -240,4 +289,5 @@ pub struct CompiledManifest {
     pub buses: BoundedList<BusEntry, 8>,
     pub sensors: BoundedList<SensorEntry, 16>,
     pub actuator_nodes: BoundedList<ActuatorNodeEntry, 8>,
+    pub effectors: BoundedList<EffectorEntry, MAX_EFFECTORS>,
 }

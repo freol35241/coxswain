@@ -16,6 +16,8 @@ pub struct ManifestToml {
     pub sensors: Vec<SensorToml>,
     #[serde(default, rename = "actuator_node")]
     pub actuator_nodes: Vec<ActuatorNodeToml>,
+    #[serde(default, rename = "effector")]
+    pub effectors: Vec<EffectorToml>,
     #[serde(default, rename = "claimant")]
     pub claimants: Vec<ClaimantToml>,
     pub estimator: EstimatorToml,
@@ -53,6 +55,8 @@ pub enum BusKindToml {
     Spi,
     I2c,
     Uart,
+    ActuatorUart,
+    Pwm,
 }
 
 #[derive(Copy, Clone, Deserialize)]
@@ -163,6 +167,47 @@ pub struct ActuatorNodeToml {
     pub function: FunctionToml,
     pub failsafe: FailsafeToml,
     pub heartbeat_timeout_ms: u32,
+}
+
+/// PWM calibration, required for every effector: both bus kinds an effector
+/// may reference (`actuator_uart`, `pwm`) are PWM-terminated (D-027).
+/// Piecewise linear through center: -max -> `us_min`, 0 -> `us_center`,
+/// +max -> `us_max`; `reversed` swaps the endpoints.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PwmCalibrationToml {
+    pub us_min: u16,
+    pub us_center: u16,
+    pub us_max: u16,
+    #[serde(default)]
+    pub reversed: bool,
+}
+
+/// One entry of the `[[effector]]` table (D-026). `kind` stays a raw string,
+/// validated in the compiler rather than as a serde enum, so "azimuth" and
+/// "sail" can be recognized and rejected with a dedicated NotImplemented
+/// error instead of an opaque parse failure (mirrors how `estimator.model`
+/// is handled). The kind-specific geometry/limit fields are optional here;
+/// the compiler picks the set that matches `kind` and errors if one is
+/// missing.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectorToml {
+    pub id: String,
+    pub kind: String,
+    pub bus: String,
+    pub channel: u16,
+    // fixed_thruster
+    pub pos_x_m: Option<f64>,
+    pub pos_y_m: Option<f64>,
+    pub azimuth_rad: Option<f64>,
+    pub max_thrust_fwd_n: Option<f64>,
+    pub max_thrust_rev_n: Option<f64>,
+    // rudder (pos_x_m shared with fixed_thruster above)
+    pub side_force_n_per_rad_mps2: Option<f64>,
+    pub max_angle_rad: Option<f64>,
+    pub min_effective_speed_mps: Option<f64>,
+    pub pwm: PwmCalibrationToml,
 }
 
 /// Per-claimant conn preemption priority (D-025). Unlike sensor/bus/

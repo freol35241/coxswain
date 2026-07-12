@@ -46,11 +46,16 @@ fn seahorse_compiles_and_roundtrips() {
     assert_eq!(manifest.vessel_id.as_str(), "se-rise-seahorse-01");
     assert_eq!(manifest.name.as_str(), "Seahorse");
     assert_eq!(manifest.revision, 7);
-    assert_eq!(manifest.schema_version, 2);
+    assert_eq!(manifest.schema_version, 3);
     assert_eq!(manifest.buses.len(), 6);
     assert_eq!(manifest.sensors.len(), 7);
     assert_eq!(manifest.actuator_nodes.len(), 3);
     assert_eq!(manifest.config.sensors.len(), 7);
+    // Seahorse's actuator story is Cyphal actuator_nodes, no [[effector]]
+    // table: an empty effector list is valid and means tau-direct legacy
+    // behavior (D-026 fallback), not an error.
+    assert!(manifest.effectors.is_empty());
+    assert!(manifest.config.effectors.is_empty());
     // D-025: autonomy default, rc outranking it.
     let priorities = manifest.config.supervisor.claimant_priorities.as_slice();
     assert_eq!(
@@ -406,13 +411,14 @@ fn rejects_inner_loop_on_udp_bus_outside_conn_segment() {
     ));
 }
 
-// Rule 10: schema_version must be 2.
+// Rule 10: schema_version must be 3. A v0.3 manifest (schema_version 2) is
+// rejected outright now, same doctrine as the 1 -> 2 bump (D-025).
 #[test]
 fn rejects_unknown_schema_version() {
-    let src = patched("schema_version = 2", "schema_version = 3");
+    let src = patched("schema_version = 3", "schema_version = 2");
     assert_eq!(
         expect_invalid(&src),
-        ValidateError::UnsupportedSchemaVersion(3)
+        ValidateError::UnsupportedSchemaVersion(2)
     );
 }
 
@@ -476,6 +482,19 @@ fn wrong_header_version_is_rejected() {
     assert_eq!(
         coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed())),
         Err(ReadError::BadVersion(9))
+    );
+}
+
+// The pre-bump v0.3 wire version (2) is not just "some other version": it
+// used to be valid, so it gets its own case rather than riding on the
+// generic wrong-version test above.
+#[test]
+fn old_schema_version_blob_is_rejected() {
+    let mut blob = seahorse_blob();
+    blob[4] = 2;
+    assert_eq!(
+        coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed())),
+        Err(ReadError::BadVersion(2))
     );
 }
 
