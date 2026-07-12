@@ -50,6 +50,15 @@ const INIT_YAW_RATE_STD: f64 = 0.5; // rad/s
 // diary's r estimate to NaN; substepping keeps the Jacobian locally valid.
 const MAX_SUBSTEP_S: f64 = 0.1;
 
+// SOG/COG estimated-speed floor: below this the course Jacobian (d psi_cog /
+// d(u, v) ~ 1/s^2) blows up, and direction over the ground is noise at a
+// near-zero velocity vector regardless of what a receiver reports. A
+// manifest field is deferred until evidence demands a vessel-specific value
+// (schema open question 1, D-022); coxswain-drivers::gnss0183 and
+// coxswain-estimator each carry their own copy of this value deliberately
+// (sentence-local physics at the source, numerical backstop here).
+pub const COG_MIN_SPEED_MPS: f64 = 0.5;
+
 /// Wrap an angle to (-pi, pi].
 pub fn wrap_angle(a: f64) -> f64 {
     let w = a - TAU * libm::floor((a + PI) / TAU);
@@ -165,6 +174,79 @@ impl Ekf {
         self.scalar_update(5, r_radps - self.x[5], std_radps * std_radps);
     }
 
+    /// GNSS fix with a full 2x2 NE covariance (e.g. RTK), closed-form 2D
+    /// update on [n, e] rather than two sequential scalar updates: those
+    /// assume a diagonal R, which a real covariance need not be. H picks
+    /// state indices 0 and 1 directly, so H P H^T is P's top-left 2x2 block
+    /// and P H^T is just P's first two columns.
+    pub fn update_position_cov(&mut self, n: f64, e: f64, cov_ne_m2: [[f64; 2]; 2]) {
+        let pn = self.p.column(0).into_owned();
+        let pe = self.p.column(1).into_owned();
+        let s00 = pn[0] + cov_ne_m2[0][0];
+        let s01 = pn[1] + cov_ne_m2[0][1];
+        let s10 = pe[0] + cov_ne_m2[1][0];
+        let s11 = pe[1] + cov_ne_m2[1][1];
+        let det = s00 * s11 - s01 * s10;
+        // The declared covariance is validated positive-definite at intake
+        // and P is positive-semidefinite by construction, so S = H P H^T + R
+        // is positive-definite and det > 0 in exact arithmetic; this is a
+        // numerical backstop against a near-singular S, not an expected path.
+        if det.abs() < 1e-12 {
+            return;
+        }
+        let (i00, i01, i10, i11) = (s11 / det, -s01 / det, -s10 / det, s00 / det);
+        let y0 = n - self.x[0];
+        let y1 = e - self.x[1];
+        // K = P H^T S^-1 = [pn | pe] S^-1, as two column vectors.
+        let k0 = pn * i00 + pe * i10;
+        let k1 = pn * i01 + pe * i11;
+        self.x += k0 * y0 + k1 * y1;
+        self.x[2] = wrap_angle(self.x[2]);
+        // P -= K H P; H P is [pn; pe] as rows (P symmetric, so column = row).
+        self.p -= k0 * pn.transpose() + k1 * pe.transpose();
+        self.p = (self.p + self.p.transpose()) * 0.5;
+    }
+
+    /// SOG measures h(x) = sqrt(u^2 + v^2). Jacobian: dh/du = u/s, dh/dv =
+    /// v/s. No-op below `COG_MIN_SPEED_MPS`: the direction split between u
+    /// and v (and thus the Jacobian) is ill-conditioned as s -> 0. This
+    /// mirrors the intake-level rejection in coxswain-estimator's lib.rs,
+    /// which is the load-bearing guard (it runs before predict, so a
+    /// rejected sample costs the filter nothing); this is the backstop for
+    /// the update math itself.
+    pub fn update_sog(&mut self, sog_mps: f64, std_mps: f64) {
+        let (u, v) = (self.x[3], self.x[4]);
+        let s = libm::hypot(u, v);
+        if s < COG_MIN_SPEED_MPS {
+            return;
+        }
+        let mut h = StateVec::zeros();
+        h[3] = u / s;
+        h[4] = v / s;
+        self.scalar_update_h(&h, sog_mps - s, std_mps * std_mps);
+    }
+
+    /// COG measures h(x) = psi + atan2(v, u). Jacobian: dh/dpsi = 1,
+    /// dh/du = -v/s^2, dh/dv = u/s^2. Wrapped innovation, same reasoning as
+    /// `update_heading`. Same speed-floor no-op as `update_sog`: s^2 in the
+    /// denominator makes the Jacobian blow up as speed goes to zero, and
+    /// course is directionless noise at a standstill regardless of what a
+    /// receiver reports.
+    pub fn update_cog(&mut self, cog_rad: f64, std_rad: f64) {
+        let (u, v) = (self.x[3], self.x[4]);
+        let s2 = u * u + v * v;
+        let s = libm::sqrt(s2);
+        if s < COG_MIN_SPEED_MPS {
+            return;
+        }
+        let mut h = StateVec::zeros();
+        h[2] = 1.0;
+        h[3] = -v / s2;
+        h[4] = u / s2;
+        let predicted = wrap_angle(self.x[2] + libm::atan2(v, u));
+        self.scalar_update_h(&h, wrap_angle(cog_rad - predicted), std_rad * std_rad);
+    }
+
     /// False once any state or covariance element has gone non-finite
     /// (NaN/inf), the estimator's health gate for a filter that has come
     /// numerically unglued.
@@ -180,6 +262,22 @@ impl Ekf {
         self.x += k * innovation;
         self.x[2] = wrap_angle(self.x[2]);
         // (I - K h) P = P - K (P h^T)^T since P is symmetric.
+        self.p -= k * ph.transpose();
+        self.p = (self.p + self.p.transpose()) * 0.5;
+    }
+
+    /// `scalar_update`'s general form for a Jacobian row that is a linear
+    /// combination of states rather than a single index (SOG/COG mix u and
+    /// v). Kept separate from `scalar_update` rather than rewriting it in
+    /// terms of this: `scalar_update`'s column extraction is the same math
+    /// specialized to h = e_idx, and it is exercised by every existing
+    /// replay case, not worth the risk of touching for this.
+    fn scalar_update_h(&mut self, h: &StateVec, innovation: f64, r: f64) {
+        let ph = self.p * h; // P h^T
+        let s = h.dot(&ph) + r;
+        let k = ph / s;
+        self.x += k * innovation;
+        self.x[2] = wrap_angle(self.x[2]);
         self.p -= k * ph.transpose();
         self.p = (self.p + self.p.transpose()) * 0.5;
     }
@@ -350,5 +448,139 @@ mod tests {
         let mut ekf2 = Ekf::init(0.0, 0.0, 1.0, 0.0, 0.1);
         ekf2.p[(4, 4)] = f64::INFINITY;
         assert!(!ekf2.is_finite());
+    }
+
+    /// `update_sog`'s Jacobian (dh/du = u/s, dh/dv = v/s for h = sqrt(u^2 +
+    /// v^2)) against a central finite difference. Cases stay well clear of
+    /// `COG_MIN_SPEED_MPS`, where the Jacobian is singular by construction.
+    #[test]
+    fn sog_jacobian_matches_finite_difference() {
+        let h = |u: f64, v: f64| libm::hypot(u, v);
+        let cases = [(2.0, 0.0), (2.0, 1.0), (-1.5, 0.8), (0.6, -0.9)];
+        let eps = 1e-6;
+        for (u, v) in cases {
+            let s = libm::hypot(u, v);
+            let (dhdu, dhdv) = (u / s, v / s);
+            let fd_u = (h(u + eps, v) - h(u - eps, v)) / (2.0 * eps);
+            let fd_v = (h(u, v + eps) - h(u, v - eps)) / (2.0 * eps);
+            assert!(
+                libm::fabs(dhdu - fd_u) < 1e-6,
+                "dh/du at ({u},{v}): {dhdu} vs fd {fd_u}"
+            );
+            assert!(
+                libm::fabs(dhdv - fd_v) < 1e-6,
+                "dh/dv at ({u},{v}): {dhdv} vs fd {fd_v}"
+            );
+        }
+    }
+
+    /// `update_cog`'s Jacobian (dh/dpsi = 1, dh/du = -v/s^2, dh/dv = u/s^2
+    /// for h = psi + atan2(v, u)) against a central finite difference.
+    #[test]
+    fn cog_jacobian_matches_finite_difference() {
+        let h = |psi: f64, u: f64, v: f64| psi + libm::atan2(v, u);
+        let cases = [
+            (0.3, 2.0, 0.0),
+            (1.0, 2.0, 1.0),
+            (-0.5, -1.5, 0.8),
+            (2.0, 0.6, -0.9),
+        ];
+        let eps = 1e-6;
+        for (psi, u, v) in cases {
+            let s2 = u * u + v * v;
+            let (dhdpsi, dhdu, dhdv) = (1.0, -v / s2, u / s2);
+            let fd_psi = (h(psi + eps, u, v) - h(psi - eps, u, v)) / (2.0 * eps);
+            let fd_u = (h(psi, u + eps, v) - h(psi, u - eps, v)) / (2.0 * eps);
+            let fd_v = (h(psi, u, v + eps) - h(psi, u, v - eps)) / (2.0 * eps);
+            assert!(libm::fabs(dhdpsi - fd_psi) < 1e-6);
+            assert!(
+                libm::fabs(dhdu - fd_u) < 1e-6,
+                "dh/du at ({psi},{u},{v}): {dhdu} vs fd {fd_u}"
+            );
+            assert!(
+                libm::fabs(dhdv - fd_v) < 1e-6,
+                "dh/dv at ({psi},{u},{v}): {dhdv} vs fd {fd_v}"
+            );
+        }
+    }
+
+    /// A SOG measurement above the floor must pull the surge estimate toward
+    /// the measured speed.
+    #[test]
+    fn update_sog_pulls_state_toward_measurement() {
+        let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.0, 0.1);
+        ekf.x[3] = 2.0; // u
+        ekf.update_sog(3.0, 0.2);
+        assert!(ekf.x[3] > 2.0 && ekf.x[3] < 3.0);
+    }
+
+    /// Below `COG_MIN_SPEED_MPS`, `update_sog`/`update_cog` must be a no-op:
+    /// the numerical backstop for the Jacobian singularity (the estimator's
+    /// intake guard is the load-bearing rejection; this is the update
+    /// model's own defense in depth).
+    #[test]
+    fn sog_and_cog_updates_are_no_ops_below_speed_floor() {
+        let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.3, 0.1);
+        ekf.x[3] = COG_MIN_SPEED_MPS * 0.5;
+        let before = ekf;
+
+        ekf.update_sog(1.0, 0.2);
+        assert_eq!(ekf.x, before.x);
+        assert_eq!(ekf.p, before.p);
+
+        ekf.update_cog(0.5, 0.1);
+        assert_eq!(ekf.x, before.x);
+        assert_eq!(ekf.p, before.p);
+    }
+
+    /// A COG measurement above the floor must pull heading toward the
+    /// measured course, same qualitative behavior as `update_heading`.
+    #[test]
+    fn update_cog_pulls_heading_toward_measurement() {
+        let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.0, 0.1);
+        ekf.x[3] = 2.0; // u; predicted course = psi + atan2(v, u) = 0
+        ekf.update_cog(0.2, 0.05);
+        assert!(ekf.x[2] > 0.0 && ekf.x[2] < 0.2);
+    }
+
+    /// `update_position_cov` with an isotropic diagonal R must match the
+    /// sequential scalar `update_position` bit for bit: the closed-form 2D
+    /// update reduces to two independent scalar updates when R is diagonal
+    /// with equal variances (no off-diagonal correlation to represent).
+    #[test]
+    fn update_position_cov_matches_scalar_path_for_isotropic_r() {
+        let mut scalar = Ekf::init(0.0, 0.0, 2.0, 0.3, 0.1);
+        let mut cov = scalar;
+        let std_m = 1.5;
+
+        scalar.update_position(3.0, -2.0, std_m);
+        cov.update_position_cov(3.0, -2.0, [[std_m * std_m, 0.0], [0.0, std_m * std_m]]);
+
+        for i in 0..6 {
+            assert!(libm::fabs(scalar.x[i] - cov.x[i]) < 1e-9, "x[{i}] mismatch");
+            for j in 0..6 {
+                assert!(
+                    libm::fabs(scalar.p[(i, j)] - cov.p[(i, j)]) < 1e-9,
+                    "p[{i},{j}] mismatch"
+                );
+            }
+        }
+    }
+
+    /// A nonzero off-diagonal (correlated N/E noise) must pull the estimate
+    /// off the axis-aligned direction the diagonal case gives: proof the 2x2
+    /// update actually uses the cross term rather than silently ignoring it.
+    #[test]
+    fn update_position_cov_uses_the_off_diagonal_term() {
+        let mut diag = Ekf::init(0.0, 0.0, 5.0, 0.0, 0.1);
+        let mut corr = diag;
+
+        diag.update_position_cov(4.0, 4.0, [[4.0, 0.0], [0.0, 4.0]]);
+        corr.update_position_cov(4.0, 4.0, [[4.0, 3.9], [3.9, 4.0]]);
+
+        assert!(
+            libm::fabs(diag.x[0] - corr.x[0]) > 1e-6 || libm::fabs(diag.x[1] - corr.x[1]) > 1e-6,
+            "correlated R must move the estimate differently from the diagonal case"
+        );
     }
 }

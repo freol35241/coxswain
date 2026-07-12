@@ -196,6 +196,42 @@ impl VesselEndpoint {
                 let msg = timestamped_float(t_wall, yaw_rate_radps.to_degrees());
                 self.put(subject::YAW_RATE_DEGPS, source_id, seal(t_wall, &msg))
             }
+            MeasurementKind::SpeedOverGround { sog_mps, .. } => {
+                let msg = timestamped_float(t_wall, sog_mps * MPS_TO_KNOTS);
+                self.put(
+                    subject::SPEED_OVER_GROUND_KNOTS,
+                    source_id,
+                    seal(t_wall, &msg),
+                )
+            }
+            MeasurementKind::CourseOverGround { cog_rad, .. } => {
+                let msg = timestamped_float(t_wall, heading_deg(cog_rad));
+                self.put(
+                    subject::COURSE_OVER_GROUND_DEG,
+                    source_id,
+                    seal(t_wall, &msg),
+                )
+            }
+            MeasurementKind::GnssPositionCov {
+                position,
+                cov_ne_m2,
+                ..
+            } => {
+                // Fix mode has no home in foxglove.LocationFix; it rides in
+                // EstimatorHealth instead (coxswain-estimator's own doc
+                // comment on that field). The covariance here is the
+                // receiver's real reported figure, not one derived from a
+                // scalar std, hence Known rather than Approximated.
+                let fix = location_fix(
+                    t_wall,
+                    position.lat_rad,
+                    position.lon_rad,
+                    0.0,
+                    cov_ne_to_enu(cov_ne_m2),
+                    foxglove::location_fix::PositionCovarianceType::Known,
+                );
+                self.put(subject::LOCATION_FIX, source_id, seal(t_wall, &fix))
+            }
         }
     }
 
@@ -492,6 +528,18 @@ fn location_fix(
         position_covariance: enu_cov.to_vec(),
         position_covariance_type: cov_type as i32,
     }
+}
+
+/// 2x2 NE covariance (m^2, row-major [n, e]) to the ENU 9-element row-major
+/// position covariance of foxglove.LocationFix. Same axis swap as
+/// `ned_cov_to_enu`, applied to the 2x2 `GnssPositionCov` carries instead of
+/// picking the position block out of the full 6x6 state covariance.
+fn cov_ne_to_enu(cov: [[f64; 2]; 2]) -> [f64; 9] {
+    [
+        cov[1][1], cov[1][0], 0.0, // E row: ee, en, eu
+        cov[0][1], cov[0][0], 0.0, // N row: ne, nn, nu
+        0.0, 0.0, 0.0, // U row
+    ]
 }
 
 /// N2K enrichment carries no covariance figure this crate trusts (canboat's

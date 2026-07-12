@@ -187,7 +187,9 @@ this before freezing far-end firmware.
       commands in physical units, node owns local calibration.
 - [ ] GNSS driver: Septentrio SBF over UART (Mosaic), PPS hook stubbed for the
       host profile. Earns its place when the estimator consumes covariance and
-      RTK status, and not before.
+      RTK status, and not before -- that precondition is now met
+      (`MeasurementKind::GnssPositionCov`, `EstimatorHealth::fix`, the 2D
+      covariance update), so this task is unblocked, not yet started.
 - [x] NMEA 2000 listen-only decode for the initial PGN set; enrichment path
       only. (Fast-packet reassembly and PGN 129029 landed after this line was
       checked, plus hosted SocketCAN wiring end to end, vcan-tested in CI.)

@@ -31,7 +31,7 @@ pub use effector::{
 pub use geo::GeoPoint;
 pub use guidance::Setpoint;
 pub use health::{EstimatorHealth, HealthLevel};
-pub use measurement::{Measurement, MeasurementKind};
+pub use measurement::{GnssFixMode, Measurement, MeasurementKind};
 pub use power::PowerStatus;
 pub use state::{BodyVelocity, Covariance, Pose, VesselState};
 pub use time::Timestamp;

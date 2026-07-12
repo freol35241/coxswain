@@ -107,9 +107,13 @@ pub fn convert(
             let _ = driver.push(b, record.t);
         }
         match driver.push(b'\r', record.t) {
-            Some(Ok(m)) => {
-                stats.measurements_emitted += 1;
-                measurements.push(m);
+            Some(Ok(batch)) => {
+                // RMC can yield both SOG and COG from one sentence; every
+                // other sentence this driver emits from yields one.
+                for m in batch.iter() {
+                    stats.measurements_emitted += 1;
+                    measurements.push(*m);
+                }
             }
             // `GnssError::Parse` is the only variant `push` can actually
             // return here (`InvalidConfig`/`NoByteSource` come from

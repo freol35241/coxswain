@@ -133,6 +133,7 @@ fn health(level: HealthLevel, gnss_stale: bool) -> EstimatorHealth {
         gnss_stale,
         heading_stale: false,
         yaw_rate_stale: false,
+        fix: None,
     }
 }
 

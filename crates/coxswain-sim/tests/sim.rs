@@ -8,11 +8,11 @@ use std::time::Duration;
 use coxswain_allocation::achieved_tau;
 use coxswain_contract::{
     ActuatorCommand, ActuatorOutputs, BodyVelocity, BoundedList, EffectorConfig, EffectorId,
-    EffectorKind, ForceDemand, Fossen3DofParams, GeoPoint, Measurement, MeasurementKind, SensorId,
-    Timestamp,
+    EffectorKind, ForceDemand, Fossen3DofParams, GeoPoint, GnssFixMode, Measurement,
+    MeasurementKind, SensorId, Timestamp,
 };
 use coxswain_model::LocalFrame;
-use coxswain_sim::{GnssModel, HeadingModel, Simulator, YawRateModel};
+use coxswain_sim::{GnssCovModel, GnssModel, HeadingModel, Simulator, VelocityModel, YawRateModel};
 
 const GNSS_ID: SensorId = SensorId(1);
 const HEADING_ID: SensorId = SensorId(2);
@@ -365,6 +365,103 @@ fn heading_bias_shifts_the_mean() {
     assert_eq!(stream.len(), 1000);
     let mean = stream.iter().map(heading).sum::<f64>() / stream.len() as f64;
     assert!((mean - 0.1).abs() < 0.01, "mean heading {mean} vs bias 0.1");
+}
+
+/// At cruise speed, the velocity sensor emits both SOG and COG every
+/// period, and their sample means land near the truth: SOG near the
+/// commanded terminal surge speed, COG near the truth heading (straight
+/// line, no sway).
+#[test]
+fn velocity_sensor_emits_sog_and_cog_at_cruise_speed() {
+    const VEL_ID: SensorId = SensorId(4);
+    let mut sim = sim(13);
+    sim.apply_command(&cmd(70.0, 0.0, 0.0));
+    // Let truth surge settle near its terminal value before sampling: the
+    // time constant is (210 + 18) / 35 = 6.51 s (terminal_velocity_matches_
+    // damping's own closed form), so 70 s is well past 8 time constants.
+    run(&mut sim, 700, Duration::from_millis(100));
+    sim.add_velocity(VEL_ID, VelocityModel::new(5.0, 0.05, 0.01));
+    let stream = run(&mut sim, 100, Duration::from_millis(100));
+
+    let sogs: Vec<f64> = stream
+        .iter()
+        .filter_map(|m| match m.kind {
+            MeasurementKind::SpeedOverGround { sog_mps, .. } => Some(sog_mps),
+            _ => None,
+        })
+        .collect();
+    let cogs: Vec<f64> = stream
+        .iter()
+        .filter_map(|m| match m.kind {
+            MeasurementKind::CourseOverGround { cog_rad, .. } => Some(cog_rad),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sogs.len(), 50);
+    assert_eq!(cogs.len(), 50);
+
+    let v_inf = 70.0 / 35.0; // terminal surge, same closed form as terminal_velocity_matches_damping
+    let mean_sog = sogs.iter().sum::<f64>() / sogs.len() as f64;
+    assert!(
+        (mean_sog - v_inf).abs() < 0.05,
+        "mean SOG {mean_sog} vs terminal {v_inf}"
+    );
+    // Truth heading starts at 0 (north) and never turns.
+    let mean_cog = cogs.iter().sum::<f64>() / cogs.len() as f64;
+    assert!(mean_cog.abs() < 0.05, "mean COG {mean_cog} vs truth 0.0");
+}
+
+/// Below `COG_MIN_SPEED_MPS`, the velocity sensor emits SOG only: no COG
+/// stream a real receiver would not produce either.
+#[test]
+fn velocity_sensor_suppresses_cog_below_speed_floor() {
+    const VEL_ID: SensorId = SensorId(4);
+    let mut sim = sim(13);
+    // Truth stays at rest: no command applied.
+    sim.add_velocity(VEL_ID, VelocityModel::new(5.0, 0.01, 0.01));
+    let stream = run(&mut sim, 100, Duration::from_millis(100));
+
+    assert!(
+        stream
+            .iter()
+            .all(|m| matches!(m.kind, MeasurementKind::SpeedOverGround { .. }))
+    );
+    assert_eq!(stream.len(), 50);
+}
+
+/// The covariance-position sensor reports the configured 2x2 covariance and
+/// fix mode verbatim, and its position noise matches the configured
+/// per-axis std (same statistical check as `gnss_noise_matches_configured_std`).
+#[test]
+fn gnss_cov_sensor_reports_configured_covariance_and_fix_mode() {
+    const COV_ID: SensorId = SensorId(5);
+    let mut sim = sim(17);
+    sim.add_gnss_cov(COV_ID, GnssCovModel::new(10.0, 0.02, GnssFixMode::RtkFixed));
+    let fixes = run(&mut sim, 200, Duration::from_secs(1));
+    assert_eq!(fixes.len(), 2000);
+
+    let frame = LocalFrame::new(origin());
+    let mut ns = Vec::with_capacity(fixes.len());
+    for m in &fixes {
+        let MeasurementKind::GnssPositionCov {
+            position,
+            cov_ne_m2,
+            fix,
+        } = m.kind
+        else {
+            panic!("expected GnssPositionCov, got {:?}", m.kind);
+        };
+        assert_eq!(cov_ne_m2, [[0.02 * 0.02, 0.0], [0.0, 0.02 * 0.02]]);
+        assert_eq!(fix, GnssFixMode::RtkFixed);
+        ns.push(frame.to_local(position).0);
+    }
+    let mean = ns.iter().sum::<f64>() / ns.len() as f64;
+    let var = ns.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (ns.len() - 1) as f64;
+    assert!(
+        (var.sqrt() - 0.02).abs() < 0.002,
+        "sample std {} vs configured 0.02",
+        var.sqrt()
+    );
 }
 
 /// Every quantized GNSS fix lands on the configured local-meter grid, with

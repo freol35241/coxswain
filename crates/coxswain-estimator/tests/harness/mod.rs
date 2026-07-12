@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use coxswain_contract::{
     ActuatorCommand, BoundedList, ConnGrantDefault, EstimatorConfig, ForceDemand, Fossen3DofParams,
-    GeoPoint, GeofenceAction, GeofenceConfig, License, Measurement, MeasurementKind, ModelParams,
-    SensorConfig, SensorId, SensorRole, SupervisorConfig, Timestamp, VesselConfig,
+    GeoPoint, GeofenceAction, GeofenceConfig, GnssFixMode, License, Measurement, MeasurementKind,
+    ModelParams, SensorConfig, SensorId, SensorRole, SupervisorConfig, Timestamp, VesselConfig,
 };
 use coxswain_estimator::LocalFrame;
 
@@ -255,6 +255,97 @@ pub fn sample_yaw_rate(
                 yaw_rate_radps: traj.truth_at(t).r + rng.gaussian(std_radps),
                 std_radps,
             },
+        })
+        .collect()
+}
+
+/// SOG/COG are attributed to `GNSS_ID`: v1 licenses them off the position
+/// sensor's gnss-list membership (coxswain_estimator's own doc comment on
+/// this, schema open question 1), no separate velocity sensor id.
+///
+/// Truth speed is the body-frame velocity norm (rotating into NED does not
+/// change magnitude); `Truth::v` is 0 throughout every trajectory this
+/// harness builds, so this reduces to `|u|`, but the general form is used in
+/// case a future trajectory adds sway. No floor is applied here: a scenario
+/// that wants a low-speed segment builds one directly (see the
+/// compass_loss/low_speed replay cases), and the estimator's own
+/// COG_MIN_SPEED_MPS guard is what is under test.
+pub fn sample_sog(
+    traj: &Trajectory,
+    window: (f64, f64),
+    rate_hz: f64,
+    std_mps: f64,
+    rng: &mut Rng,
+) -> Vec<Measurement> {
+    sample_times(window, rate_hz)
+        .map(|t| {
+            let truth = traj.truth_at(t);
+            let sog_truth = (truth.u * truth.u + truth.v * truth.v).sqrt();
+            Measurement {
+                sensor: GNSS_ID,
+                t: ts(t),
+                kind: MeasurementKind::SpeedOverGround {
+                    // A real receiver never reports negative speed.
+                    sog_mps: (sog_truth + rng.gaussian(std_mps)).max(0.0),
+                    std_mps,
+                },
+            }
+        })
+        .collect()
+}
+
+pub fn sample_cog(
+    traj: &Trajectory,
+    window: (f64, f64),
+    rate_hz: f64,
+    std_rad: f64,
+    rng: &mut Rng,
+) -> Vec<Measurement> {
+    sample_times(window, rate_hz)
+        .map(|t| {
+            let truth = traj.truth_at(t);
+            let cog_truth = wrap(truth.psi + truth.v.atan2(truth.u));
+            Measurement {
+                sensor: GNSS_ID,
+                t: ts(t),
+                kind: MeasurementKind::CourseOverGround {
+                    cog_rad: wrap(cog_truth + rng.gaussian(std_rad)),
+                    std_rad,
+                },
+            }
+        })
+        .collect()
+}
+
+/// `cov_ne_m2` is diagonal-noise-sampled here (per-axis std from the
+/// declared diagonal): correlated noise generation would need a Cholesky
+/// factor for no additional verification value in these scenarios, which
+/// exercise the estimator's consumption of a declared covariance, not the
+/// harness's noise-generation fidelity.
+pub fn sample_gnss_cov(
+    traj: &Trajectory,
+    window: (f64, f64),
+    rate_hz: f64,
+    cov_ne_m2: [[f64; 2]; 2],
+    fix: GnssFixMode,
+    rng: &mut Rng,
+) -> Vec<Measurement> {
+    let frame = traj.frame();
+    let std_n = cov_ne_m2[0][0].sqrt();
+    let std_e = cov_ne_m2[1][1].sqrt();
+    sample_times(window, rate_hz)
+        .map(|t| {
+            let truth = traj.truth_at(t);
+            let (n, e) = frame.to_local(truth.position);
+            Measurement {
+                sensor: GNSS_ID,
+                t: ts(t),
+                kind: MeasurementKind::GnssPositionCov {
+                    position: frame.to_geo(n + rng.gaussian(std_n), e + rng.gaussian(std_e)),
+                    cov_ne_m2,
+                    fix,
+                },
+            }
         })
         .collect()
 }

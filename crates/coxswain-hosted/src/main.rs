@@ -1251,12 +1251,16 @@ fn run() -> Result<(), String> {
                     rec.record(byte, acquired_at);
                 }
                 match link.driver.push(byte, acquired_at) {
-                    Some(Ok(m)) => {
-                        ingest_measurement(&mut core, &mut ingest_error_logged, &m);
-                        publish(
-                            endpoint.publish_raw(wall, &m, &format!("raw/{}", m.sensor.0)),
-                            &mut publish_error_logged,
-                        );
+                    Some(Ok(batch)) => {
+                        // RMC can yield both SOG and COG from one sentence;
+                        // every other sentence this driver emits yields one.
+                        for m in batch.iter() {
+                            ingest_measurement(&mut core, &mut ingest_error_logged, m);
+                            publish(
+                                endpoint.publish_raw(wall, m, &format!("raw/{}", m.sensor.0)),
+                                &mut publish_error_logged,
+                            );
+                        }
                     }
                     Some(Err(e)) if !driver_error_logged => {
                         eprintln!("coxswain-hosted: 0183 sentence rejected (continuing): {e:?}");

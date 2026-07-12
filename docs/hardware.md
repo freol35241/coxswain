@@ -11,7 +11,10 @@ procurement shortlist.
 
 - NMEA 0183 over UART, listen-only, strict parsing (GGA, RMC, HDT, VTG;
   NMEA 2.3/4.1 layouts with FAA mode). The GNSS driver emits position
-  (GGA, gated on fix quality, std from HDOP x UERE) and heading (HDT).
+  (GGA, gated on fix quality, std from HDOP x UERE), heading (HDT), and
+  speed/course over ground (RMC, gated on status/FAA mode; course only
+  above a 0.5 m/s floor). VTG parses but emits nothing (RMC already
+  carries the same SOG/COG; emitting both would double-count).
 - NMEA 0183 over UDP, listen-only, same parser and sentence set as the
   UART path (D-014). Binds `0.0.0.0:<listen_port>`, not the manifest's
   named interface: `SO_BINDTODEVICE` needs `CAP_NET_RAW`/`CAP_NET_ADMIN`,

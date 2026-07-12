@@ -18,4 +18,8 @@ pub struct EstimatorHealth {
     pub gnss_stale: bool,
     pub heading_stale: bool,
     pub yaw_rate_stale: bool,
+    /// Fix mode of the most recently accepted position measurement (from
+    /// `GnssPositionCov`; the scalar `GnssPosition` path carries no mode).
+    /// `None` before the first accepted position measurement.
+    pub fix: Option<crate::measurement::GnssFixMode>,
 }

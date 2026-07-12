@@ -1,7 +1,7 @@
-//! GNSS-over-0183 driver: GGA -> position, HDT -> heading, RMC/VTG parsed
-//! and discarded. docs/TASKS.md Phase 6: covariance from HDOP and fix
-//! quality, deliberately crude; the estimator's declared noise parameters
-//! carry the weight until SBF lands.
+//! GNSS-over-0183 driver: GGA -> position, HDT -> heading, RMC -> SOG/COG,
+//! VTG parsed and discarded. docs/TASKS.md Phase 6: covariance from HDOP and
+//! fix quality, deliberately crude; the estimator's declared noise
+//! parameters carry the weight until SBF lands.
 //!
 //! Byte-fed and pure (`push`), not owning any UART or clock: the driver
 //! crate's timestamping policy (see `crate` docs) requires the caller to
@@ -14,10 +14,18 @@
 //! emitting on a fixed schedule) that bias is constant, and is absorbed in
 //! the declared measurement std until PPS-disciplined timestamping arrives
 //! with SBF.
+//!
+//! GGA is the only position source this driver emits: it carries HDOP, so a
+//! per-fix std is derivable, and it stays a scalar `GnssPosition`
+//! (`MeasurementKind::GnssPositionCov`'s full covariance and fix mode have
+//! no 0183 source; that variant plumbs through once a covariance-capable
+//! receiver, e.g. SBF, exists to observe it from, which is deliberate, not
+//! an oversight).
 
 use coxswain_contract::{BoundedList, GeoPoint, Measurement, MeasurementKind, SensorId, Timestamp};
 use coxswain_nmea0183::{
-    GgaSentence, HdtSentence, ParseError, Quirks, Sentence, SentenceReader, TalkerId,
+    FaaMode, GgaSentence, HdtSentence, ParseError, Quirks, RmcSentence, RmcStatus, Sentence,
+    SentenceReader, TalkerId,
 };
 
 use crate::Driver;
@@ -32,6 +40,24 @@ const DEG_TO_RAD: f64 = core::f64::consts::PI / 180.0;
 /// a UERE gives a rough 1-sigma horizontal error, the standard crude GPS
 /// accuracy estimate.
 pub const DEFAULT_UERE_M: f64 = 5.0;
+
+/// 1 international knot = 1852 m / 3600 s, exact by definition. RMC's SOG
+/// field is knots; the contract's `SpeedOverGround` is m/s (D-023).
+const KNOTS_TO_MPS: f64 = 1852.0 / 3600.0;
+
+/// Placeholder 1-sigma SOG std, m/s: no per-receiver source of truth exists
+/// yet, same "crude and known to be crude" caveat as `DEFAULT_UERE_M` until
+/// SBF lands.
+const SOG_STD_MPS: f64 = 0.2;
+
+/// Estimated-speed floor below which a course reading is direction-over-
+/// noise, sentence-local physics: RMC's own reported SOG (not the truth) is
+/// what a real receiver would gate on too. Deliberately duplicated from
+/// `coxswain_estimator::COG_MIN_SPEED_MPS` rather than shared: this floor is
+/// about what a sentence's own numbers can support, the estimator's copy is
+/// a numerical backstop for its Jacobians; they share a value today, not a
+/// purpose, so they are not the same constant.
+const COG_MIN_SPEED_MPS: f64 = 0.5;
 
 /// Which sentence types the accept filter can name. Mirrors
 /// `coxswain_manifest::Nmea0183Quirks::sentences` without depending on the
@@ -105,6 +131,24 @@ fn gga_fix_is_trusted(fix_quality: u8) -> bool {
     matches!(fix_quality, 1 | 2 | 4 | 5)
 }
 
+/// RMC FAA modes the estimator is licensed to see SOG/COG from: Autonomous,
+/// Differential, FloatRtk, FixedRtk are real fixes; Estimated, Manual,
+/// Simulator, NotValid are not. Same "gate, not a scale" reasoning as
+/// `gga_fix_is_trusted`. `None` is a pre-2.3 sentence with no mode field at
+/// all; trusted when `status` alone reports Valid, since that combination is
+/// the only signal a pre-2.3 receiver gives.
+fn rmc_mode_is_trusted(mode: Option<FaaMode>) -> bool {
+    match mode {
+        None => true,
+        Some(
+            FaaMode::Autonomous | FaaMode::Differential | FaaMode::FloatRtk | FaaMode::FixedRtk,
+        ) => true,
+        Some(FaaMode::Estimated | FaaMode::Manual | FaaMode::Simulator | FaaMode::NotValid) => {
+            false
+        }
+    }
+}
+
 /// Errors `push` can surface. Parse failures are countable; gating and
 /// filtering are not errors (quiet `None`, normal operation).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -118,6 +162,36 @@ pub enum GnssError {
     /// `Driver::read_with_timestamp` was called on this byte-fed driver; see
     /// the `impl Driver` doc comment for why it always returns this.
     NoByteSource,
+}
+
+/// Up to two measurements from one completed sentence. GGA and HDT yield at
+/// most one; RMC can yield both SOG and COG (COG gated further by
+/// `COG_MIN_SPEED_MPS`, see `Gnss0183Driver::rmc_to_measurements`).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct MeasurementBatch {
+    first: Measurement,
+    second: Option<Measurement>,
+}
+
+impl MeasurementBatch {
+    fn one(m: Measurement) -> Self {
+        Self {
+            first: m,
+            second: None,
+        }
+    }
+
+    fn two(a: Measurement, b: Measurement) -> Self {
+        Self {
+            first: a,
+            second: Some(b),
+        }
+    }
+
+    /// The 1 or 2 measurements, in emission order.
+    pub fn iter(&self) -> impl Iterator<Item = &Measurement> {
+        core::iter::once(&self.first).chain(self.second.iter())
+    }
 }
 
 /// Byte-fed GGA/HDT-to-Measurement driver. Owns a `SentenceReader` and
@@ -136,28 +210,33 @@ impl Gnss0183Driver {
     /// Feed one byte, acquired at `acquired_at` (the driver-crate
     /// timestamping policy: acquisition time of the byte, caller-injected,
     /// never a clock read here). Returns `Some` exactly when a sentence
-    /// completed: `Some(Ok(m))` for a Measurement-producing sentence,
-    /// `Some(Err(_))` for a sentence that failed to parse, and `None` both
-    /// while still accumulating a sentence and when a complete sentence
-    /// parsed but produced nothing (gated out by fix quality, filtered out
-    /// by talker/sentence, or an RMC/VTG that this driver never turns into a
+    /// completed: `Some(Ok(batch))` for a Measurement-producing sentence
+    /// (RMC may yield two, everything else at most one), `Some(Err(_))` for
+    /// a sentence that failed to parse, and `None` both while still
+    /// accumulating a sentence and when a complete sentence parsed but
+    /// produced nothing (gated out by fix quality/status/mode, filtered out
+    /// by talker/sentence, or VTG, which this driver never turns into a
     /// Measurement). The completed sentence is stamped with this call's
     /// `acquired_at` (its terminating byte), per the module doc comment.
     pub fn push(
         &mut self,
         byte: u8,
         acquired_at: Timestamp,
-    ) -> Option<Result<Measurement, GnssError>> {
+    ) -> Option<Result<MeasurementBatch, GnssError>> {
         match self.reader.push(byte)? {
             Ok(sentence) => self.to_measurement(sentence, acquired_at).map(Ok),
             Err(e) => Some(Err(GnssError::Parse(e))),
         }
     }
 
-    /// Maps one parsed sentence onto a Measurement, applying the accept
-    /// filter and the GGA/HDT gating rules. `None` for anything that is not
-    /// an error but also not a Measurement.
-    fn to_measurement(&self, sentence: Sentence, acquired_at: Timestamp) -> Option<Measurement> {
+    /// Maps one parsed sentence onto a batch of 0-2 measurements, applying
+    /// the accept filter and the per-sentence gating rules. `None` for
+    /// anything that is not an error but also not a Measurement.
+    fn to_measurement(
+        &self,
+        sentence: Sentence,
+        acquired_at: Timestamp,
+    ) -> Option<MeasurementBatch> {
         let (talker, kind) = match &sentence {
             Sentence::Gga(s) => (s.talker, SentenceKind::Gga),
             Sentence::Rmc(s) => (s.talker, SentenceKind::Rmc),
@@ -168,16 +247,66 @@ impl Gnss0183Driver {
             return None;
         }
         match sentence {
-            Sentence::Gga(gga) => self.gga_to_position(gga, acquired_at),
-            Sentence::Hdt(hdt) => Some(self.hdt_to_heading(hdt, acquired_at)),
-            // RMC/VTG parse cleanly but emit nothing: MeasurementKind has no
-            // SOG/COG variant, and a position out of RMC would double-count
-            // the GGA fix already on the wire. Becomes relevant again only
-            // if RMC ever becomes the position source, at which point
-            // RMC::mode (FaaMode) gates it the way fix_quality gates GGA
-            // here.
-            Sentence::Rmc(_) | Sentence::Vtg(_) => None,
+            Sentence::Gga(gga) => self
+                .gga_to_position(gga, acquired_at)
+                .map(MeasurementBatch::one),
+            Sentence::Hdt(hdt) => {
+                Some(MeasurementBatch::one(self.hdt_to_heading(hdt, acquired_at)))
+            }
+            Sentence::Rmc(rmc) => self.rmc_to_measurements(rmc, acquired_at),
+            // VTG duplicates RMC's SOG/COG on every receiver that emits
+            // both (same track, same instant); emitting from both would
+            // double-count the exact way a position out of RMC would
+            // double-count GGA. RMC is the sole SOG/COG source.
+            Sentence::Vtg(_) => None,
         }
+    }
+
+    /// RMC -> SOG always (when status/mode gate as trusted), COG only when
+    /// the same sentence's SOG clears `COG_MIN_SPEED_MPS`: below that,
+    /// course over ground is direction-over-noise regardless of what the
+    /// receiver reports (sentence-local physics; the estimator's own floor
+    /// is the numerical backstop, not the primary gate). Both are
+    /// attributed to `position_sensor`: same physical receiver, and v1
+    /// licenses SOG/COG off the position sensor's gnss-list membership
+    /// (`coxswain_estimator`'s own doc comment on this, schema open
+    /// question 1).
+    fn rmc_to_measurements(
+        &self,
+        rmc: RmcSentence,
+        acquired_at: Timestamp,
+    ) -> Option<MeasurementBatch> {
+        if rmc.status != RmcStatus::Valid || !rmc_mode_is_trusted(rmc.mode) {
+            return None;
+        }
+        let sog_mps = rmc.sog_knots? * KNOTS_TO_MPS;
+        let sog = Measurement {
+            sensor: self.config.position_sensor,
+            t: acquired_at,
+            kind: MeasurementKind::SpeedOverGround {
+                sog_mps,
+                std_mps: SOG_STD_MPS,
+            },
+        };
+        if sog_mps < COG_MIN_SPEED_MPS {
+            return Some(MeasurementBatch::one(sog));
+        }
+        let Some(cog_deg) = rmc.cog_deg else {
+            return Some(MeasurementBatch::one(sog));
+        };
+        let cog = Measurement {
+            sensor: self.config.position_sensor,
+            t: acquired_at,
+            kind: MeasurementKind::CourseOverGround {
+                cog_rad: cog_deg * DEG_TO_RAD,
+                // Error propagation of velocity noise onto direction: at low
+                // speed the same lateral position uncertainty subtends a
+                // wider course angle, so std grows as 1/sog (floored, same
+                // reasoning `update_cog`'s Jacobian gets guarded).
+                std_rad: SOG_STD_MPS / sog_mps.max(COG_MIN_SPEED_MPS),
+            },
+        };
+        Some(MeasurementBatch::two(sog, cog))
     }
 
     fn gga_to_position(&self, gga: GgaSentence, acquired_at: Timestamp) -> Option<Measurement> {
@@ -291,7 +420,7 @@ mod tests {
         driver: &mut Gnss0183Driver,
         line: &[u8],
         acquired_at: Timestamp,
-    ) -> Option<Result<Measurement, GnssError>> {
+    ) -> Option<Result<MeasurementBatch, GnssError>> {
         for &b in line {
             assert_eq!(driver.push(b, acquired_at), None);
         }
@@ -313,15 +442,31 @@ mod tests {
     const GGA_GN_TALKER: &[u8] =
         b"$GNGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*59";
     const HDT_TRUE_HEADING: &[u8] = b"$HEHDT,123.456,T*28";
+    // Reference fix's cruise-speed RMC (SOG 22.4 kn ~ 11.52 m/s, comfortably
+    // above COG_MIN_SPEED_MPS): pre-2.3, 11 fields, no mode indicator.
     const RMC_REFERENCE_FIX: &[u8] =
         b"$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
+    // Same fix, SOG dropped to 0.5 kn (~0.257 m/s), below COG_MIN_SPEED_MPS.
+    const RMC_LOW_SPEED: &[u8] =
+        b"$GPRMC,123519,A,4807.038,N,01131.000,E,000.5,084.4,230394,003.1,W*6B";
+    // Status Warning (V), cruise speed otherwise identical to the reference.
+    const RMC_STATUS_WARNING: &[u8] =
+        b"$GPRMC,123519,V,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*7D";
+    // 2.3-layout (12 fields), FAA mode Estimated: not a real fix.
+    const RMC_MODE_ESTIMATED: &[u8] =
+        b"$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W,E*03";
+    // 2.3-layout, FAA mode FixedRtk: a real fix, same as Autonomous/Differential.
+    const RMC_MODE_FIXED_RTK: &[u8] =
+        b"$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W,R*14";
+    // Cruise speed but no COG field.
+    const RMC_NO_COG: &[u8] = b"$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,,230394,003.1,W*4C";
     const VTG_COURSE_AND_SPEED: &[u8] = b"$GPVTG,054.7,T,034.4,M,005.5,N,010.2,K*48";
 
     #[test]
     fn gga_quality_1_yields_position_scaled_by_hdop() {
         let mut driver = Gnss0183Driver::new(config());
         let t = Timestamp::from_nanos(1_000);
-        let m = feed(&mut driver, GGA_QUALITY_1, t).unwrap().unwrap();
+        let m = feed(&mut driver, GGA_QUALITY_1, t).unwrap().unwrap().first;
         assert_eq!(m.sensor, SensorId(1));
         assert_eq!(m.t, t);
         let MeasurementKind::GnssPosition { position, std_m } = m.kind else {
@@ -338,7 +483,10 @@ mod tests {
     fn hdt_yields_heading_with_configured_std() {
         let mut driver = Gnss0183Driver::new(config());
         let t = Timestamp::from_nanos(2_000);
-        let m = feed(&mut driver, HDT_TRUE_HEADING, t).unwrap().unwrap();
+        let m = feed(&mut driver, HDT_TRUE_HEADING, t)
+            .unwrap()
+            .unwrap()
+            .first;
         assert_eq!(m.sensor, SensorId(2));
         assert_eq!(m.t, t);
         let MeasurementKind::Heading {
@@ -383,7 +531,8 @@ mod tests {
             Timestamp::from_nanos(0),
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .first;
         assert!(matches!(m.kind, MeasurementKind::GnssPosition { .. }));
     }
 
@@ -392,7 +541,8 @@ mod tests {
         let mut driver = Gnss0183Driver::new(config());
         let m = feed(&mut driver, GGA_QUALITY_1_NO_HDOP, Timestamp::from_nanos(0))
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .first;
         let MeasurementKind::GnssPosition { std_m, .. } = m.kind else {
             panic!("expected GnssPosition, got {:?}", m.kind);
         };
@@ -426,12 +576,94 @@ mod tests {
     }
 
     #[test]
-    fn rmc_and_vtg_parse_but_emit_nothing() {
+    fn rmc_at_cruise_speed_yields_sog_and_cog() {
+        let mut driver = Gnss0183Driver::new(config());
+        let t = Timestamp::from_nanos(3_000);
+        let batch = feed(&mut driver, RMC_REFERENCE_FIX, t).unwrap().unwrap();
+
+        let MeasurementKind::SpeedOverGround { sog_mps, std_mps } = batch.first.kind else {
+            panic!("expected SpeedOverGround, got {:?}", batch.first.kind);
+        };
+        assert_eq!(batch.first.sensor, SensorId(1));
+        assert_eq!(batch.first.t, t);
+        assert!((sog_mps - 22.4 * KNOTS_TO_MPS).abs() < 1e-9);
+        assert_eq!(std_mps, SOG_STD_MPS);
+
+        let cog = batch.second.expect("expected a COG measurement too");
+        let MeasurementKind::CourseOverGround { cog_rad, std_rad } = cog.kind else {
+            panic!("expected CourseOverGround, got {:?}", cog.kind);
+        };
+        assert_eq!(cog.sensor, SensorId(1));
+        assert_eq!(cog.t, t);
+        assert!((cog_rad - 84.4_f64.to_radians()).abs() < 1e-9);
+        assert!((std_rad - SOG_STD_MPS / sog_mps).abs() < 1e-9);
+    }
+
+    /// Below `COG_MIN_SPEED_MPS`, only SOG emits: course is suppressed at
+    /// the source, the same floor the estimator's own Jacobian guard uses.
+    #[test]
+    fn rmc_below_speed_floor_emits_sog_only() {
+        let mut driver = Gnss0183Driver::new(config());
+        let batch = feed(&mut driver, RMC_LOW_SPEED, Timestamp::from_nanos(0))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            batch.first.kind,
+            MeasurementKind::SpeedOverGround { .. }
+        ));
+        assert!(batch.second.is_none());
+    }
+
+    #[test]
+    fn rmc_status_warning_emits_nothing() {
         let mut driver = Gnss0183Driver::new(config());
         assert_eq!(
-            feed(&mut driver, RMC_REFERENCE_FIX, Timestamp::from_nanos(0)),
+            feed(&mut driver, RMC_STATUS_WARNING, Timestamp::from_nanos(0)),
             None
         );
+    }
+
+    #[test]
+    fn rmc_mode_estimated_emits_nothing() {
+        let mut driver = Gnss0183Driver::new(config());
+        assert_eq!(
+            feed(&mut driver, RMC_MODE_ESTIMATED, Timestamp::from_nanos(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn rmc_mode_fixed_rtk_emits() {
+        let mut driver = Gnss0183Driver::new(config());
+        let batch = feed(&mut driver, RMC_MODE_FIXED_RTK, Timestamp::from_nanos(0))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            batch.first.kind,
+            MeasurementKind::SpeedOverGround { .. }
+        ));
+    }
+
+    /// A trusted RMC with no COG field emits SOG alone: nothing to report a
+    /// course from, and the sentence is not malformed (parses fine).
+    #[test]
+    fn rmc_no_cog_field_emits_sog_only() {
+        let mut driver = Gnss0183Driver::new(config());
+        let batch = feed(&mut driver, RMC_NO_COG, Timestamp::from_nanos(0))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            batch.first.kind,
+            MeasurementKind::SpeedOverGround { .. }
+        ));
+        assert!(batch.second.is_none());
+    }
+
+    /// VTG duplicates RMC's SOG/COG on the wire; this driver's sole SOG/COG
+    /// source is RMC, so VTG parses cleanly and emits nothing.
+    #[test]
+    fn vtg_parses_but_emits_nothing() {
+        let mut driver = Gnss0183Driver::new(config());
         assert_eq!(
             feed(&mut driver, VTG_COURSE_AND_SPEED, Timestamp::from_nanos(0)),
             None
@@ -451,7 +683,8 @@ mod tests {
         // line does not corrupt the reader's state for the following one.
         let m = feed(&mut driver, GGA_QUALITY_1, Timestamp::from_nanos(0))
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .first;
         assert!(matches!(m.kind, MeasurementKind::GnssPosition { .. }));
     }
 
@@ -467,7 +700,8 @@ mod tests {
         // would be prepended to this GGA line and it would fail to parse.
         let m = feed(&mut driver, GGA_QUALITY_1, Timestamp::from_nanos(0))
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .first;
         assert!(matches!(m.kind, MeasurementKind::GnssPosition { .. }));
     }
 

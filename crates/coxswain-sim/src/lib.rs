@@ -18,7 +18,7 @@ use core::time::Duration;
 use coxswain_allocation::achieved_tau;
 use coxswain_contract::{
     ActuatorCommand, ActuatorOutputs, BodyVelocity, EffectorConfig, ForceDemand, Fossen3DofParams,
-    GeoPoint, Measurement, MeasurementKind, Pose, SensorId, Timestamp, VesselState,
+    GeoPoint, GnssFixMode, Measurement, MeasurementKind, Pose, SensorId, Timestamp, VesselState,
 };
 use coxswain_model::{Fossen3Dof, LocalFrame, ModelError};
 use nalgebra::Vector3;
@@ -107,15 +107,85 @@ impl YawRateModel {
     }
 }
 
+// Estimated-speed floor below which course over ground is suppressed,
+// mirroring coxswain_estimator::COG_MIN_SPEED_MPS and
+// coxswain_drivers::gnss0183's own copy: a real receiver would not report a
+// course at a standstill either, so the simulator should not manufacture a
+// stream neither real path would produce. Deliberately duplicated (see the
+// driver's own comment on this) rather than depending on the estimator
+// crate just for one constant.
+const COG_MIN_SPEED_MPS: f64 = 0.5;
+
+/// SOG/CourseOverGround sensor, emitted from truth body velocity (rotating
+/// into NED does not change speed magnitude, so surge/sway alone give SOG).
+/// See `GnssModel` for the latency caveat. COG is suppressed below
+/// `COG_MIN_SPEED_MPS` *sampled* speed (matching a real receiver, which
+/// gates on what it measured, not on the truth).
+#[derive(Copy, Clone, Debug)]
+pub struct VelocityModel {
+    pub rate_hz: f64,
+    pub std_sog_mps: f64,
+    pub std_cog_rad: f64,
+    pub bias_sog_mps: f64,
+    pub latency: Duration,
+}
+
+impl VelocityModel {
+    pub fn new(rate_hz: f64, std_sog_mps: f64, std_cog_rad: f64) -> Self {
+        Self {
+            rate_hz,
+            std_sog_mps,
+            std_cog_rad,
+            bias_sog_mps: 0.0,
+            latency: Duration::ZERO,
+        }
+    }
+}
+
+/// GNSS position sensor reporting a full 2x2 NE covariance and fix mode
+/// (e.g. an RTK receiver), rather than the scalar isotropic std `GnssModel`
+/// assumes. See `GnssModel` for the latency/bias caveats.
+#[derive(Copy, Clone, Debug)]
+pub struct GnssCovModel {
+    pub rate_hz: f64,
+    /// 2x2 NE covariance, m^2; diagonal by default (see `new`).
+    pub cov_ne_m2: [[f64; 2]; 2],
+    pub fix: GnssFixMode,
+    pub bias_m: f64,
+    pub latency: Duration,
+}
+
+impl GnssCovModel {
+    /// Diagonal covariance from a per-axis std.
+    pub fn new(rate_hz: f64, std_m: f64, fix: GnssFixMode) -> Self {
+        let var = std_m * std_m;
+        Self {
+            rate_hz,
+            cov_ne_m2: [[var, 0.0], [0.0, var]],
+            fix,
+            bias_m: 0.0,
+            latency: Duration::ZERO,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 enum SensorKind {
     Gnss,
     Heading,
     YawRate,
+    Velocity {
+        std_cog_rad: f64,
+    },
+    GnssCov {
+        cov_ne_m2: [[f64; 2]; 2],
+        fix: GnssFixMode,
+    },
 }
 
-/// The three public models share one shape once units are stripped, so one
-/// internal record covers them all.
+/// The three scalar public models share one shape once units are stripped,
+/// so one internal record covers them; `Velocity`/`GnssCov` carry their
+/// extra field(s) inline on the `SensorKind` variant instead.
 #[derive(Copy, Clone, Debug)]
 struct Sensor {
     id: SensorId,
@@ -217,6 +287,42 @@ impl Simulator {
             model.bias_radps,
             model.latency,
             model.quantization_radps,
+        );
+    }
+
+    /// `std_sog_mps`/`bias_sog_mps` ride the shared `Sensor.std`/`.bias`
+    /// fields (SOG is this sensor's "primary" scalar, same convention as the
+    /// other `add_*` methods); `std_cog_rad` has no shared-shape home, so it
+    /// rides on `SensorKind::Velocity` instead.
+    pub fn add_velocity(&mut self, id: SensorId, model: VelocityModel) {
+        self.add_sensor(
+            id,
+            SensorKind::Velocity {
+                std_cog_rad: model.std_cog_rad,
+            },
+            model.rate_hz,
+            model.std_sog_mps,
+            model.bias_sog_mps,
+            model.latency,
+            None,
+        );
+    }
+
+    /// The 2x2 covariance and fix mode ride on `SensorKind::GnssCov`; the
+    /// shared `Sensor.std` field is unused for this kind (the noise scale
+    /// comes from the covariance instead).
+    pub fn add_gnss_cov(&mut self, id: SensorId, model: GnssCovModel) {
+        self.add_sensor(
+            id,
+            SensorKind::GnssCov {
+                cov_ne_m2: model.cov_ne_m2,
+                fix: model.fix,
+            },
+            model.rate_hz,
+            0.0,
+            model.bias_m,
+            model.latency,
+            None,
         );
     }
 
@@ -414,14 +520,27 @@ impl Simulator {
     }
 
     /// Sample sensor `idx` at its due time from the current truth and push
-    /// the measurement onto the delivery buffer.
+    /// the measurement(s) onto the delivery buffer. `Velocity` can push two
+    /// (SOG always, COG only above the speed floor); every other kind pushes
+    /// exactly one.
     fn sample(&mut self, idx: usize) {
         let s = self.sensors[idx];
         if s.dropout {
             return;
         }
         let t = s.next_due;
-        let kind = match s.kind {
+        let delivery = t.checked_add(s.latency).expect("sim time overflow");
+        let emit = |sim: &mut Self, kind: MeasurementKind| {
+            sim.pending.push((
+                delivery,
+                Measurement {
+                    sensor: s.id,
+                    t,
+                    kind,
+                },
+            ));
+        };
+        match s.kind {
             SensorKind::Gnss => {
                 let n = quantize(
                     self.eta[0] + s.bias + self.rng.gaussian(s.std),
@@ -431,35 +550,73 @@ impl Simulator {
                     self.eta[1] + s.bias + self.rng.gaussian(s.std),
                     s.quantization,
                 );
-                MeasurementKind::GnssPosition {
+                let kind = MeasurementKind::GnssPosition {
                     position: self.frame.to_geo(n, e),
                     std_m: s.std,
+                };
+                emit(self, kind);
+            }
+            SensorKind::Heading => {
+                let kind = MeasurementKind::Heading {
+                    heading_rad: wrap_pi(quantize(
+                        self.eta[2] + s.bias + self.rng.gaussian(s.std),
+                        s.quantization,
+                    )),
+                    std_rad: s.std,
+                };
+                emit(self, kind);
+            }
+            SensorKind::YawRate => {
+                let kind = MeasurementKind::YawRate {
+                    yaw_rate_radps: quantize(
+                        self.nu[2] + s.bias + self.rng.gaussian(s.std),
+                        s.quantization,
+                    ),
+                    std_radps: s.std,
+                };
+                emit(self, kind);
+            }
+            SensorKind::Velocity { std_cog_rad } => {
+                // Rotating body velocity into NED does not change its
+                // magnitude, so truth SOG is just the body-frame norm.
+                let sog_truth = self.nu[0].hypot(self.nu[1]);
+                let sampled_sog = (sog_truth + s.bias + self.rng.gaussian(s.std)).max(0.0);
+                emit(
+                    self,
+                    MeasurementKind::SpeedOverGround {
+                        sog_mps: sampled_sog,
+                        std_mps: s.std,
+                    },
+                );
+                // Gated on the *sampled* SOG, not truth: a real receiver
+                // decides from its own reported speed.
+                if sampled_sog >= COG_MIN_SPEED_MPS {
+                    let cog_truth = wrap_pi(self.eta[2] + self.nu[1].atan2(self.nu[0]));
+                    let cog = wrap_pi(cog_truth + self.rng.gaussian(std_cog_rad));
+                    emit(
+                        self,
+                        MeasurementKind::CourseOverGround {
+                            cog_rad: cog,
+                            std_rad: std_cog_rad,
+                        },
+                    );
                 }
             }
-            SensorKind::Heading => MeasurementKind::Heading {
-                heading_rad: wrap_pi(quantize(
-                    self.eta[2] + s.bias + self.rng.gaussian(s.std),
-                    s.quantization,
-                )),
-                std_rad: s.std,
-            },
-            SensorKind::YawRate => MeasurementKind::YawRate {
-                yaw_rate_radps: quantize(
-                    self.nu[2] + s.bias + self.rng.gaussian(s.std),
-                    s.quantization,
-                ),
-                std_radps: s.std,
-            },
-        };
-        let delivery = t.checked_add(s.latency).expect("sim time overflow");
-        self.pending.push((
-            delivery,
-            Measurement {
-                sensor: s.id,
-                t,
-                kind,
-            },
-        ));
+            SensorKind::GnssCov { cov_ne_m2, fix } => {
+                let std_n = cov_ne_m2[0][0].sqrt();
+                let std_e = cov_ne_m2[1][1].sqrt();
+                let n = self.eta[0] + s.bias + self.rng.gaussian(std_n);
+                let e = self.eta[1] + s.bias + self.rng.gaussian(std_e);
+                emit(
+                    self,
+                    MeasurementKind::GnssPositionCov {
+                        position: self.frame.to_geo(n, e),
+                        cov_ne_m2,
+                        fix,
+                    },
+                );
+            }
+        }
     }
 }
 
