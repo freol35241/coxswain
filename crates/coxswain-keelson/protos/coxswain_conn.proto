@@ -27,6 +27,7 @@ message ConnReply {
     REFUSED_VOLTAGE = 7;
     REFUSED_POSITION = 8;
     ERROR = 9;
+    REFUSED_POWER_STALE = 10;
   }
   Result result = 1;
 }

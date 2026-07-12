@@ -153,6 +153,10 @@ pub struct SupervisorConfig {
     pub position_degraded_after: Duration,
     pub low_voltage_v: f64,
     pub critical_voltage_v: f64,
+    /// How long a power report may go silent before the supervisor treats
+    /// telemetry as stale (report-only, see `Directive::power_stale`);
+    /// judged from the first report ever seen, not from boot.
+    pub power_stale_after: Duration,
     pub geofence: GeofenceConfig,
     /// Capacity mirrors `coxswain_supervisor::MAX_CLAIMANTS`; the contract
     /// crate does not depend on the supervisor crate, so the two are kept in

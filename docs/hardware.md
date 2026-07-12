@@ -83,8 +83,14 @@ ordering anything.
 - Closed: power monitoring input path in real-serial mode. `$CXPWR`
   reports on the actuator link's reverse direction now feed the failsafe
   matrix (coxswain-drivers/src/actuator_serial.rs); the healthy default
-  applies only until the first report arrives. Report staleness (what
-  happens if reports stop) is not handled and remains an open item.
+  applies only until the first report arrives.
+- Closed: power report staleness. `SupervisorConfig::power_stale_after`
+  (coxswain-supervisor/src/lib.rs) refuses a fresh arm and flags
+  `Directive::power_stale` once a report has been seen and then gone
+  silent past the bound; report-only for an already-armed vessel, same
+  matrix v1 philosophy as low voltage. Not yet an authored manifest field
+  (coxswain-manifest/src/compile.rs hardcodes 3 s); promoting it to the
+  schema is an open item.
 - Closed: the actuator serial link is a manifest `actuator_uart` bus now
   (D-026/D-027), mapped via `--port <bus_id>=<device>` like any other bus;
   an unmapped bus carrying effectors is a boot error (self-sufficiency,

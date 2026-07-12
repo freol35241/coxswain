@@ -98,6 +98,7 @@ fn config(geofence: GeofenceConfig) -> VesselConfig {
             position_degraded_after: Duration::from_secs(3),
             low_voltage_v: 12.4,
             critical_voltage_v: 11.8,
+            power_stale_after: Duration::from_secs(3),
             geofence,
             claimant_priorities: BoundedList::from_slice(&[ClaimantPriority {
                 id: RC,

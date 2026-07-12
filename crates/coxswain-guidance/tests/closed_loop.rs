@@ -48,6 +48,7 @@ fn config() -> VesselConfig {
             position_degraded_after: Duration::from_secs(2),
             low_voltage_v: 11.5,
             critical_voltage_v: 10.5,
+            power_stale_after: Duration::from_secs(3),
             geofence: GeofenceConfig {
                 enabled: false,
                 action: GeofenceAction::Hold,

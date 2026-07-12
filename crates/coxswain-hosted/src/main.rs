@@ -242,6 +242,7 @@ fn arm_reply(result: Result<(), ArmError>) -> ConnReplyResult {
         Err(ArmError::EstimatorNotReady) => ConnReplyResult::RefusedEstimator,
         Err(ArmError::PositionDegraded) => ConnReplyResult::RefusedPosition,
         Err(ArmError::VoltageLow) => ConnReplyResult::RefusedVoltage,
+        Err(ArmError::PowerStale) => ConnReplyResult::RefusedPowerStale,
     }
 }
 

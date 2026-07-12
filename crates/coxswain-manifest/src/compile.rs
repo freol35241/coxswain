@@ -560,6 +560,10 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         position_degraded_after: Duration::from_millis(m.supervisor.position_degraded_after_ms),
         low_voltage_v: m.supervisor.low_voltage_v,
         critical_voltage_v: m.supervisor.critical_voltage_v,
+        // Not yet an authored field: the schema bump to add it is a
+        // follow-up task in this queue. Hardcoded to a reasonable default
+        // until then.
+        power_stale_after: Duration::from_millis(3000),
         geofence: build_geofence(m.supervisor.geofence.as_ref())?,
         claimant_priorities: claimant_priorities(&m.claimants)?,
     };

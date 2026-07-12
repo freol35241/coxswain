@@ -69,13 +69,16 @@ impl Core {
             allocator: (!effectors.is_empty()).then(|| {
                 Allocator::new(effectors).expect("manifest compile validates the effector table")
             }),
-            // Nominal 13.0 V rather than 0 V: a zero default would trip
-            // critical voltage before the first report. Real deployments
-            // publish power from boot; power staleness is revisited in
-            // Phase 5+.
+            // NaN, not a nominal voltage: the supervisor's non-finite guard
+            // already treats "no good reading yet" as within bounds, and a
+            // non-finite reading never starts its power-report-staleness
+            // clock either (coxswain-supervisor::Supervisor::tick's own
+            // comment), so a vessel with no power link wired up at all stays
+            // arm-able indefinitely instead of going falsely stale a few
+            // seconds after boot. A real link's first report overwrites this.
             power: PowerStatus {
                 t: Timestamp::from_nanos(0),
-                voltage_v: 13.0,
+                voltage_v: f64::NAN,
             },
             setpoints: [None; MAX_CLAIMANTS],
         }

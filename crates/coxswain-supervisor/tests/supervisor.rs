@@ -21,6 +21,7 @@ const V_CRIT: f64 = 11.0; // below critical_voltage_v 11.8
 
 const HB_MS: u64 = 1_000; // claimant_heartbeat
 const DEGRADE_MS: u64 = 3_000; // position_degraded_after
+const POWER_STALE_MS: u64 = 3_000; // power_stale_after
 
 fn ts(ms: u64) -> Timestamp {
     Timestamp::from_nanos(ms * 1_000_000)
@@ -88,6 +89,7 @@ fn config_with_fence(grant: ConnGrantDefault, fence: GeofenceConfig) -> VesselCo
             position_degraded_after: Duration::from_millis(DEGRADE_MS),
             low_voltage_v: 12.4,
             critical_voltage_v: 11.8,
+            power_stale_after: Duration::from_millis(POWER_STALE_MS),
             geofence: fence,
             claimant_priorities: BoundedList::new(),
         },
@@ -154,11 +156,13 @@ fn state_at(position: GeoPoint) -> VesselState {
     }
 }
 
-fn pw(voltage_v: f64) -> PowerStatus {
-    PowerStatus {
-        t: ts(0),
-        voltage_v,
-    }
+/// A power report as if it just arrived at `now`. Every pre-existing test
+/// wants a fresh report on every tick (mirroring the hosted sim backend,
+/// which republishes voltage every control tick), so `power_stale_after`
+/// never trips for them; tests that exercise staleness itself hold `t`
+/// behind `now` explicitly instead of going through this helper.
+fn pw(now: Timestamp, voltage_v: f64) -> PowerStatus {
+    PowerStatus { t: now, voltage_v }
 }
 
 fn cruise() -> Setpoint {
@@ -173,7 +177,7 @@ fn nominal_tick(sup: &mut Supervisor, now: Timestamp) -> Directive {
         now,
         &nominal(),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(now, V_OK),
         Some(cruise()),
     )
 }
@@ -426,7 +430,7 @@ fn arm_on_estimator_fault_is_estimator_not_ready() {
         ts(0),
         &health(HealthLevel::Fault, false),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(0), V_OK),
         None,
     );
     assert_eq!(sup.arm(AUTONOMY), Err(ArmError::EstimatorNotReady));
@@ -442,7 +446,7 @@ fn arm_while_position_degraded_denied() {
         ts(0),
         &health(HealthLevel::Degraded, true),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(0), V_OK),
         None,
     );
     sup.heartbeat(AUTONOMY, ts(DEGRADE_MS + 1)).unwrap();
@@ -450,7 +454,7 @@ fn arm_while_position_degraded_denied() {
         ts(DEGRADE_MS + 1),
         &health(HealthLevel::Degraded, true),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(DEGRADE_MS + 1), V_OK),
         None,
     );
     assert_eq!(sup.arm(AUTONOMY), Err(ArmError::PositionDegraded));
@@ -464,7 +468,7 @@ fn arm_on_low_voltage_denied_until_recovery() {
         ts(0),
         &nominal(),
         Some(&state_at(inside())),
-        &pw(V_LOW),
+        &pw(ts(0), V_LOW),
         None,
     );
     assert_eq!(sup.arm(AUTONOMY), Err(ArmError::VoltageLow));
@@ -474,11 +478,91 @@ fn arm_on_low_voltage_denied_until_recovery() {
         ts(100),
         &nominal(),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(100), V_OK),
         None,
     );
     assert_eq!(sup.arm(AUTONOMY), Ok(()));
     assert_eq!(sup.arming(), ArmingState::Armed);
+}
+
+#[test]
+fn arm_allowed_before_first_power_report() {
+    // No power link wired up at all: every tick sees a non-finite reading,
+    // so no report is ever seen and the staleness clock never starts, no
+    // matter how much time passes (coxswain-hosted::Core::new's own NaN
+    // sentinel for exactly this scenario).
+    let mut sup = Supervisor::new(&config(ConnGrantDefault::Autonomy, GeofenceAction::Hold));
+    let now = ts(POWER_STALE_MS + 1);
+    sup.heartbeat(AUTONOMY, now).unwrap();
+    sup.tick(
+        now,
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(now, f64::NAN),
+        None,
+    );
+    assert_eq!(sup.arm(AUTONOMY), Ok(()));
+}
+
+#[test]
+fn arm_refused_when_power_report_stale() {
+    let mut sup = Supervisor::new(&config(ConnGrantDefault::Autonomy, GeofenceAction::Hold));
+    sup.heartbeat(AUTONOMY, ts(0)).unwrap();
+    sup.tick(
+        ts(0),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(0), V_OK),
+        None,
+    );
+    // Past power_stale_after with no fresh report since: the cached voltage
+    // may be old news, so arming is refused even though the last known
+    // value was healthy.
+    let stale_at = ts(POWER_STALE_MS + 1);
+    sup.heartbeat(AUTONOMY, stale_at).unwrap();
+    sup.tick(
+        stale_at,
+        &nominal(),
+        // Same report as before: nothing fresh arrived.
+        Some(&state_at(inside())),
+        &pw(ts(0), V_OK),
+        None,
+    );
+    assert_eq!(sup.arm(AUTONOMY), Err(ArmError::PowerStale));
+}
+
+#[test]
+fn arm_allowed_again_once_a_fresh_report_clears_staleness() {
+    let mut sup = Supervisor::new(&config(ConnGrantDefault::Autonomy, GeofenceAction::Hold));
+    sup.heartbeat(AUTONOMY, ts(0)).unwrap();
+    sup.tick(
+        ts(0),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(0), V_OK),
+        None,
+    );
+    let stale_at = ts(POWER_STALE_MS + 1);
+    sup.heartbeat(AUTONOMY, stale_at).unwrap();
+    sup.tick(
+        stale_at,
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(0), V_OK),
+        None,
+    );
+    assert_eq!(sup.arm(AUTONOMY), Err(ArmError::PowerStale));
+    // A fresh report clears it.
+    let recovered_at = ts(POWER_STALE_MS + 100);
+    sup.heartbeat(AUTONOMY, recovered_at).unwrap();
+    sup.tick(
+        recovered_at,
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(recovered_at, V_OK),
+        None,
+    );
+    assert_eq!(sup.arm(AUTONOMY), Ok(()));
 }
 
 #[test]
@@ -499,7 +583,7 @@ fn critical_voltage_forces_disarm_and_it_sticks() {
         ts(100),
         &nominal(),
         Some(&state_at(inside())),
-        &pw(V_CRIT),
+        &pw(ts(100), V_CRIT),
         Some(cruise()),
     );
     assert_eq!(
@@ -510,6 +594,7 @@ fn critical_voltage_forces_disarm_and_it_sticks() {
             conn: ConnState::Held(AUTONOMY),
             failsafe: Some(FailsafeCause::CriticalVoltage),
             low_voltage: true,
+            power_stale: false,
         }
     );
     // Voltage recovery does not re-arm; that is the holder's call.
@@ -531,7 +616,7 @@ fn nan_voltage_does_not_trip_critical_or_low() {
         ts(100),
         &nominal(),
         Some(&state_at(inside())),
-        &pw(f64::NAN),
+        &pw(ts(100), f64::NAN),
         Some(cruise()),
     );
     assert_eq!(d.failsafe, None);
@@ -547,7 +632,7 @@ fn nan_voltage_does_not_clear_latched_critical_voltage() {
         ts(100),
         &nominal(),
         Some(&state_at(inside())),
-        &pw(V_CRIT),
+        &pw(ts(100), V_CRIT),
         Some(cruise()),
     );
     assert_eq!(d.failsafe, Some(FailsafeCause::CriticalVoltage));
@@ -559,7 +644,7 @@ fn nan_voltage_does_not_clear_latched_critical_voltage() {
         ts(200),
         &nominal(),
         Some(&state_at(inside())),
-        &pw(f64::NAN),
+        &pw(ts(200), f64::NAN),
         Some(cruise()),
     );
     assert_eq!(d.failsafe, Some(FailsafeCause::CriticalVoltage));
@@ -574,7 +659,7 @@ fn nan_voltage_does_not_clear_latched_critical_voltage() {
         ts(300),
         &nominal(),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(300), V_OK),
         Some(cruise()),
     );
     assert_eq!(d.failsafe, None);
@@ -592,7 +677,7 @@ fn position_degraded_idles_but_stays_armed() {
         ts(100),
         &health(HealthLevel::Fault, false),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(100), V_OK),
         Some(cruise()),
     );
     assert_eq!(
@@ -603,6 +688,7 @@ fn position_degraded_idles_but_stays_armed() {
             conn: ConnState::Held(AUTONOMY),
             failsafe: Some(FailsafeCause::PositionDegraded),
             low_voltage: false,
+            power_stale: false,
         }
     );
     // Recovery: the holder's setpoint passes through again.
@@ -620,7 +706,7 @@ fn geofence_hold_station_keeps_at_breach_point() {
         ts(100),
         &nominal(),
         Some(&state_at(outside())),
-        &pw(V_OK),
+        &pw(ts(100), V_OK),
         Some(cruise()),
     );
     assert_eq!(
@@ -633,6 +719,7 @@ fn geofence_hold_station_keeps_at_breach_point() {
             conn: ConnState::Held(AUTONOMY),
             failsafe: Some(FailsafeCause::GeofenceBreach),
             low_voltage: false,
+            power_stale: false,
         }
     );
 }
@@ -646,7 +733,7 @@ fn geofence_return_uses_last_inside_position() {
         ts(100),
         &nominal(),
         Some(&state_at(inside_b())),
-        &pw(V_OK),
+        &pw(ts(100), V_OK),
         Some(cruise()),
     );
     sup.heartbeat(AUTONOMY, ts(200)).unwrap();
@@ -654,7 +741,7 @@ fn geofence_return_uses_last_inside_position() {
         ts(200),
         &nominal(),
         Some(&state_at(outside())),
-        &pw(V_OK),
+        &pw(ts(200), V_OK),
         Some(cruise()),
     );
     assert_eq!(
@@ -674,7 +761,7 @@ fn geofence_zero_thrust_idles_but_stays_armed() {
         ts(100),
         &nominal(),
         Some(&state_at(outside())),
-        &pw(V_OK),
+        &pw(ts(100), V_OK),
         Some(cruise()),
     );
     assert_eq!(d.setpoint, Setpoint::Idle);
@@ -691,7 +778,7 @@ fn claimant_lost_station_keeps_on_own_authority() {
         ts(2 * HB_MS),
         &nominal(),
         Some(&state_at(inside_b())),
-        &pw(V_OK),
+        &pw(ts(2 * HB_MS), V_OK),
         Some(cruise()),
     );
     assert_eq!(
@@ -704,6 +791,7 @@ fn claimant_lost_station_keeps_on_own_authority() {
             conn: ConnState::Unheld,
             failsafe: Some(FailsafeCause::ClaimantLost),
             low_voltage: false,
+            power_stale: false,
         }
     );
 }
@@ -716,7 +804,7 @@ fn low_voltage_reports_only_and_blocks_arming() {
         ts(100),
         &nominal(),
         Some(&state_at(inside())),
-        &pw(V_LOW),
+        &pw(ts(100), V_LOW),
         Some(cruise()),
     );
     // The holder's setpoint passes through; the flag is the only effect.
@@ -728,6 +816,7 @@ fn low_voltage_reports_only_and_blocks_arming() {
             conn: ConnState::Held(AUTONOMY),
             failsafe: None,
             low_voltage: true,
+            power_stale: false,
         }
     );
     // While low voltage holds, a disarmed vessel cannot re-arm.
@@ -748,7 +837,7 @@ fn no_condition_passes_holder_setpoint_or_idles_without_one() {
         ts(200),
         &nominal(),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(200), V_OK),
         None,
     );
     assert_eq!(d.setpoint, Setpoint::Idle);
@@ -767,6 +856,7 @@ fn disarmed_vessel_always_idles() {
             conn: ConnState::Held(AUTONOMY),
             failsafe: None,
             low_voltage: false,
+            power_stale: false,
         }
     );
     // Conditions still evaluate and report while disarmed, but the setpoint
@@ -776,11 +866,153 @@ fn disarmed_vessel_always_idles() {
         ts(100),
         &nominal(),
         Some(&state_at(outside())),
-        &pw(V_OK),
+        &pw(ts(100), V_OK),
         Some(cruise()),
     );
     assert_eq!(d.setpoint, Setpoint::Idle);
     assert_eq!(d.failsafe, Some(FailsafeCause::GeofenceBreach));
+}
+
+// ------------------------------------------------------ power report staleness
+
+#[test]
+fn power_stale_boundary_exact_vs_one_past() {
+    // `armed()` itself lands one report at t=0 (its own doc comment).
+    let mut sup = armed(GeofenceAction::Hold);
+    // Exactly power_stale_after since that report, no fresher one having
+    // arrived: not yet stale.
+    sup.heartbeat(AUTONOMY, ts(POWER_STALE_MS)).unwrap();
+    let d = sup.tick(
+        ts(POWER_STALE_MS),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(0), V_OK),
+        Some(cruise()),
+    );
+    assert!(!d.power_stale);
+    // One nanosecond beyond: stale.
+    let just_past = Timestamp::from_nanos(POWER_STALE_MS * 1_000_000 + 1);
+    sup.heartbeat(AUTONOMY, just_past).unwrap();
+    let d = sup.tick(
+        just_past,
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(0), V_OK),
+        Some(cruise()),
+    );
+    assert!(d.power_stale);
+}
+
+#[test]
+fn armed_vessel_unaffected_by_power_staleness_apart_from_the_flag() {
+    let mut sup = armed(GeofenceAction::Hold);
+    let stale_at = ts(POWER_STALE_MS + 1);
+    sup.heartbeat(AUTONOMY, stale_at).unwrap();
+    let d = sup.tick(
+        stale_at,
+        &nominal(),
+        Some(&state_at(inside())),
+        // The same t=0 report `armed()` landed, never refreshed: report-only,
+        // exactly like low voltage, so an armed vessel keeps its setpoint.
+        &pw(ts(0), V_OK),
+        Some(cruise()),
+    );
+    assert_eq!(
+        d,
+        Directive {
+            setpoint: cruise(),
+            arming: ArmingState::Armed,
+            conn: ConnState::Held(AUTONOMY),
+            failsafe: None,
+            low_voltage: false,
+            power_stale: true,
+        }
+    );
+}
+
+#[test]
+fn low_voltage_still_evaluated_on_last_good_value_while_power_stale() {
+    let mut sup = armed(GeofenceAction::Hold);
+    sup.heartbeat(AUTONOMY, ts(100)).unwrap();
+    sup.tick(
+        ts(100),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(100), V_LOW),
+        Some(cruise()),
+    );
+    // No fresher report arrives; the low reading is what stays "current"
+    // once the report itself goes stale.
+    let stale_at = ts(100 + POWER_STALE_MS + 1);
+    sup.heartbeat(AUTONOMY, stale_at).unwrap();
+    let d = sup.tick(
+        stale_at,
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(100), V_LOW),
+        Some(cruise()),
+    );
+    assert!(d.low_voltage);
+    assert!(d.power_stale);
+    assert_eq!(d.arming, ArmingState::Armed);
+    assert_eq!(d.setpoint, cruise());
+}
+
+#[test]
+fn critical_voltage_still_evaluated_on_last_good_value_while_power_stale() {
+    let mut sup = armed(GeofenceAction::Hold);
+    sup.heartbeat(AUTONOMY, ts(100)).unwrap();
+    sup.tick(
+        ts(100),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(100), V_CRIT),
+        Some(cruise()),
+    );
+    let stale_at = ts(100 + POWER_STALE_MS + 1);
+    sup.heartbeat(AUTONOMY, stale_at).unwrap();
+    let d = sup.tick(
+        stale_at,
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(100), V_CRIT),
+        Some(cruise()),
+    );
+    assert_eq!(d.failsafe, Some(FailsafeCause::CriticalVoltage));
+    assert!(d.power_stale);
+    assert_eq!(d.arming, ArmingState::Disarmed);
+    assert_eq!(d.setpoint, Setpoint::Idle);
+}
+
+#[test]
+fn nan_report_does_not_refresh_the_staleness_clock() {
+    // A NaN reading never overwrites the voltage (the supervisor's existing
+    // guard); for the same reason it must not restart the staleness clock
+    // either, or a stream of malformed reports would masquerade as a live
+    // link and mask a link that has actually gone silent.
+    let mut sup = armed(GeofenceAction::Hold); // good report at t=0
+    sup.heartbeat(AUTONOMY, ts(2_000)).unwrap();
+    let d = sup.tick(
+        ts(2_000),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(2_000), f64::NAN),
+        Some(cruise()),
+    );
+    assert!(!d.power_stale);
+    // Past power_stale_after since the original t=0 report. If the t=2s NaN
+    // reading had wrongly refreshed the clock, only 1001 ms would have
+    // elapsed since and this would not be stale yet.
+    let stale_at = ts(POWER_STALE_MS + 1);
+    sup.heartbeat(AUTONOMY, stale_at).unwrap();
+    let d = sup.tick(
+        stale_at,
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(2_000), f64::NAN),
+        Some(cruise()),
+    );
+    assert!(d.power_stale);
 }
 
 // ------------------------------------------------ failsafe matrix, pairwise
@@ -845,7 +1077,7 @@ fn run_pair(hi: Cond, lo: Cond) {
         now,
         &health(level, false),
         Some(&state_at(pos)),
-        &pw(voltage),
+        &pw(now, voltage),
         Some(cruise()),
     );
 
@@ -880,6 +1112,10 @@ fn run_pair(hi: Cond, lo: Cond) {
         },
         failsafe: Some(expected_cause),
         low_voltage: has(Cond::Critical) || has(Cond::LowVolt),
+        // None of the five conditions this matrix exercises is power
+        // staleness; every report here arrives fresh at `now` (`pw`'s own
+        // doc comment).
+        power_stale: false,
     };
     assert_eq!(d, expected, "pair {hi:?} + {lo:?}");
 }
@@ -899,7 +1135,7 @@ fn claimant_lost_latches_until_regrant() {
         ts(2 * HB_MS + 200),
         &nominal(),
         Some(&state_at(inside_b())),
-        &pw(V_OK),
+        &pw(ts(2 * HB_MS + 200), V_OK),
         Some(cruise()),
     );
     assert_eq!(d.conn, ConnState::Unheld);
@@ -921,7 +1157,7 @@ fn geofence_breach_clears_on_reentry_and_relatches() {
         ts(100),
         &nominal(),
         Some(&state_at(outside())),
-        &pw(V_OK),
+        &pw(ts(100), V_OK),
         Some(cruise()),
     );
     assert_eq!(d.failsafe, Some(FailsafeCause::GeofenceBreach));
@@ -931,7 +1167,7 @@ fn geofence_breach_clears_on_reentry_and_relatches() {
         ts(200),
         &nominal(),
         Some(&state_at(inside_b())),
-        &pw(V_OK),
+        &pw(ts(200), V_OK),
         Some(cruise()),
     );
     assert_eq!(d.failsafe, None);
@@ -942,7 +1178,7 @@ fn geofence_breach_clears_on_reentry_and_relatches() {
         ts(300),
         &nominal(),
         Some(&state_at(outside_b())),
-        &pw(V_OK),
+        &pw(ts(300), V_OK),
         Some(cruise()),
     );
     assert_eq!(
@@ -961,7 +1197,7 @@ fn geofence_target_latched_at_detection_not_re_derived() {
         ts(100),
         &nominal(),
         Some(&state_at(outside())),
-        &pw(V_OK),
+        &pw(ts(100), V_OK),
         Some(cruise()),
     );
     // The vessel keeps drifting; the target must not follow it.
@@ -970,7 +1206,7 @@ fn geofence_target_latched_at_detection_not_re_derived() {
         ts(200),
         &nominal(),
         Some(&state_at(outside_b())),
-        &pw(V_OK),
+        &pw(ts(200), V_OK),
         Some(cruise()),
     );
     assert_eq!(
@@ -989,7 +1225,7 @@ fn position_degraded_onset_boundary() {
         ts(0),
         &health(HealthLevel::Nominal, true),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(0), V_OK),
         Some(cruise()),
     );
     // Exactly position_degraded_after: not yet degraded.
@@ -998,7 +1234,7 @@ fn position_degraded_onset_boundary() {
         ts(DEGRADE_MS),
         &health(HealthLevel::Nominal, true),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(DEGRADE_MS), V_OK),
         Some(cruise()),
     );
     assert_eq!(d.failsafe, None);
@@ -1010,7 +1246,7 @@ fn position_degraded_onset_boundary() {
         just_past,
         &health(HealthLevel::Nominal, true),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(just_past, V_OK),
         Some(cruise()),
     );
     assert_eq!(d.failsafe, Some(FailsafeCause::PositionDegraded));
@@ -1022,14 +1258,20 @@ fn position_degraded_onset_boundary() {
 fn gnss_recovery_resets_the_staleness_onset() {
     let mut sup = armed(GeofenceAction::Hold);
     let stale = health(HealthLevel::Nominal, true);
-    sup.tick(ts(0), &stale, Some(&state_at(inside())), &pw(V_OK), None);
+    sup.tick(
+        ts(0),
+        &stale,
+        Some(&state_at(inside())),
+        &pw(ts(0), V_OK),
+        None,
+    );
     // Fresh tick at t=2s resets the onset.
     sup.heartbeat(AUTONOMY, ts(2_000)).unwrap();
     sup.tick(
         ts(2_000),
         &nominal(),
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(2_000), V_OK),
         None,
     );
     // Stale again from t=2.5s: at t=5s only 2.5s have elapsed, not degraded.
@@ -1038,7 +1280,7 @@ fn gnss_recovery_resets_the_staleness_onset() {
         ts(2_500),
         &stale,
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(2_500), V_OK),
         None,
     );
     sup.heartbeat(AUTONOMY, ts(5_000)).unwrap();
@@ -1046,7 +1288,7 @@ fn gnss_recovery_resets_the_staleness_onset() {
         ts(5_000),
         &stale,
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(5_000), V_OK),
         None,
     );
     assert_eq!(d.failsafe, None);
@@ -1056,7 +1298,7 @@ fn gnss_recovery_resets_the_staleness_onset() {
         ts(5_501),
         &stale,
         Some(&state_at(inside())),
-        &pw(V_OK),
+        &pw(ts(5_501), V_OK),
         None,
     );
     assert_eq!(d.failsafe, Some(FailsafeCause::PositionDegraded));
@@ -1072,7 +1314,7 @@ fn release_while_armed_latches_claimant_lost() {
         ts(100),
         &nominal(),
         Some(&state_at(inside_b())),
-        &pw(V_OK),
+        &pw(ts(100), V_OK),
         Some(cruise()),
     );
     assert_eq!(
@@ -1083,6 +1325,7 @@ fn release_while_armed_latches_claimant_lost() {
             conn: ConnState::Unheld,
             failsafe: Some(FailsafeCause::ClaimantLost),
             low_voltage: false,
+            power_stale: false,
         }
     );
 }
@@ -1102,6 +1345,7 @@ fn release_while_disarmed_is_clean() {
             conn: ConnState::Unheld,
             failsafe: None,
             low_voltage: false,
+            power_stale: false,
         }
     );
 }
@@ -1126,7 +1370,7 @@ fn disabled_or_degenerate_geofence_never_breaches() {
         ts(100),
         &nominal(),
         Some(&state_at(outside())),
-        &pw(V_OK),
+        &pw(ts(100), V_OK),
         Some(cruise()),
     );
     assert_eq!(d.failsafe, None);
@@ -1151,7 +1395,7 @@ fn disabled_or_degenerate_geofence_never_breaches() {
         ts(100),
         &nominal(),
         Some(&state_at(outside())),
-        &pw(V_OK),
+        &pw(ts(100), V_OK),
         Some(cruise()),
     );
     assert_eq!(d.failsafe, None);

@@ -358,6 +358,7 @@ pub fn test_config(model: ModelParams) -> VesselConfig {
             position_degraded_after: Duration::from_millis(3_000),
             low_voltage_v: 12.4,
             critical_voltage_v: 11.8,
+            power_stale_after: Duration::from_millis(3_000),
             geofence: GeofenceConfig {
                 enabled: false,
                 action: GeofenceAction::Hold,

@@ -409,6 +409,7 @@ mod tests {
                 position_degraded_after: Duration::from_secs(3),
                 low_voltage_v: 12.4,
                 critical_voltage_v: 11.8,
+                power_stale_after: Duration::from_secs(3),
                 geofence: GeofenceConfig {
                     enabled: false,
                     action: GeofenceAction::Hold,

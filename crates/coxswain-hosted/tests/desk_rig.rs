@@ -933,6 +933,71 @@ impl Drop for RcTransmitter {
     }
 }
 
+/// Sends the current voltage as a `$CXPWR` line at a fixed rate on its own
+/// thread, standing in for the real actuator far end (about 1 Hz per
+/// hardware.md), comfortably inside the manifest's `power_stale_after`
+/// (3 s, `coxswain-manifest::compile` hardcodes it) so the staleness gate
+/// this task adds does not fire while this rig waits on GNSS convergence;
+/// same pattern as `RcTransmitter` above. `set` additionally writes
+/// immediately rather than waiting for the next periodic tick, so a
+/// deliberate voltage transition still propagates at the same near-instant
+/// latency a one-shot write would have, keeping this rig's tight
+/// arm-refusal timing margins unaffected by the keepalive cadence.
+struct PowerTransmitter {
+    voltage_v: Arc<Mutex<f64>>,
+    writer: Arc<Mutex<File>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PowerTransmitter {
+    fn start(power_master: File, initial_voltage_v: f64) -> Self {
+        let voltage_v = Arc::new(Mutex::new(initial_voltage_v));
+        let writer = Arc::new(Mutex::new(power_master));
+        let stop = Arc::new(AtomicBool::new(false));
+        let v = Arc::clone(&voltage_v);
+        let w = Arc::clone(&writer);
+        let stopping = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stopping.load(Ordering::Relaxed) {
+                let voltage = *v.lock().unwrap();
+                if w.lock()
+                    .unwrap()
+                    .write_all(cxpwr_line(voltage).as_bytes())
+                    .is_err()
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+        Self {
+            voltage_v,
+            writer,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn set(&self, voltage_v: f64) {
+        *self.voltage_v.lock().unwrap() = voltage_v;
+        let _ = self
+            .writer
+            .lock()
+            .unwrap()
+            .write_all(cxpwr_line(voltage_v).as_bytes());
+    }
+}
+
+impl Drop for PowerTransmitter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn make_tmp(name: &str) -> TempDir {
     let dir = std::env::temp_dir().join(format!(
         "coxswain-desk-rig-{name}-{}-{}",
@@ -1222,7 +1287,7 @@ fn power_report_rig() {
 
     let (gnss_master, gnss_slave) = open_pty_pair();
     let (actuator_master, actuator_slave) = open_pty_pair();
-    let mut power_writer = actuator_master
+    let power_writer = actuator_master
         .try_clone()
         .expect("clone the actuator pty master for writing $CXPWR");
     // Drains the vessel's own $CXOUT stream, unused here (this rig never
@@ -1232,6 +1297,12 @@ fn power_report_rig() {
     // the whole test so the draining thread keeps running.
     let _cxout_rx = spawn_cxout_reader(actuator_master);
     let plant = PlantLoop::start(gnss_master, None);
+    // Reports on its own thread at a realistic cadence (module doc comment
+    // on `PowerTransmitter`): a one-shot write per stage would leave the
+    // report stale by the time the estimator and GNSS fix converge, tripping
+    // the staleness gate this task adds well before the deliberate voltage
+    // transitions below.
+    let power = PowerTransmitter::start(power_writer, 13.0);
 
     let port = free_port();
     let endpoint = format!("tcp/127.0.0.1:{port}");
@@ -1269,13 +1340,6 @@ fn power_report_rig() {
         ],
     );
 
-    // A healthy report before anything else: proves the read path itself
-    // is what is being exercised, not merely that the boot default (also
-    // 13.0 V, `Core::new`'s own doc comment) happens to be healthy too.
-    power_writer
-        .write_all(cxpwr_line(13.0).as_bytes())
-        .expect("write healthy $CXPWR");
-
     let session = zenoh::open(client_config(&endpoint)).wait().unwrap();
     let teleop = ClaimantClient::new(session, "keelson", "cx-desk-rig-01", ClaimantId(7));
     assert_eq!(rpc("register", || teleop.register()), ConnReplyResult::Ok);
@@ -1307,9 +1371,7 @@ fn power_report_rig() {
     // already-armed vessel tolerates it) -- the existing armed state must
     // survive, but a *fresh* arm attempt is refused.
     let low_report_at = Instant::now();
-    power_writer
-        .write_all(cxpwr_line(12.0).as_bytes())
-        .expect("write low $CXPWR");
+    power.set(12.0);
     let refusal_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if rpc("arm", || teleop.arm()) == ConnReplyResult::RefusedVoltage {
@@ -1349,9 +1411,7 @@ fn power_report_rig() {
     // that cadence, not a measurement of the supervisor's actual (one
     // tick, ~100 ms) reaction time.
     let critical_report_at = Instant::now();
-    power_writer
-        .write_all(cxpwr_line(11.0).as_bytes())
-        .expect("write critical $CXPWR");
+    power.set(11.0);
     let disarmed = wait_for(
         &status_rx,
         Duration::from_secs(5),

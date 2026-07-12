@@ -33,10 +33,12 @@ pub enum ArmError {
     EstimatorNotReady,
     PositionDegraded,
     VoltageLow,
+    PowerStale,
 }
 
-/// Failsafe conditions in priority order, highest first. Low voltage is
-/// report-only and surfaces as [`Directive::low_voltage`], not as a cause.
+/// Failsafe conditions in priority order, highest first. Low voltage and
+/// power-report staleness are report-only and surface as
+/// [`Directive::low_voltage`] and [`Directive::power_stale`], not as a cause.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FailsafeCause {
     CriticalVoltage,
@@ -54,6 +56,12 @@ pub struct Directive {
     pub conn: ConnState,
     pub failsafe: Option<FailsafeCause>,
     pub low_voltage: bool,
+    /// Time since the last power report exceeds `power_stale_after`
+    /// (meaningless, and always false, until a first report has been
+    /// seen). Report-only, exactly like `low_voltage`: telemetry dying is
+    /// not battery dying, so it never trips a failsafe or overrides an
+    /// already-armed vessel's setpoint.
+    pub power_stale: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -71,6 +79,7 @@ struct Claimant {
 struct TickCache {
     level: HealthLevel,
     voltage_v: f64,
+    power_stale: bool,
 }
 
 pub struct Supervisor {
@@ -91,6 +100,13 @@ pub struct Supervisor {
     geofence_breach: Option<Setpoint>,
     /// Latched when the conn holder is lost; cleared only by a fresh grant.
     claimant_lost: Option<Setpoint>,
+    /// Timestamp of the last power report with a finite voltage. `None`
+    /// until the first one arrives, so staleness cannot be judged before
+    /// then (the healthy-default behavior stands unchanged, matching
+    /// `voltage_v`'s own no-prior-good-reading fallback below); a vessel
+    /// with no power link at all, permanently non-finite, never starts
+    /// this clock either.
+    last_report_t: Option<Timestamp>,
 }
 
 impl Supervisor {
@@ -119,6 +135,7 @@ impl Supervisor {
             last_inside: None,
             geofence_breach: None,
             claimant_lost: None,
+            last_report_t: None,
         }
     }
 
@@ -232,6 +249,12 @@ impl Supervisor {
         if self.position_degraded {
             return Err(ArmError::PositionDegraded);
         }
+        // A stale power report means the cached voltage below may be old
+        // news; refusing to arm on it mirrors VoltageLow rather than
+        // trusting a number that might no longer be true.
+        if cache.power_stale {
+            return Err(ArmError::PowerStale);
+        }
         // Arming needs margin. An already-armed vessel tolerates low
         // voltage (report-only in the matrix); starting a sortie on it is
         // a different decision.
@@ -263,10 +286,11 @@ impl Supervisor {
     /// Evaluate the failsafe matrix and produce the tick's directive.
     ///
     /// Priority: critical voltage, position degraded, geofence breach,
-    /// claimant lost, then the holder's setpoint (with low voltage as a
-    /// report-only flag). The first active condition supplies the setpoint;
-    /// lower-priority conditions still latch and surface once the higher
-    /// ones clear. A disarmed vessel always gets `Idle`.
+    /// claimant lost, then the holder's setpoint (with low voltage and
+    /// power-report staleness as report-only flags). The first active
+    /// condition supplies the setpoint; lower-priority conditions still
+    /// latch and surface once the higher ones clear. A disarmed vessel
+    /// always gets `Idle`.
     pub fn tick(
         &mut self,
         now: Timestamp,
@@ -352,9 +376,23 @@ impl Supervisor {
         let low_voltage = voltage_v < self.cfg.low_voltage_v;
         let critical_voltage = voltage_v < self.cfg.critical_voltage_v;
 
+        // Report staleness ages against the last *finite* reading, the same
+        // guard as immediately above: a non-finite report never overwrote
+        // the voltage, so for the same reason it must not count as a report
+        // either, or a vessel with no power link at all (permanently
+        // non-finite) would eventually read as stale despite no report ever
+        // having existed to go stale.
+        if power.voltage_v.is_finite() {
+            self.last_report_t = Some(power.t);
+        }
+        let power_stale = self
+            .last_report_t
+            .is_some_and(|t| now.saturating_duration_since(t) > self.cfg.power_stale_after);
+
         self.last_tick = Some(TickCache {
             level: health.level,
             voltage_v,
+            power_stale,
         });
 
         if critical_voltage {
@@ -400,6 +438,7 @@ impl Supervisor {
             conn: self.conn,
             failsafe,
             low_voltage,
+            power_stale,
         }
     }
 }
