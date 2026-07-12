@@ -94,8 +94,9 @@ ordering anything.
 - Closed: the actuator serial link is a manifest `actuator_uart` bus now
   (D-026/D-027), mapped via `--port <bus_id>=<device>` like any other bus;
   an unmapped bus carrying effectors is a boot error (self-sufficiency,
-  D-009). RC remains the one CLI option, not a manifest bus; promoting it
-  into the schema is an open item recorded in the code.
+  D-009). RC is a manifest `crsf_uart` bus too now (D-025, `[rc]` names it),
+  mapped the same way; a declared `[rc]` with its bus unmapped, or a mapped
+  crsf_uart bus with no `[rc]` section, are both boot errors.
 - Baud for the GNSS bus comes from the manifest bus entry; confirm the
   chosen compass actually speaks its rated sentences at that baud with
   heading at 5 Hz or better.

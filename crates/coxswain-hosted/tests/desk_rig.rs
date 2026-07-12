@@ -11,35 +11,37 @@
 //! with the others.
 //!
 //! The manifest (`MANIFEST_TEMPLATE`) declares a twin differential thruster
-//! pair on an `actuator_uart` bus (D-026/D-027): allocation runs inside the
-//! binary under test, so every rig now needs that bus mapped to a pty too
-//! (self-sufficiency, D-009), even the ones that never arm thrust.
+//! pair on an `actuator_uart` bus (D-026/D-027) and an RC hand controller on
+//! a `crsf_uart` bus (D-025, `[rc]`): allocation and the RC boot-error check
+//! both run inside the binary under test, so every rig now needs both buses
+//! mapped to a pty too (self-sufficiency, D-009), even the ones that never
+//! arm thrust or drive RC.
 //!
 //! - `gnss_fusion_rig`: boots the binary with the GNSS bus mapped to a pty
-//!   (plus the actuator bus, drained but otherwise unused). A harness-side
-//!   `coxswain-sim` plant is truth; every 200 ms (5 Hz, both sentences, per
-//!   the 2026-07-10 experiment's conclusion that 5 Hz heading suffices
-//!   without a gyro) it's rendered into checksummed GGA+HDT and written to
-//!   the pty master. Asserts the binary's estimator converges on truth and
-//!   the tick loop never gapped.
-//! - `rc_authority_rig`: boots the binary with the GNSS bus plus the RC and
-//!   actuator ports all mapped to ptys (the actuator link is a manifest bus
-//!   now, mapped via `--port` like any other), closing the full physical
-//!   loop (allocated thruster outputs -> harness plant -> truth -> GNSS
-//!   sentences -> the binary's estimator). Scripts a teleop arm (over
-//!   Keelson, the existing claimant path; RC has no arm switch of its own,
-//!   D-025's kill-first sequencing), an RC takeover preempting teleop by
-//!   manifest priority, stick effort driving the plant, a kill disarming
-//!   it, and a kill release. See that test's doc comment for why the final
-//!   assertion is "the RC claimant's link stays alive", not "thrust
-//!   resumes": nothing in the RC adapter re-arms.
-//! - `power_report_rig`: boots the binary with the GNSS bus and the
-//!   actuator bus mapped, no RC. Writes `$CXPWR` reports on the actuator
-//!   pty master (the real link's reverse direction, coxswain-drivers::
-//!   actuator_serial's module doc comment) and asserts the failsafe matrix
-//!   v1's report-only low-voltage behavior (a fresh arm attempt refused,
-//!   the existing armed state untouched) followed by a critical-voltage
-//!   forced disarm.
+//!   (plus the actuator and RC buses, drained but otherwise unused). A
+//!   harness-side `coxswain-sim` plant is truth; every 200 ms (5 Hz, both
+//!   sentences, per the 2026-07-10 experiment's conclusion that 5 Hz
+//!   heading suffices without a gyro) it's rendered into checksummed
+//!   GGA+HDT and written to the pty master. Asserts the binary's estimator
+//!   converges on truth and the tick loop never gapped.
+//! - `rc_authority_rig`: boots the binary with the GNSS, RC, and actuator
+//!   buses all mapped to ptys (`--port rc0=<pty>`, same as every other bus;
+//!   D-025 retired the old `--rc-port`/`--rc-claimant-id` CLI pair), closing
+//!   the full physical loop (allocated thruster outputs -> harness plant ->
+//!   truth -> GNSS sentences -> the binary's estimator). Scripts a teleop
+//!   arm (over Keelson, the existing claimant path; RC has no arm switch of
+//!   its own, D-025's kill-first sequencing), an RC takeover preempting
+//!   teleop by manifest priority, stick effort driving the plant, a kill
+//!   disarming it, and a kill release. See that test's doc comment for why
+//!   the final assertion is "the RC claimant's link stays alive", not
+//!   "thrust resumes": nothing in the RC adapter re-arms.
+//! - `power_report_rig`: boots the binary with the GNSS, actuator, and RC
+//!   buses mapped, the RC pty left idle (this scenario never drives it).
+//!   Writes `$CXPWR` reports on the actuator pty master (the real link's
+//!   reverse direction, coxswain-drivers::actuator_serial's module doc
+//!   comment) and asserts the failsafe matrix v1's report-only low-voltage
+//!   behavior (a fresh arm attempt refused, the existing armed state
+//!   untouched) followed by a critical-voltage forced disarm.
 //! - `rudderboat_direct_effort_rig`: a second manifest fixture
 //!   (`RUDDERBOAT_MANIFEST_TEMPLATE`), the underactuated ESC-plus-rudder
 //!   shape from crates/coxswain-manifest/tests/rudderboat.toml, teleop
@@ -156,7 +158,9 @@ fn origin() -> GeoPoint {
 /// Minimal manifest for the desk rig: one nmea0183_uart bus carrying both a
 /// gnss and a heading sensor over the driver this task wires up (Phase 6),
 /// no IMU (the 2026-07-10 experiment's no-gyro-suffices conclusion), a
-/// teleop and an RC claimant at the priorities D-025 needs, geofence off.
+/// teleop and an RC claimant at the priorities D-025 needs (`[rc]` names
+/// the `rc0` crsf_uart bus below, mirroring rudderboat.toml's shape),
+/// geofence off.
 /// `{PORT}` is substituted with the gnss pty's slave path per test: the
 /// manifest declares a logical bus id, and the actual `/dev` path is a
 /// `--port` CLI argument (never manifest data), but the compiler doesn't
@@ -188,6 +192,12 @@ id       = "actuator"
 kind     = "actuator_uart"
 port     = "actuator0"
 baud     = 115200
+
+[[bus]]
+id       = "rc0"
+kind     = "crsf_uart"
+port     = "rc0"
+# baud omitted: defaults to 420000, CRSF's real link rate
 
 [[effector]]
 id      = "thruster_port"
@@ -233,6 +243,19 @@ driver  = "nmea0183"
 bus     = "gnss0183"
 license = "inner_loop"
 
+[rc]
+bus                = "rc0"
+claimant           = 1
+kill_channel       = 4
+takeover_channel   = 5
+surge_channel      = 2
+yaw_channel        = 3
+switch_low_us      = 1300
+switch_high_us     = 1700
+stick_deadband_us  = 12
+max_surge_n        = 150.0
+max_yaw_nm         = 60.0
+
 [[claimant]]
 name     = "teleop"
 id       = 7
@@ -266,9 +289,11 @@ low_voltage_v               = 12.4
 critical_voltage_v          = 11.8
 "#;
 
-fn build_blob() -> (Vec<u8>, String) {
-    let manifest =
-        coxswain_manifest::compile(MANIFEST_TEMPLATE).expect("desk-rig manifest compiles");
+/// Compiles and signs an arbitrary manifest TOML, shared by every `build_*`
+/// helper below (and the boot-error tests, which each need a one-off
+/// variant of `MANIFEST_TEMPLATE`).
+fn compile_and_sign(manifest_toml: &str) -> (Vec<u8>, String) {
+    let manifest = coxswain_manifest::compile(manifest_toml).expect("desk-rig manifest compiles");
     let seed: [u8; 32] = SEED.try_into().expect("seed file is 32 bytes");
     let blob = coxswain_manifest::write(&manifest, &seed);
     let pubkey_hex: String = coxswain_manifest::public_key(&seed)
@@ -276,6 +301,10 @@ fn build_blob() -> (Vec<u8>, String) {
         .map(|b| format!("{b:02x}"))
         .collect();
     (blob, pubkey_hex)
+}
+
+fn build_blob() -> (Vec<u8>, String) {
+    compile_and_sign(MANIFEST_TEMPLATE)
 }
 
 /// The underactuated rudderboat shape (crates/coxswain-manifest/tests/
@@ -380,15 +409,7 @@ critical_voltage_v          = 11.4
 "#;
 
 fn build_rudderboat_blob() -> (Vec<u8>, String) {
-    let manifest = coxswain_manifest::compile(RUDDERBOAT_MANIFEST_TEMPLATE)
-        .expect("rudderboat desk-rig manifest compiles");
-    let seed: [u8; 32] = SEED.try_into().expect("seed file is 32 bytes");
-    let blob = coxswain_manifest::write(&manifest, &seed);
-    let pubkey_hex: String = coxswain_manifest::public_key(&seed)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    (blob, pubkey_hex)
+    compile_and_sign(RUDDERBOAT_MANIFEST_TEMPLATE)
 }
 
 // -------------------------------------------------------------------- pty
@@ -1026,9 +1047,10 @@ const STICK_HIGH_US: u16 = 2012; // full deflection, channel_to_us's own nominal
 // ------------------------------------------------------------------ tests
 
 /// The 0183 GNSS half: real pty bytes in, fused position out. No claimant:
-/// isolates the read path this task adds. The manifest's actuator_uart bus
-/// still needs a mapped port (self-sufficiency, D-009: it carries
-/// effectors), so a pty stands in here too, drained but otherwise unused.
+/// isolates the read path this task adds. The manifest's actuator_uart and
+/// crsf_uart (RC) buses still need a mapped port each (self-sufficiency,
+/// D-009: one carries effectors, the other `[rc]`), so a pty stands in for
+/// both here too, unused (RC) or drained (actuator).
 #[test]
 fn gnss_fusion_rig() {
     let tmp = make_tmp("gnss");
@@ -1040,6 +1062,10 @@ fn gnss_fusion_rig() {
     let plant = PlantLoop::start(gnss_master, None);
     let (actuator_master, actuator_slave) = open_pty_pair();
     let _actuator_drain = spawn_cxout_reader(actuator_master);
+    // Kept alive (bound, not dropped) for the whole test: nothing needs to
+    // write to it or read from it, but a dropped master would close the
+    // slave the vessel is holding open.
+    let (_rc_master, rc_slave) = open_pty_pair();
 
     let (mut vessel, status_rx) = spawn_vessel(
         &blob_path,
@@ -1050,6 +1076,8 @@ fn gnss_fusion_rig() {
             format!("gnss0183={gnss_slave}"),
             "--port".to_string(),
             format!("actuator={actuator_slave}"),
+            "--port".to_string(),
+            format!("rc0={rc_slave}"),
         ],
     );
 
@@ -1140,10 +1168,8 @@ fn rc_authority_rig() {
         &[
             "--port".to_string(),
             format!("gnss0183={gnss_slave}"),
-            "--rc-port".to_string(),
-            rc_slave,
-            "--rc-claimant-id".to_string(),
-            "1".to_string(),
+            "--port".to_string(),
+            format!("rc0={rc_slave}"),
             "--port".to_string(),
             format!("actuator={actuator_slave}"),
         ],
@@ -1277,7 +1303,8 @@ const TICK_S: f64 = 0.1;
 /// reopened fresh here, and the module doc comment's own rationale for
 /// splitting applies just as much to a third independent script as to the
 /// second. No RC needed: only a teleop claimant (over Keelson) to observe
-/// the arm/disarm reaction.
+/// the arm/disarm reaction; the manifest's crsf_uart bus still gets a pty
+/// mapped (self-sufficiency, D-009: `[rc]` names it), left idle.
 #[test]
 fn power_report_rig() {
     let tmp = make_tmp("power");
@@ -1287,6 +1314,9 @@ fn power_report_rig() {
 
     let (gnss_master, gnss_slave) = open_pty_pair();
     let (actuator_master, actuator_slave) = open_pty_pair();
+    // Kept alive (bound, not dropped) for the whole test, same reasoning as
+    // `gnss_fusion_rig`'s own `_rc_master`.
+    let (_rc_master, rc_slave) = open_pty_pair();
     let power_writer = actuator_master
         .try_clone()
         .expect("clone the actuator pty master for writing $CXPWR");
@@ -1337,6 +1367,8 @@ fn power_report_rig() {
             format!("gnss0183={gnss_slave}"),
             "--port".to_string(),
             format!("actuator={actuator_slave}"),
+            "--port".to_string(),
+            format!("rc0={rc_slave}"),
         ],
     );
 
@@ -1437,6 +1469,108 @@ fn power_report_rig() {
     let _ = vessel.wait();
     let _ = zenohd.kill();
     let _ = zenohd.wait();
+}
+
+// ------------------------------------------------------------ boot errors
+//
+// D-025's RC promotion (main.rs's port-map and self-sufficiency checks):
+// [rc] names a crsf_uart bus, mapped via --port like any other bus. Both
+// ends of that contract are boot errors, not silent gaps: a declared claim
+// with nowhere to read its wiring from (the takeover path must terminate at
+// the conn node, D-009), and a mapped bus nobody claims (a stray
+// commissioning mapping). Neither scenario reaches the tick loop or opens a
+// zenoh session, so `Command::output` (which blocks for exit) is the right
+// tool, unlike `spawn_vessel`'s piped-stdout-and-keep-running pattern used
+// by the rigs above.
+
+/// `MANIFEST_TEMPLATE` with its `[rc]` table cut out: the `rc0` crsf_uart
+/// bus stays declared (nothing else references it), so the manifest still
+/// compiles (`[rc]` is optional, coxswain-manifest's own doc comment on
+/// `RcEntry`), but nothing in it claims that bus anymore.
+fn manifest_without_rc_section() -> String {
+    let start = MANIFEST_TEMPLATE
+        .find("\n[rc]\n")
+        .expect("MANIFEST_TEMPLATE declares [rc]");
+    let end = MANIFEST_TEMPLATE[start..]
+        .find("\n[[claimant]]\n")
+        .map(|offset| start + offset)
+        .expect("a [[claimant]] table follows [rc] in MANIFEST_TEMPLATE");
+    format!(
+        "{}{}",
+        &MANIFEST_TEMPLATE[..start],
+        &MANIFEST_TEMPLATE[end..]
+    )
+}
+
+/// Spawns the binary expecting a boot error: `run()` returns before the
+/// tick loop or the Keelson session ever start, so the process exits
+/// quickly on its own, no bring-up wait or kill needed. Asserts a nonzero
+/// exit and that stderr names the specific gap.
+fn assert_boot_error(
+    blob_path: &std::path::Path,
+    pubkey_hex: &str,
+    ports: &[(&str, &str)],
+) -> String {
+    let mut args = vec![
+        "--manifest".to_string(),
+        blob_path.to_str().unwrap().to_string(),
+        "--pubkey".to_string(),
+        pubkey_hex.to_string(),
+    ];
+    for (bus, path) in ports {
+        args.push("--port".to_string());
+        args.push(format!("{bus}={path}"));
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_coxswain-hosted"))
+        .args(&args)
+        .output()
+        .expect("spawn coxswain-hosted");
+    assert!(
+        !output.status.success(),
+        "expected a boot error, exited {:?}",
+        output.status
+    );
+    String::from_utf8(output.stderr).expect("stderr is UTF-8")
+}
+
+/// `[rc]` declared, `rc0` never mapped: the RC-specific half of D-009's
+/// self-sufficiency check (main.rs's `if bus.kind == BusKind::CrsfUart`
+/// branch). GNSS and actuator are "mapped" to paths that are never actually
+/// opened (this check runs, and fails, before any real serial I/O), so the
+/// RC gap is the only thing that can trip here.
+#[test]
+fn rc_declared_but_bus_unmapped_is_a_boot_error() {
+    let tmp = make_tmp("rc-unmapped");
+    let (blob, pubkey_hex) = build_blob();
+    let blob_path = tmp.0.join("desk-rig.cxmanifest");
+    std::fs::write(&blob_path, &blob).unwrap();
+
+    let stderr = assert_boot_error(
+        &blob_path,
+        &pubkey_hex,
+        &[("gnss0183", "/dev/null"), ("actuator", "/dev/null")],
+    );
+    assert!(
+        stderr.contains("rc0") && stderr.contains("self-sufficiency"),
+        "stderr did not name the unmapped rc0 bus: {stderr:?}"
+    );
+}
+
+/// `rc0` mapped, no `[rc]` section: the reverse gap, checked while building
+/// the port map itself (main.rs's `--port` validation loop), before the
+/// self-sufficiency pass ever runs.
+#[test]
+fn crsf_bus_mapped_but_no_rc_section_is_a_boot_error() {
+    let tmp = make_tmp("rc-stray");
+    let (blob, pubkey_hex) = compile_and_sign(&manifest_without_rc_section());
+    let blob_path = tmp.0.join("desk-rig.cxmanifest");
+    std::fs::write(&blob_path, &blob).unwrap();
+
+    let stderr = assert_boot_error(&blob_path, &pubkey_hex, &[("rc0", "/dev/null")]);
+    assert!(
+        stderr.contains("rc0") && stderr.contains("[rc]"),
+        "stderr did not name the stray rc0 mapping: {stderr:?}"
+    );
 }
 
 /// The underactuated rudderboat shape, direct-effort half: teleop's

@@ -6,22 +6,24 @@
 # on, the network coming up. Keelson/zenoh (--connect/--listen below) is
 # enrichment; its absence at boot is not a startup failure.
 #
-# Placeholders below (manifest path, pubkey, --port bus=device mappings, RC
-# device path) are per-vessel commissioning data, filled in when the unit is
-# installed, not shipped as-is.
+# Placeholders below (manifest path, pubkey, --port bus=device mappings) are
+# per-vessel commissioning data, filled in when the unit is installed, not
+# shipped as-is. Bus ids (gnss_serial, actuator_bridge, rc_link) match
+# crates/coxswain-manifest/tests/rudderboat.toml's example vessel; RC is a
+# manifest bus like any other (D-025), not a separate flag.
 
 [Unit]
 Description=Coxswain vessel control and autonomy stack
 # No After=/Requires=/Wants= on networking: see the comment above.
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/local/bin/coxswain-hosted \
     --manifest /etc/coxswain/vessel.cxmanifest \
     --pubkey /etc/coxswain/vessel.pubkey \
     --port gnss_serial=/dev/ttyUSB0 \
     --port actuator_bridge=/dev/ttyUSB2 \
-    --rc-port /dev/ttyUSB1 --rc-claimant-id 1
+    --port rc_link=/dev/ttyUSB1
     # --connect tcp/<companion-computer>:7447   # Keelson/zenoh, optional
 
 # The control loop is the vessel's safety-critical process: if it dies,
@@ -32,11 +34,13 @@ ExecStart=/usr/local/bin/coxswain-hosted \
 Restart=always
 RestartSec=1
 
-# Optional: have systemd itself watch a liveness ping if/when the binary
-# grows sd_notify(WATCHDOG=1) support (it does not yet). Uncomment both
-# lines together; a WatchdogSec with no pings from the process just kills it
-# on schedule.
-# WatchdogSec=5
+# The binary pings sd_notify(WATCHDOG=1) once per control tick, rate-limited
+# to 1 Hz (coxswain-hosted/src/sd_notify.rs); with Type=notify above this
+# lets systemd kill and restart a wedged-but-alive process, the case
+# Restart=always alone cannot see. Complements, rather than replaces, the H7
+# profile's own hardware watchdog note above: that one is board-level and a
+# later phase, this one is process-level and covers this unit today.
+WatchdogSec=5
 
 [Install]
 WantedBy=multi-user.target

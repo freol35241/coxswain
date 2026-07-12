@@ -1,8 +1,8 @@
 //! The Linux-hosted profile binary: manifest from file, zenoh session up
 //! (Phase 5). I/O backend is the simulator by default, or real serial ports
-//! per manifest bus plus RC (Phase 6; docs/TASKS.md "coxswain-hosted
-//! on real /dev ports"); the actuator link is a manifest bus too (D-026/
-//! D-027 Phase 6b), mapped the same way as any other.
+//! per manifest bus (Phase 6; docs/TASKS.md "coxswain-hosted on real /dev
+//! ports"); the actuator link and RC are manifest buses too (D-026/D-027
+//! Phase 6b, D-025), mapped the same way as any other.
 //!
 //! One monotonic clock drives everything: `Timestamp` is nanoseconds since
 //! boot from `std::time::Instant`, and every measurement (simulated or read
@@ -33,6 +33,7 @@ use coxswain_nmea0183::Quirks as Nmea0183ParserQuirks;
 use coxswain_sim::{GnssModel, HeadingModel, Simulator, YawRateModel};
 use zenoh::Wait;
 
+mod sd_notify;
 mod serial;
 mod udp;
 
@@ -58,35 +59,9 @@ const SIM_SEED: u64 = 1;
 const NMEA0183_FALLBACK_STD_M: f64 = 25.0;
 const NMEA0183_HEADING_STD_RAD: f64 = 0.02;
 
-// RC is conn-node-local serial (`Args` doc comment), with no manifest bus to
-// carry a baud, so the profile fixes one. CRSF's real link runs 420000 baud,
-// which is not a POSIX `Bxxxx` rate; on Linux `serial::open_serial` reaches
-// for termios2/BOTHER to hit it exactly (see serial.rs). The actuator link
-// is a manifest bus now (D-026/D-027): its baud comes from the bus entry's
-// own `rate`, same as the GNSS bus.
-const RC_BAUD_HINT: u32 = 420_000;
-
-/// RC channel mapping and stick/switch thresholds: CRSF/ELRS convention,
-/// not yet manifest-configurable (the schema has no place to declare RC
-/// today, same open item as the port itself).
-fn rc_config() -> rc::Config {
-    rc::Config {
-        kill_channel: 4,
-        takeover_channel: 5,
-        surge_channel: 2,
-        yaw_channel: 3,
-        switch_low_us: 1300,
-        switch_high_us: 1700,
-        stick_deadband_us: 12,
-        max_surge_n: 150.0,
-        max_yaw_nm: 60.0,
-    }
-}
-
 const USAGE: &str = "usage: coxswain-hosted --manifest <blob.cxmanifest> --pubkey <hex-or-file> \
                      [--connect <endpoint>] [--listen <endpoint>] [--sim] \
-                     [--port <bus_id>=<device>]... \
-                     [--rc-port <device> --rc-claimant-id <id>]";
+                     [--port <bus_id>=<device>]...";
 
 /// Where the simulated vessel floats when the manifest has no geofence: off
 /// Gothenburg, same waters as the Seahorse example and the closed-loop tests.
@@ -109,19 +84,13 @@ struct Args {
     /// Manifest bus id -> real device path, repeated (`--port a=/dev/x
     /// --port b=/dev/y`). Logical port names, not Linux paths (the manifest
     /// declares peripherals, not a host filesystem). The actuator_uart bus
-    /// (D-026/D-027) is mapped the same way as the GNSS bus now; RC remains
-    /// the one conn-node-local link with no manifest bus of its own (below).
+    /// (D-026/D-027) and the crsf_uart RC bus (D-025) are mapped the same
+    /// way as the GNSS bus.
     ports: Vec<(String, String)>,
-    /// RC is conn-node-local serial, not a manifest bus today (the schema
-    /// has no place to declare it yet); these CLI options stand in until
-    /// that lands.
-    rc_port: Option<String>,
-    rc_claimant_id: Option<u16>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let (mut manifest, mut pubkey, mut connect, mut listen) = (None, None, None, None);
-    let (mut rc_port, mut rc_claimant_id) = (None, None);
     let mut sim = false;
     let mut ports = Vec::new();
     let mut iter = args.iter();
@@ -141,20 +110,12 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 let (bus, path) = raw.split_once('=').ok_or(USAGE)?;
                 ports.push((bus.to_string(), path.to_string()));
             }
-            "--rc-port" => value(&mut rc_port)?,
-            "--rc-claimant-id" => {
-                let raw = iter.next().ok_or(USAGE)?;
-                rc_claimant_id = Some(raw.parse::<u16>().map_err(|_| USAGE)?);
-            }
             _ => return Err(USAGE.to_string()),
         }
     }
     let (Some(manifest), Some(pubkey)) = (manifest, pubkey) else {
         return Err(USAGE.to_string());
     };
-    if rc_port.is_some() != rc_claimant_id.is_some() {
-        return Err("--rc-port and --rc-claimant-id must be given together".to_string());
-    }
     if sim && !ports.is_empty() {
         return Err("--sim and --port are mutually exclusive I/O backends".to_string());
     }
@@ -165,8 +126,6 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         listen,
         sim,
         ports,
-        rc_port,
-        rc_claimant_id,
     })
 }
 
@@ -462,14 +421,12 @@ fn effector_limits(kind: &EffectorKind) -> (f64, f64) {
 /// Groups the compiled manifest's effectors by their `actuator_uart` bus,
 /// channel-ordered, one group per bus that has at least one effector on it.
 /// Channels are positional on the wire (`$CXOUT` fields are field `i` for
-/// channel `i`), so a bus whose declared channels are not contiguous from 0
-/// is a boot error here rather than a silently misrendered line; this is a
-/// manifest-shape check, so it runs regardless of sim vs. real-serial mode.
-/// Simple by design (CLAUDE.md): this graduates to a manifest compile rule
-/// in v0.4.x once the schema settles further, per D-022's sequencing.
+/// channel `i`); `coxswain-manifest::compile` already refuses a bus whose
+/// declared channels are not contiguous from 0 (v0.5), so this function only
+/// sorts into wire order, it doesn't re-check that rule.
 fn actuator_bus_channels(
     manifest: &coxswain_manifest::CompiledManifest,
-) -> Result<Vec<(String, Vec<EffectorChannel>)>, String> {
+) -> Vec<(String, Vec<EffectorChannel>)> {
     let mut by_bus: HashMap<&str, Vec<(u16, EffectorChannel)>> = HashMap::new();
     for (i, entry) in manifest.effectors.as_slice().iter().enumerate() {
         let (max_pos, max_neg) = effector_limits(&manifest.config.effectors.as_slice()[i].kind);
@@ -493,21 +450,12 @@ fn actuator_bus_channels(
             continue;
         };
         entries.sort_by_key(|(channel, _)| *channel);
-        for (expected, (channel, _)) in entries.iter().enumerate() {
-            if *channel as usize != expected {
-                return Err(format!(
-                    "bus {:?}: effector channels must be contiguous from 0 (found channel \
-                     {channel} at position {expected})",
-                    bus.id.as_str()
-                ));
-            }
-        }
         out.push((
             bus.id.as_str().to_string(),
             entries.into_iter().map(|(_, ch)| ch).collect(),
         ));
     }
-    Ok(out)
+    out
 }
 
 /// Physical output (newtons or radians, the allocator's per-effector value)
@@ -679,14 +627,14 @@ fn run() -> Result<(), String> {
     // Effector render table (D-026/D-027), grouped by actuator_uart bus and
     // channel-validated regardless of sim vs. real-serial mode (see the
     // function doc comment).
-    let actuator_groups = actuator_bus_channels(&manifest)?;
+    let actuator_groups = actuator_bus_channels(&manifest);
 
     // Bus port map: logical manifest bus id -> real device path (not a
     // Linux path the manifest itself carries: buses name conn-node
-    // peripherals). nmea0183_uart and actuator_uart buses have a driver in
-    // this profile (Phase 6's GNSS-over-0183 item, Phase 6b's $CXOUT item);
-    // mapping any other bus kind is rejected rather than silently doing
-    // nothing.
+    // peripherals). nmea0183_uart, actuator_uart, and crsf_uart buses have a
+    // driver in this profile (Phase 6's GNSS-over-0183 item, Phase 6b's
+    // $CXOUT item, D-025's RC item); mapping any other bus kind is rejected
+    // rather than silently doing nothing.
     let mut port_map: HashMap<&str, &str> = HashMap::new();
     for (bus_id, path) in &args.ports {
         let bus = manifest
@@ -694,10 +642,23 @@ fn run() -> Result<(), String> {
             .iter()
             .find(|b| b.id.as_str() == bus_id)
             .ok_or_else(|| format!("--port {bus_id}=...: no such bus in the manifest"))?;
-        if !matches!(bus.kind, BusKind::Nmea0183Uart | BusKind::ActuatorUart) {
+        if !matches!(
+            bus.kind,
+            BusKind::Nmea0183Uart | BusKind::ActuatorUart | BusKind::CrsfUart
+        ) {
             return Err(format!(
                 "--port {bus_id}=...: bus kind {:?} has no driver in this hosted profile yet",
                 bus.kind
+            ));
+        }
+        // A mapped crsf_uart bus that no `[rc]` section names is a stray
+        // mapping (a commissioning mistake, D-025): the RC adapter has
+        // nowhere to read its wiring from, so it would never be built.
+        if bus.kind == BusKind::CrsfUart
+            && manifest.rc.as_ref().map(|rc| rc.bus.as_str()) != Some(bus_id.as_str())
+        {
+            return Err(format!(
+                "--port {bus_id}=...: bus is crsf_uart but no [rc] section names it"
             ));
         }
         port_map.insert(bus_id.as_str(), path.as_str());
@@ -731,6 +692,24 @@ fn run() -> Result<(), String> {
                 }
                 // No effectors on this bus: nothing to actuate, so an
                 // unmapped actuator_uart bus here is inert, not a gap.
+                continue;
+            }
+            if bus.kind == BusKind::CrsfUart {
+                if manifest.rc.as_ref().map(|rc| rc.bus.as_str()) == Some(bus.id.as_str()) {
+                    // The takeover path must terminate at the conn node
+                    // (D-009 self-sufficiency, extended to the human input
+                    // path by D-025): a declared RC claimant with no way to
+                    // hear its receiver is not a degraded mode, it's a boot
+                    // error.
+                    return Err(format!(
+                        "bus {:?} carries [rc] but has no --port mapping \
+                         (self-sufficiency, D-009): pass --port {}=<device>",
+                        bus.id.as_str(),
+                        bus.id.as_str()
+                    ));
+                }
+                // No [rc] section references this bus: nothing to read, so
+                // an unmapped crsf_uart bus here is inert, not a gap.
                 continue;
             }
             let inner_loop_here = manifest
@@ -863,23 +842,40 @@ fn run() -> Result<(), String> {
         }
     }
 
-    // RC and the actuator link: conn-node-local serial, not manifest buses
-    // today (see the `Args` doc comment); an open item is promoting them
-    // into the schema alongside the other conn-node peripherals.
-    let rc_claimant = args.rc_claimant_id.map(ClaimantId);
-    let mut rc_link = match (&args.rc_port, rc_claimant) {
-        (Some(path), Some(id)) => {
-            let port =
-                serial::open_serial(path, RC_BAUD_HINT).map_err(|e| format!("{path}: {e}"))?;
-            Some((
-                spawn_byte_reader(port, boot),
-                FrameReader::new(),
-                RcAdapter::new(rc_config()),
-                id,
-            ))
-        }
-        _ => None,
-    };
+    // RC (D-025): `[rc]` names a crsf_uart bus, mapped via --port exactly
+    // like the GNSS and actuator buses above; the boot-error checks above
+    // guarantee the bus is in `port_map` whenever `manifest.rc` is declared
+    // and this profile isn't running the simulator backend (`port_map` is
+    // empty there, so `rc_link` simply stays `None`, same as an unmapped
+    // actuator_uart bus leaves `actuator_links` empty). The baud comes from
+    // the bus entry's own `rate`, same as the GNSS and actuator buses.
+    let mut rc_link = None;
+    if let Some(rc_entry) = manifest.rc
+        && let Some(&path) = port_map.get(rc_entry.bus.as_str())
+    {
+        let bus = manifest
+            .buses
+            .iter()
+            .find(|b| b.id.as_str() == rc_entry.bus.as_str())
+            .expect("rc.bus is a validated BusEntry::id reference (coxswain-manifest::compile)");
+        let port = serial::open_serial(path, bus.rate).map_err(|e| format!("{path}: {e}"))?;
+        rc_link = Some((
+            spawn_byte_reader(port, boot),
+            FrameReader::new(),
+            RcAdapter::new(rc::Config {
+                kill_channel: rc_entry.kill_channel as usize,
+                takeover_channel: rc_entry.takeover_channel as usize,
+                surge_channel: rc_entry.surge_channel as usize,
+                yaw_channel: rc_entry.yaw_channel as usize,
+                switch_low_us: rc_entry.switch_low_us,
+                switch_high_us: rc_entry.switch_high_us,
+                stick_deadband_us: rc_entry.stick_deadband_us,
+                max_surge_n: rc_entry.max_surge_n,
+                max_yaw_nm: rc_entry.max_yaw_nm,
+            }),
+            ClaimantId(rc_entry.claimant),
+        ));
+    }
     // Each mapped actuator_uart bus is bidirectional (D-021 "command-then-
     // report lite"): `port` stays open for `write_outputs`, and a
     // `try_clone` duplicates the fd for a reader thread on the same pattern
@@ -913,11 +909,14 @@ fn run() -> Result<(), String> {
     let mut power_report_received = false;
 
     let mut core = Core::new(&manifest.config);
-    // Register the RC claimant at boot with its manifest-authored id (the
-    // seahorse example's `[[claimant]] name = "rc"`), same as any other
-    // claimant needs registering before it can request the conn.
-    if let Some(rc_id) = rc_claimant {
-        core.register(rc_id, now_ts(&boot))
+    // Register the RC claimant at boot with its manifest-authored id
+    // (`[rc].claimant`, the rudderboat example's `[[claimant]] name = "rc"`),
+    // same as any other claimant needs registering before it can request the
+    // conn. Only when the link actually opened (`rc_link` is `None` in sim
+    // mode, same as `actuator_links` stays empty there): nothing to register
+    // for otherwise.
+    if let Some((_, _, _, rc_id)) = &rc_link {
+        core.register(*rc_id, now_ts(&boot))
             .map_err(|e| format!("rc claimant {}: {e:?}", rc_id.0))?;
     }
     let mut rc_kill_engaged = false;
@@ -925,6 +924,13 @@ fn run() -> Result<(), String> {
     let session = open_session(&args)?;
     let mut endpoint = VesselEndpoint::new(session, "keelson", manifest.vessel_id.as_str())
         .map_err(|e| format!("keelson endpoint: {e}"))?;
+
+    // Boot complete (manifest verified, buses mapped, zenoh session up):
+    // tell systemd, if it's listening (`$NOTIFY_SOCKET` unset otherwise, the
+    // no-op case). `contrib/coxswain.service`'s `Type=notify` waits for
+    // exactly this before treating the unit as started.
+    let mut notifier = sd_notify::Notifier::from_env();
+    notifier.ready();
 
     // Publish failures must not stop the loop; log the first error kind once
     // so a dead router does not flood stderr at 10 Hz.
@@ -963,6 +969,15 @@ fn run() -> Result<(), String> {
             std::thread::sleep(remaining);
         }
         let tick_start = Instant::now();
+        // A liveness ping every tick, rate-limited to 1 Hz internally
+        // (`Notifier::watchdog`'s own doc comment): pairs with
+        // `contrib/coxswain.service`'s `WatchdogSec=5`, so systemd kills and
+        // restarts a wedged-but-alive process, the case `Restart=always`
+        // alone cannot see. Complements, not replaces, the H7 profile's own
+        // hardware watchdog (`conn_node.watchdog_ms`): that one is Phase 8
+        // and covers the board itself; this one exists today and only
+        // covers the Linux process.
+        notifier.watchdog(tick_start);
         if let Some(prev) = prev_tick_start {
             interval_max = interval_max.max(tick_start - prev);
         }
