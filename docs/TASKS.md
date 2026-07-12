@@ -189,7 +189,8 @@ this before freezing far-end firmware.
       host profile. Earns its place when the estimator consumes covariance and
       RTK status, and not before.
 - [x] NMEA 2000 listen-only decode for the initial PGN set; enrichment path
-      only.
+      only. (Fast-packet reassembly and PGN 129029 landed after this line was
+      checked, plus hosted SocketCAN wiring end to end, vcan-tested in CI.)
 - [x] 0183-over-UDP bus: listen socket, source_ip pinning enforcement,
       enrichment cap when unpinned.
 

@@ -113,20 +113,24 @@ the vessel keeps station.
 
 Phase 6 and 7 software is done except what needs a bench or a device.
 Landed: NMEA 0183 over serial and UDP feeding the estimator (GNSS fix,
-heading), a CRSF RC claimant with a hardware kill switch, power
-monitoring from the actuator link into the failsafe matrix, and NMEA
-2000 listen-only decode for the initial PGN set (enrichment only, not
-yet wired to a CAN interface). Phase 6b added control allocation
+heading), a CRSF RC claimant with a hardware kill switch (RC and the
+actuator link both manifest-declared buses), power monitoring from the
+actuator link into the failsafe matrix with staleness detection (no
+known telemetry-rot gaps left in the matrix), and NMEA 2000
+listen-only decode wired end to end on the hosted profile over
+SocketCAN (enrichment only, vcan-tested in CI). Field data has a
+capture-to-replay path too: `--record-nmea` taps a 0183 bus before the
+parser, and `cxconvert` (coxswain-replay) turns the raw log into a
+replay-harness measurement log. Phase 6b added control allocation
 (D-026/D-027): a conn-node allocation stage maps guidance's generalized
 force onto a manifest-declared effector table (thrusters, rudder), the
 actuator wire carries per-channel outputs (`$CXOUT`, replacing the
 tau-carrying `$CXACT`), and a hull without sway authority gets a
 drift-and-reapproach hold in place of a point hold.
 
-What remains needs hardware: IMU/mag drivers, CAN wiring for Cyphal and
-NMEA 2000, Cyphal actuator nodes, Septentrio SBF, the H7 conn-node
-firmware, and the water itself. Sequenced in
-[docs/TASKS.md](docs/TASKS.md).
+What remains needs hardware: IMU/mag drivers, Cyphal CAN wiring and
+actuator nodes, Septentrio SBF, the H7 conn-node firmware, and the
+water itself. Sequenced in [docs/TASKS.md](docs/TASKS.md).
 
 ## Layout
 
@@ -145,7 +149,8 @@ firmware, and the water itself. Sequenced in
 | `coxswain-drivers` | The driver trait and timestamping policy, plus the drivers built on it: NMEA 0183 GNSS/heading, CRSF RC, and the `$CXOUT` actuator serial backend. |
 | `coxswain-nmea0183` | Strict no_std NMEA 0183 parser (GGA, RMC, HDT, VTG). Zero dependencies. |
 | `coxswain-crsf` | Strict no_std CRSF parser (RC channels, link statistics) for the hand controller link. Zero dependencies. |
-| `coxswain-n2k` | Strict no_std NMEA 2000 decoder for the initial single-frame PGN set. Listen-only enrichment, zero dependencies. |
+| `coxswain-n2k` | Strict no_std NMEA 2000 decoder: single-frame PGNs plus fast-packet reassembly (129029). Listen-only enrichment, zero dependencies. |
+| `coxswain-replay` | Capture and replay formats for field data: measurement JSONL for the replay harness, raw-NMEA JSONL for `--record-nmea`, and the `cxconvert` binary bridging one to the other. Host-only. |
 
 `docs/DECISIONS.md` records the settled architecture and the reasoning;
 `docs/manifest-schema.md` is the manifest schema; `diary/` is the running

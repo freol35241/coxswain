@@ -37,6 +37,15 @@ procurement shortlist.
   end beyond emitting the line.
 - Hosted profile serial: standard POSIX bauds via termios; on Linux, any
   other exact rate (CRSF's 420000, notably) via termios2/BOTHER.
+- NMEA 2000 over SocketCAN, listen-only by construction (never a write,
+  own-message reception off): single-frame PGNs plus fast-packet
+  reassembly (129029), per-sensor pgn and source-address filtering from
+  the manifest quirk table. Decoded values publish to Keelson as raw
+  enrichment; the estimator never fuses them (D-011). vcan-tested in CI.
+- `--record-nmea <dir>` taps every 0183 bus before the parser and writes
+  the raw bytes to disk; worth turning on from first water so quirk
+  discovery keeps the bytes that failed to parse, not just the ones that
+  didn't.
 
 ## What first water requires (from the 2026-07-10 replay experiment)
 
@@ -88,9 +97,8 @@ ordering anything.
   (coxswain-supervisor/src/lib.rs) refuses a fresh arm and flags
   `Directive::power_stale` once a report has been seen and then gone
   silent past the bound; report-only for an already-armed vessel, same
-  matrix v1 philosophy as low voltage. Not yet an authored manifest field
-  (coxswain-manifest/src/compile.rs hardcodes 3 s); promoting it to the
-  schema is an open item.
+  matrix v1 philosophy as low voltage. Now an authored manifest field,
+  `supervisor.power_stale_after_ms` (schema v0.5, default 3000).
 - Closed: the actuator serial link is a manifest `actuator_uart` bus now
   (D-026/D-027), mapped via `--port <bus_id>=<device>` like any other bus;
   an unmapped bus carrying effectors is a boot error (self-sufficiency,
@@ -100,3 +108,12 @@ ordering anything.
 - Baud for the GNSS bus comes from the manifest bus entry; confirm the
   chosen compass actually speaks its rated sentences at that baud with
   heading at 5 Hz or better.
+- N2K source pinning is numeric (source address) only; canboat's
+  NAME-based pinning is deferred, since the schema has no source-name
+  table to resolve it against yet (coxswain-hosted/src/main.rs).
+- Nonlinear thrust curve: `[effector.pwm]` calibration is piecewise
+  linear through center. A real ESC/prop pair rarely is; a proper curve
+  is open (manifest-schema.md open question 4).
+- IMU/mag drivers remain off the critical path: the 2026-07-10 replay
+  experiment shows a 5 Hz 0183 heading source suffices. Returns if trial
+  data disagrees or higher speeds demand it.

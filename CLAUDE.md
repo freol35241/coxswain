@@ -6,7 +6,7 @@ Coxswain is a maritime-native vessel control and autonomy stack: the ArduPilot
 role rebuilt from marine first principles. Read docs/DECISIONS.md before writing
 any code; it records the settled architecture and the rationale. docs/TASKS.md
 holds the sequenced backlog. docs/manifest-schema.md is the draft vessel
-manifest schema (v0.2).
+manifest schema; its revision moves with the code, do not cite it here.
 
 One line: ArduPilot is an autopilot that tolerates boats. Coxswain is a crew
 member.
