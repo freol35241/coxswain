@@ -371,9 +371,9 @@ version = "0.1.0"
 dependencies = [
  "coxswain-contract",
  "coxswain-model",
+ "coxswain-replay",
  "libm",
  "nalgebra",
- "serde_json",
 ]
 
 [[package]]
@@ -401,6 +401,7 @@ dependencies = [
  "coxswain-manifest",
  "coxswain-model",
  "coxswain-nmea0183",
+ "coxswain-replay",
  "coxswain-sim",
  "coxswain-supervisor",
  "libc",
@@ -449,6 +450,19 @@ version = "0.1.0"
 [[package]]
 name = "coxswain-nmea0183"
 version = "0.1.0"
+
+[[package]]
+name = "coxswain-replay"
+version = "0.1.0"
+dependencies = [
+ "coxswain-contract",
+ "coxswain-drivers",
+ "coxswain-estimator",
+ "coxswain-model",
+ "coxswain-nmea0183",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "coxswain-sim"

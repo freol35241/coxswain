@@ -1,0 +1,37 @@
+# Dependency justifications (one line each):
+# - coxswain-contract (serde feature): the Measurement type this crate logs,
+#   and Timestamp for raw-log records; serde is how both get to JSON.
+# - coxswain-drivers / coxswain-nmea0183: cxconvert's parsing engine
+#   (Gnss0183Driver) and its Quirks type; both already no_std, zero
+#   transitive cost.
+# - serde / serde_json: the JSONL wire format itself, the same choice the
+#   estimator's test harness already made (float_roundtrip so replay
+#   reproduces exact f64 values).
+# - base64: hand-rolled instead (src/base64.rs), not a dependency; the only
+#   user is the rare non-ASCII raw-log chunk, and the codec is under 50
+#   lines either way (see that module's doc comment).
+
+[package]
+name = "coxswain-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+coxswain-contract = { path = "../coxswain-contract", features = ["serde"] }
+coxswain-drivers = { path = "../coxswain-drivers" }
+coxswain-nmea0183 = { path = "../coxswain-nmea0183" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+# The end-to-end bridge test feeds cxconvert's output into a real
+# estimator to prove the whole capture-to-replay path, not just the file
+# format.
+coxswain-estimator = { path = "../coxswain-estimator" }
+coxswain-model = { path = "../coxswain-model" }
+
+[[bin]]
+name = "cxconvert"
+path = "src/bin/cxconvert.rs"

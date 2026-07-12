@@ -6,8 +6,6 @@
 //! recorded-log format until real recordings exist.
 
 use std::f64::consts::{PI, TAU};
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -371,20 +369,15 @@ pub fn test_config(model: ModelParams) -> VesselConfig {
 }
 
 // ---------------------------------------------------------------------------
-// JSONL measurement log: one serde_json Measurement per line.
+// JSONL measurement log: coxswain-replay owns the format now (promoted out
+// of this harness once coxswain-hosted's field-data bridge became a second
+// consumer, docs/TASKS.md Phase 2). Thin panicking wrappers so call sites
+// in replay_cases.rs are unchanged.
 
 pub fn write_jsonl(path: &Path, measurements: &[Measurement]) {
-    let mut w = BufWriter::new(File::create(path).expect("create log"));
-    for m in measurements {
-        serde_json::to_writer(&mut w, m).expect("serialize measurement");
-        w.write_all(b"\n").expect("write log");
-    }
-    w.flush().expect("flush log");
+    coxswain_replay::write_measurements(path, measurements).expect("write measurement log");
 }
 
 pub fn read_jsonl(path: &Path) -> Vec<Measurement> {
-    BufReader::new(File::open(path).expect("open log"))
-        .lines()
-        .map(|line| serde_json::from_str(&line.expect("read line")).expect("parse measurement"))
-        .collect()
+    coxswain_replay::read_measurements(path).expect("read measurement log")
 }

@@ -15,6 +15,7 @@ members = [
     "crates/coxswain-sim",
     "crates/coxswain-keelson",
     "crates/coxswain-hosted",
+    "crates/coxswain-replay",
 ]
 
 [workspace.package]

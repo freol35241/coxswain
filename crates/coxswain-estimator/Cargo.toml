@@ -17,5 +17,8 @@ libm = "0.2"
 [dev-dependencies]
 # serde feature so the replay harness can log measurements as JSONL.
 coxswain-contract = { path = "../coxswain-contract", features = ["serde"] }
-# float_roundtrip so log replay reproduces exact f64 values.
-serde_json = { version = "1", features = ["float_roundtrip"] }
+# The JSONL measurement-log format itself: promoted out of this harness once
+# coxswain-hosted's field-data bridge became a second consumer (docs/
+# TASKS.md Phase 2's own deferral). The harness keeps its trajectory
+# generators and seeded RNG; only the log read/write moved.
+coxswain-replay = { path = "../coxswain-replay" }

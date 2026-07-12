@@ -33,6 +33,7 @@ use coxswain_nmea0183::Quirks as Nmea0183ParserQuirks;
 use coxswain_sim::{GnssModel, HeadingModel, Simulator, YawRateModel};
 use zenoh::Wait;
 
+mod recorder;
 mod sd_notify;
 mod serial;
 mod udp;
@@ -61,7 +62,7 @@ const NMEA0183_HEADING_STD_RAD: f64 = 0.02;
 
 const USAGE: &str = "usage: coxswain-hosted --manifest <blob.cxmanifest> --pubkey <hex-or-file> \
                      [--connect <endpoint>] [--listen <endpoint>] [--sim] \
-                     [--port <bus_id>=<device>]...";
+                     [--port <bus_id>=<device>]... [--record-nmea <dir>]";
 
 /// Where the simulated vessel floats when the manifest has no geofence: off
 /// Gothenburg, same waters as the Seahorse example and the closed-loop tests.
@@ -87,10 +88,14 @@ struct Args {
     /// (D-026/D-027) and the crsf_uart RC bus (D-025) are mapped the same
     /// way as the GNSS bus.
     ports: Vec<(String, String)>,
+    /// Directory for `recorder::BusRecorder`'s raw-log files, one per 0183
+    /// bus (uart and udp), named `<bus_id>.jsonl`. `None`: no recording.
+    record_nmea: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    let (mut manifest, mut pubkey, mut connect, mut listen) = (None, None, None, None);
+    let (mut manifest, mut pubkey, mut connect, mut listen, mut record_nmea) =
+        (None, None, None, None, None);
     let mut sim = false;
     let mut ports = Vec::new();
     let mut iter = args.iter();
@@ -105,6 +110,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--connect" => value(&mut connect)?,
             "--listen" => value(&mut listen)?,
             "--sim" => sim = true,
+            "--record-nmea" => value(&mut record_nmea)?,
             "--port" => {
                 let raw = iter.next().ok_or(USAGE)?;
                 let (bus, path) = raw.split_once('=').ok_or(USAGE)?;
@@ -126,6 +132,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         listen,
         sim,
         ports,
+        record_nmea,
     })
 }
 
@@ -288,6 +295,28 @@ fn spawn_byte_reader(mut port: std::fs::File, boot: Instant) -> Receiver<(u8, Ti
 struct Nmea0183Link {
     driver: Gnss0183Driver,
     rx: Receiver<(u8, Timestamp)>,
+    /// `--record-nmea`'s tap on this bus; `None` when recording is off.
+    recorder: Option<recorder::BusRecorder>,
+}
+
+/// Opens a `BusRecorder` for `bus_id` under `dir` if `--record-nmea` was
+/// given. A failure to open (bad directory, permissions) disables
+/// recording for this bus with a warning rather than failing boot:
+/// recording is not part of the control path (module doc comment on
+/// `recorder`), so it gets the same never-fail treatment at bring-up that
+/// it gets on every write.
+fn open_recorder(dir: Option<&str>, bus_id: &str) -> Option<recorder::BusRecorder> {
+    let dir = dir?;
+    match recorder::BusRecorder::open(std::path::Path::new(dir), bus_id) {
+        Ok(rec) => Some(rec),
+        Err(e) => {
+            eprintln!(
+                "coxswain-hosted: --record-nmea {dir:?}: bus {bus_id:?}: could not open, \
+                 recording disabled for this bus (continuing): {e}"
+            );
+            None
+        }
+    }
 }
 
 /// Which sensors on `bus_id` this profile's only 0183-bus driver serves.
@@ -743,6 +772,23 @@ fn run() -> Result<(), String> {
             );
         }
     }
+    // --record-nmea's directory, created once up front; a failure here
+    // disables recording for every bus with one warning rather than one per
+    // bus (never a boot error, per the module doc comment on `recorder`).
+    let record_dir =
+        args.record_nmea
+            .as_deref()
+            .and_then(|dir| match std::fs::create_dir_all(dir) {
+                Ok(()) => Some(dir),
+                Err(e) => {
+                    eprintln!(
+                        "coxswain-hosted: --record-nmea {dir:?}: could not create directory, \
+                     recording disabled (continuing): {e}"
+                    );
+                    None
+                }
+            });
+
     // Wire a Gnss0183Driver per mapped nmea0183_uart bus that actually has a
     // gnss/heading sensor declared for it.
     let mut nmea0183_links: Vec<Nmea0183Link> = Vec::new();
@@ -766,6 +812,7 @@ fn run() -> Result<(), String> {
         nmea0183_links.push(Nmea0183Link {
             driver: Gnss0183Driver::new(gnss0183_config(&wiring, bus.checksum)),
             rx,
+            recorder: open_recorder(record_dir, bus.id.as_str()),
         });
     }
     // Wire a Gnss0183Driver per nmea0183_udp bus that has a gnss/heading
@@ -820,6 +867,7 @@ fn run() -> Result<(), String> {
                 nmea0183_links.push(Nmea0183Link {
                     driver: Gnss0183Driver::new(gnss0183_config(&wiring, bus.checksum)),
                     rx,
+                    recorder: open_recorder(record_dir, bus.id.as_str()),
                 });
             }
             Err(e) if inner_loop_here => {
@@ -1032,6 +1080,13 @@ fn run() -> Result<(), String> {
         // through the same ingest/publish path as a simulated measurement.
         for link in &mut nmea0183_links {
             while let Ok((byte, acquired_at)) = link.rx.try_recv() {
+                // Recorded before the byte reaches the parser: quirk
+                // discovery needs the bytes that failed to parse, and a
+                // driver rejection must not also cost the recording of
+                // what was actually on the wire.
+                if let Some(rec) = &mut link.recorder {
+                    rec.record(byte, acquired_at);
+                }
                 match link.driver.push(byte, acquired_at) {
                     Some(Ok(m)) => {
                         ingest_measurement(&mut core, &mut ingest_error_logged, &m);
