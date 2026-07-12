@@ -20,6 +20,12 @@ jobs:
       # Installs the pinned zenohd the integration tests spawn (idempotent;
       # runners have passwordless sudo). Same provisioning as the devcontainer.
       - run: bash .devcontainer/postCreate.sh
+      # Best-effort: enables coxswain-hosted/tests/can_rig.rs's vcan
+      # end-to-end path. This runner has /lib/modules, unlike the
+      # devcontainer's WSL2 kernel, so this should succeed; `|| true`
+      # guards it anyway so a runner without vcan support still passes,
+      # via that test's own runtime skip (can_rig.rs's module doc comment).
+      - run: sudo modprobe vcan || true
       - run: cargo test --workspace
       - run: >
           cargo build --target thumbv7em-none-eabihf

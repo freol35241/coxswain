@@ -147,7 +147,9 @@ impl VesselEndpoint {
             t_wall,
             s.pose.position.lat_rad,
             s.pose.position.lon_rad,
+            0.0,
             ned_cov_to_enu(&s.covariance),
+            foxglove::location_fix::PositionCovarianceType::Approximated,
         );
         self.put(subject::LOCATION_FIX, source_id, seal(t_wall, &fix))?;
         let heading = timestamped_float(t_wall, heading_deg(s.pose.heading_rad));
@@ -172,7 +174,14 @@ impl VesselEndpoint {
                 let var = std_m * std_m;
                 // Same per-axis variance east and north, up unmodelled.
                 let cov = [var, 0.0, 0.0, 0.0, var, 0.0, 0.0, 0.0, 0.0];
-                let fix = location_fix(t_wall, position.lat_rad, position.lon_rad, cov);
+                let fix = location_fix(
+                    t_wall,
+                    position.lat_rad,
+                    position.lon_rad,
+                    0.0,
+                    cov,
+                    foxglove::location_fix::PositionCovarianceType::Approximated,
+                );
                 self.put(subject::LOCATION_FIX, source_id, seal(t_wall, &fix))
             }
             MeasurementKind::Heading { heading_rad, .. } => {
@@ -186,6 +195,151 @@ impl VesselEndpoint {
             MeasurementKind::YawRate { yaw_rate_radps, .. } => {
                 let msg = timestamped_float(t_wall, yaw_rate_radps.to_degrees());
                 self.put(subject::YAW_RATE_DEGPS, source_id, seal(t_wall, &msg))
+            }
+        }
+    }
+
+    /// NMEA 2000 enrichment pass-through (D-011): a decoded message rides up
+    /// under the declaring sensor's source_id, never through
+    /// `Measurement`/`publish_raw`, since N2K enrichment never fuses
+    /// (coxswain-n2k's own module doc: deliberately no `MeasurementKind`
+    /// mapping). Reuses `location_fix`/`heading_true_north_deg`/
+    /// `yaw_rate_degps` where a decoded PGN matches their meaning exactly;
+    /// everything else rides a minimal `keelson.TimestampedFloat` subject
+    /// (`keys::subject`). A reference this driver has no matching subject
+    /// for (e.g. wind referenced to magnetic north, no exact match in
+    /// keelson 0.5.4's registry) is dropped rather than guessed at: nothing
+    /// to publish is not an error.
+    pub fn publish_n2k(
+        &self,
+        t_wall: SystemTime,
+        message: &coxswain_n2k::Message,
+        source_id: &str,
+    ) -> Result<(), Error> {
+        use coxswain_n2k::{DirectionReference, Message, WindReference};
+        match *message {
+            Message::VesselHeading(h) => {
+                let Some(heading_rad) = h.heading_rad else {
+                    return Ok(());
+                };
+                let subj = match h.reference {
+                    DirectionReference::True => subject::HEADING_TRUE_NORTH_DEG,
+                    DirectionReference::Magnetic => subject::HEADING_MAGNETIC_DEG,
+                    // The sensor reported an error condition or an
+                    // undefined reference codepoint: no reference frame to
+                    // honestly label this value with.
+                    DirectionReference::Error | DirectionReference::Reserved => return Ok(()),
+                };
+                let msg = timestamped_float(t_wall, heading_deg(heading_rad));
+                self.put(subj, source_id, seal(t_wall, &msg))
+            }
+            Message::RateOfTurn(r) => {
+                let Some(rate) = r.rate_rad_per_s else {
+                    return Ok(());
+                };
+                let msg = timestamped_float(t_wall, rate.to_degrees());
+                self.put(subject::YAW_RATE_DEGPS, source_id, seal(t_wall, &msg))
+            }
+            Message::WaterDepth(d) => {
+                let Some(depth_m) = d.depth_m else {
+                    return Ok(());
+                };
+                let msg = timestamped_float(t_wall, depth_m);
+                self.put(
+                    subject::DEPTH_BELOW_TRANSDUCER_M,
+                    source_id,
+                    seal(t_wall, &msg),
+                )
+            }
+            Message::PositionRapidUpdate(p) => {
+                let (Some(lat_rad), Some(lon_rad)) = (p.lat_rad, p.lon_rad) else {
+                    return Ok(());
+                };
+                let fix = location_fix(
+                    t_wall,
+                    lat_rad,
+                    lon_rad,
+                    0.0,
+                    N2K_UNKNOWN_COV,
+                    foxglove::location_fix::PositionCovarianceType::Unknown,
+                );
+                self.put(subject::LOCATION_FIX, source_id, seal(t_wall, &fix))
+            }
+            Message::CogSogRapidUpdate(c) => {
+                // COG has no registered magnetic-reference subject in
+                // keelson 0.5.4 (only course_over_ground_deg, no implied
+                // reference); publishing a magnetic reading under it would
+                // misdescribe the value, so only True is honored. SOG has
+                // no reference concept at all and always publishes when
+                // present.
+                if c.cog_reference == DirectionReference::True
+                    && let Some(cog_rad) = c.cog_rad
+                {
+                    let msg = timestamped_float(t_wall, heading_deg(cog_rad));
+                    self.put(
+                        subject::COURSE_OVER_GROUND_DEG,
+                        source_id,
+                        seal(t_wall, &msg),
+                    )?;
+                }
+                if let Some(sog) = c.sog_m_per_s {
+                    let msg = timestamped_float(t_wall, sog * MPS_TO_KNOTS);
+                    self.put(
+                        subject::SPEED_OVER_GROUND_KNOTS,
+                        source_id,
+                        seal(t_wall, &msg),
+                    )?;
+                }
+                Ok(())
+            }
+            Message::WindData(w) => {
+                let (speed_subj, angle_subj) = match w.reference {
+                    WindReference::True => {
+                        (subject::TRUE_WIND_SPEED_MPS, subject::TRUE_WIND_ANGLE_DEG)
+                    }
+                    WindReference::Apparent => (
+                        subject::APPARENT_WIND_SPEED_MPS,
+                        subject::APPARENT_WIND_ANGLE_DEG,
+                    ),
+                    // Magnetic ground reference and boat/water-referenced
+                    // true wind have no exact match in keelson 0.5.4's
+                    // registry (only "true" and "apparent" are defined);
+                    // dropped rather than guessed, same reasoning as
+                    // VesselHeading's Error/Reserved arm above.
+                    WindReference::Magnetic
+                    | WindReference::TrueBoatReferenced
+                    | WindReference::TrueWaterReferenced
+                    | WindReference::Reserved(_) => return Ok(()),
+                };
+                if let Some(speed) = w.speed_m_per_s {
+                    self.put(
+                        speed_subj,
+                        source_id,
+                        seal(t_wall, &timestamped_float(t_wall, speed)),
+                    )?;
+                }
+                if let Some(angle) = w.angle_rad {
+                    self.put(
+                        angle_subj,
+                        source_id,
+                        seal(t_wall, &timestamped_float(t_wall, heading_deg(angle))),
+                    )?;
+                }
+                Ok(())
+            }
+            Message::GnssPositionData(g) => {
+                let (Some(lat_rad), Some(lon_rad)) = (g.lat_rad, g.lon_rad) else {
+                    return Ok(());
+                };
+                let fix = location_fix(
+                    t_wall,
+                    lat_rad,
+                    lon_rad,
+                    g.altitude_m.unwrap_or(0.0),
+                    N2K_UNKNOWN_COV,
+                    foxglove::location_fix::PositionCovarianceType::Unknown,
+                );
+                self.put(subject::LOCATION_FIX, source_id, seal(t_wall, &fix))
             }
         }
     }
@@ -325,21 +479,33 @@ fn location_fix(
     t_wall: SystemTime,
     lat_rad: f64,
     lon_rad: f64,
+    altitude_m: f64,
     enu_cov: [f64; 9],
+    cov_type: foxglove::location_fix::PositionCovarianceType,
 ) -> foxglove::LocationFix {
     foxglove::LocationFix {
         timestamp: Some(wall_to_proto(t_wall)),
         frame_id: String::new(),
         latitude: lat_rad.to_degrees(),
         longitude: lon_rad.to_degrees(),
-        altitude: 0.0,
+        altitude: altitude_m,
         position_covariance: enu_cov.to_vec(),
-        // Up is unmodelled in the 3-DOF state, so the covariance is never
-        // fully known.
-        position_covariance_type: foxglove::location_fix::PositionCovarianceType::Approximated
-            as i32,
+        position_covariance_type: cov_type as i32,
     }
 }
+
+/// N2K enrichment carries no covariance figure this crate trusts (canboat's
+/// HDOP-based estimate needs a receiver-specific UERE this crate does not
+/// have, same reasoning coxswain-drivers::gnss0183 documents for its own
+/// UERE constant); zero plus `Unknown` is honest about that absence, unlike
+/// `Approximated`, which the fused/GNSS-driver paths use for a real, if
+/// partial, covariance.
+const N2K_UNKNOWN_COV: [f64; 9] = [0.0; 9];
+
+/// 1 international knot = 1852 m / 3600 s (exact, by definition):
+/// `speed_over_ground_knots` is keelson's registered unit; N2K's SOG field
+/// is m/s on the wire.
+const MPS_TO_KNOTS: f64 = 3600.0 / 1852.0;
 
 fn timestamped_float(t_wall: SystemTime, value: f64) -> keelson::TimestampedFloat {
     keelson::TimestampedFloat {

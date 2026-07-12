@@ -360,6 +360,25 @@ pub enum Outcome {
     Unknown { pgn: u32 },
 }
 
+impl Message {
+    /// The PGN this message decoded from. Lets a caller that only holds a
+    /// `Message` (e.g. `FastPacketAssembler::push`'s completed reassembly,
+    /// or a manifest-driven per-sensor filter matching against
+    /// `Nmea2000Quirks::pgns`) recover the PGN without re-deriving it from
+    /// the raw frame.
+    pub fn pgn(&self) -> u32 {
+        match self {
+            Self::VesselHeading(_) => PGN_VESSEL_HEADING,
+            Self::RateOfTurn(_) => PGN_RATE_OF_TURN,
+            Self::WaterDepth(_) => PGN_WATER_DEPTH,
+            Self::PositionRapidUpdate(_) => PGN_POSITION_RAPID_UPDATE,
+            Self::CogSogRapidUpdate(_) => PGN_COG_SOG_RAPID_UPDATE,
+            Self::WindData(_) => PGN_WIND_DATA,
+            Self::GnssPositionData(_) => PGN_GNSS_POSITION_DATA,
+        }
+    }
+}
+
 pub(crate) fn decode_message(pgn: u32, data: &[u8]) -> Result<Outcome, DecodeError> {
     match pgn {
         PGN_VESSEL_HEADING => {

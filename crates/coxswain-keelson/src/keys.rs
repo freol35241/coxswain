@@ -18,6 +18,26 @@ pub mod subject {
     /// keelson.TimestampedFloat, degrees per second. The closest well-known
     /// subject to a body-frame yaw rate.
     pub const YAW_RATE_DEGPS: &str = "yaw_rate_degps";
+    /// keelson.TimestampedFloat, degrees.
+    pub const HEADING_MAGNETIC_DEG: &str = "heading_magnetic_deg";
+    /// keelson.TimestampedFloat, degrees.
+    pub const COURSE_OVER_GROUND_DEG: &str = "course_over_ground_deg";
+    /// keelson.TimestampedFloat, knots (keelson's registered unit for this
+    /// subject; N2K's own SOG field is m/s, converted at the publish edge).
+    pub const SPEED_OVER_GROUND_KNOTS: &str = "speed_over_ground_knots";
+    /// keelson.TimestampedFloat, m/s.
+    pub const TRUE_WIND_SPEED_MPS: &str = "true_wind_speed_mps";
+    /// keelson.TimestampedFloat, degrees.
+    pub const TRUE_WIND_ANGLE_DEG: &str = "true_wind_angle_deg";
+    /// keelson.TimestampedFloat, m/s.
+    pub const APPARENT_WIND_SPEED_MPS: &str = "apparent_wind_speed_mps";
+    /// keelson.TimestampedFloat, degrees.
+    pub const APPARENT_WIND_ANGLE_DEG: &str = "apparent_wind_angle_deg";
+    /// keelson.TimestampedFloat, metres. Not in keelson 0.5.4's registry
+    /// (surveyed against messages/subjects.yaml at authoring time): a
+    /// minimal coxswain-specific addition, N2K PGN 128267's primary value
+    /// only (offset/range are dropped, not worth a subject each yet).
+    pub const DEPTH_BELOW_TRANSDUCER_M: &str = "depth_below_transducer_m";
     /// keelson.EntityHealth.
     pub const ENTITY_HEALTH: &str = "entity_health";
     /// coxswain.SetpointMsg. Coxswain-specific; the stream doubles as the

@@ -29,6 +29,9 @@ coxswain-crsf = { path = "../coxswain-crsf" }
 # Only for the `Quirks` type `coxswain-drivers::gnss0183::Config` takes;
 # already pulled in transitively via coxswain-drivers.
 coxswain-nmea0183 = { path = "../coxswain-nmea0183" }
+# NMEA 2000 frame/fast-packet decode (D-011's second bus); can.rs is this
+# profile's own SocketCAN transport, coxswain-n2k stays transport-agnostic.
+coxswain-n2k = { path = "../coxswain-n2k" }
 # --record-nmea's raw-log format (recorder.rs); the same JSONL format
 # cxconvert reads, so today's capture is this evening's replay regression.
 coxswain-replay = { path = "../coxswain-replay" }

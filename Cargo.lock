@@ -400,6 +400,7 @@ dependencies = [
  "coxswain-keelson",
  "coxswain-manifest",
  "coxswain-model",
+ "coxswain-n2k",
  "coxswain-nmea0183",
  "coxswain-replay",
  "coxswain-sim",
@@ -413,6 +414,7 @@ name = "coxswain-keelson"
 version = "0.1.0"
 dependencies = [
  "coxswain-contract",
+ "coxswain-n2k",
  "prost",
  "prost-build",
  "prost-types",

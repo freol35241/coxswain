@@ -7,6 +7,9 @@ publish = false
 
 [dependencies]
 coxswain-contract = { path = "../coxswain-contract" }
+# N2K enrichment publishing (D-011/D-008): this adapter maps decoded
+# messages onto Keelson subjects, so it needs the decoded type.
+coxswain-n2k = { path = "../coxswain-n2k" }
 # The native external interface (D-003). Pinned to the zenohd 1.9 line the
 # devcontainer ships.
 zenoh = "1.9"

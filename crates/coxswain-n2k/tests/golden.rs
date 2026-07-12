@@ -304,6 +304,32 @@ fn wind_data_not_available() {
     assert_eq!(w.reference, WindReference::Reserved(7));
 }
 
+// --- Message::pgn() -----------------------------------------------------------
+
+/// `pgn()` recovers the PGN a decoded `Message` came from, independent of
+/// `decode_frame`/`FastPacketAssembler::push`'s own PGN dispatch (each call
+/// below decodes a different, unrelated frame and checks the PGN handed to
+/// `decode_frame` against what `pgn()` reports back).
+#[test]
+fn message_pgn_matches_the_decoded_pgn_for_every_variant() {
+    let cases: &[(u32, [u8; 8])] = &[
+        (127250, common::vessel_heading_payload(1, 1, 1, 1, 0)),
+        (127251, common::rate_of_turn_payload(1, 1)),
+        (128267, common::water_depth_payload(1, 1, 1, 1)),
+        (129025, common::position_rapid_update_payload(1, 1)),
+        (129026, common::cog_sog_rapid_update_payload(1, 0, 1, 1)),
+        (130306, common::wind_data_payload(1, 1, 1, 0)),
+    ];
+    for &(pgn, data) in cases {
+        let can_id = common::pack_can_id(2, pgn, 1, 0);
+        let frame = decode_frame(can_id, &data).unwrap();
+        let Outcome::Message(m) = frame.outcome else {
+            panic!("pgn {pgn}: expected a decoded message");
+        };
+        assert_eq!(m.pgn(), pgn);
+    }
+}
+
 // --- Unknown PGN -------------------------------------------------------------
 
 #[test]

@@ -77,6 +77,7 @@ fn golden_gnss_position_data_reassembly() {
     approx(g.hdop.unwrap(), 0.85);
     approx(g.pdop.unwrap(), 1.20);
     approx(g.geoidal_separation_m.unwrap(), -12.34);
+    assert_eq!(Message::GnssPositionData(g).pgn(), 129029);
 }
 
 #[test]

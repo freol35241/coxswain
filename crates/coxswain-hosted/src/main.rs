@@ -29,10 +29,12 @@ use coxswain_drivers::rc::{self, RcAdapter};
 use coxswain_hosted::{ArmError, ClaimError, Core, TickOutput};
 use coxswain_keelson::{ConnEvent, ConnReplyResult, VesselEndpoint};
 use coxswain_manifest::{BusKind, ChecksumMode, Nmea0183Quirks, PwmCalibration, SensorEntry};
+use coxswain_n2k::{DecodeError, FastPacketAssembler, Outcome};
 use coxswain_nmea0183::Quirks as Nmea0183ParserQuirks;
 use coxswain_sim::{GnssModel, HeadingModel, Simulator, YawRateModel};
 use zenoh::Wait;
 
+mod can;
 mod recorder;
 mod sd_notify;
 mod serial;
@@ -407,6 +409,128 @@ fn gnss0183_config(wiring: &Nmea0183Wiring, checksum: ChecksumMode) -> gnss0183:
     }
 }
 
+// --------------------------------------------------------------------- N2K
+//
+// nmea2000_can bus wiring (D-011): listen-only enrichment, published to
+// Keelson only, never through core.ingest -- coxswain-n2k deliberately has
+// no MeasurementKind mapping, so there is no inner_loop promotion path to
+// protect here regardless of what a sensor's license field says.
+
+/// A sensor's `nmea2000.sources` pinning: `"any"` (the manifest's own
+/// documented default, seahorse.toml) accepts every source address;
+/// otherwise a comma-separated list of decimal source addresses (0..=253)
+/// pins the sensor to those senders. canboat's "NAME" pinning is not
+/// implemented: the schema has no source-name table to resolve it against
+/// yet, so only numeric pinning is live (documented in the manifest schema
+/// as "or explicit NAME/source-address pinning").
+#[derive(Clone, Debug, PartialEq)]
+enum SourceFilter {
+    Any,
+    Pinned(Vec<u8>),
+}
+
+impl SourceFilter {
+    fn matches(&self, source_address: u8) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Pinned(addrs) => addrs.contains(&source_address),
+        }
+    }
+}
+
+fn parse_n2k_sources(raw: &str) -> SourceFilter {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("any") {
+        return SourceFilter::Any;
+    }
+    SourceFilter::Pinned(
+        raw.split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect(),
+    )
+}
+
+/// One sensor's manifest-declared N2K filter: which PGNs belong to it
+/// (`Nmea2000Quirks::pgns`) and which source addresses it accepts. Several
+/// enrichment sensors can share one physical CAN bus (seahorse.toml's
+/// "instruments" bus), each selecting its own slice of the traffic.
+struct Nmea2000SensorFilter {
+    /// The sensor's authored id, used as the Keelson source_id its decoded
+    /// values publish under.
+    source_id: String,
+    pgns: Vec<u32>,
+    sources: SourceFilter,
+}
+
+impl Nmea2000SensorFilter {
+    fn matches(&self, pgn: u32, source_address: u8) -> bool {
+        self.pgns.contains(&pgn) && self.sources.matches(source_address)
+    }
+}
+
+/// Every sensor on `bus_id` using driver "nmea2000" that declared an
+/// `[sensor.nmea2000]` quirk table (the table is where `pgns` lives; a
+/// sensor without one selects nothing and is silently skipped, same
+/// "declared but inert" treatment as an unmapped bus).
+fn nmea2000_sensors(bus_id: &str, sensors: &[SensorEntry]) -> Vec<Nmea2000SensorFilter> {
+    sensors
+        .iter()
+        .filter(|s| s.bus.as_str() == bus_id && s.driver.as_str() == "nmea2000")
+        .filter_map(|s| {
+            let quirks = s.nmea2000?;
+            Some(Nmea2000SensorFilter {
+                source_id: s.name.as_str().to_string(),
+                pgns: quirks.pgns.as_slice().to_vec(),
+                sources: parse_n2k_sources(quirks.sources.as_str()),
+            })
+        })
+        .collect()
+}
+
+/// Per-bus N2K decode error bookkeeping: counted, never fatal (a shared CAN
+/// bus carries traffic this profile does not speak), logged once per typed
+/// kind so a noisy/foreign bus does not flood stderr while every distinct
+/// problem still surfaces at least once. `coxswain_n2k::DecodeError` has
+/// exactly three variants.
+#[derive(Default)]
+struct N2kErrorCounters {
+    payload_length: u64,
+    fast_packet_length: u64,
+    fast_packet_sequence: u64,
+}
+
+impl N2kErrorCounters {
+    fn record(&mut self, bus_id: &str, e: DecodeError) {
+        let (count, name) = match e {
+            DecodeError::PayloadLength => (&mut self.payload_length, "PayloadLength"),
+            DecodeError::FastPacketLength => (&mut self.fast_packet_length, "FastPacketLength"),
+            DecodeError::FastPacketSequence => {
+                (&mut self.fast_packet_sequence, "FastPacketSequence")
+            }
+        };
+        *count += 1;
+        if *count == 1 {
+            eprintln!(
+                "coxswain-hosted: bus {bus_id:?}: N2K decode error {name} (continuing, counted \
+                 not fatal; a shared bus carries traffic this profile does not speak)"
+            );
+        }
+    }
+}
+
+/// One mapped `nmea2000_can` bus: a fast-packet assembler shared across
+/// every frame on the bus (129029 spans several physical frames;
+/// interleaving between sources needs one assembler per bus, not per
+/// sensor, per `FastPacketAssembler`'s own doc comment), the reader
+/// channel, and the manifest's per-sensor filters.
+struct Nmea2000Link {
+    bus_id: String,
+    assembler: FastPacketAssembler,
+    rx: Receiver<(can::RawFrame, Timestamp)>,
+    sensors: Vec<Nmea2000SensorFilter>,
+    errors: N2kErrorCounters,
+}
+
 // ------------------------------------------------------------ actuator link
 //
 // $CXOUT rendering (D-026/D-027): the allocator (coxswain-hosted::Core) has
@@ -673,7 +797,10 @@ fn run() -> Result<(), String> {
             .ok_or_else(|| format!("--port {bus_id}=...: no such bus in the manifest"))?;
         if !matches!(
             bus.kind,
-            BusKind::Nmea0183Uart | BusKind::ActuatorUart | BusKind::CrsfUart
+            BusKind::Nmea0183Uart
+                | BusKind::ActuatorUart
+                | BusKind::CrsfUart
+                | BusKind::Nmea2000Can
         ) {
             return Err(format!(
                 "--port {bus_id}=...: bus kind {:?} has no driver in this hosted profile yet",
@@ -888,6 +1015,42 @@ fn run() -> Result<(), String> {
                 );
             }
         }
+    }
+
+    // Wire an Nmea2000Link per mapped nmea2000_can bus that has at least one
+    // sensor using driver "nmea2000" declared for it. A mapped bus that
+    // fails to open is a hard boot error, the same treatment the
+    // nmea0183_uart block above gives an explicit --port mapping: the
+    // operator asked for this interface by name, so a failure to open it is
+    // a misconfiguration to fail loudly on, not a degraded mode (unlike the
+    // udp block above, where "no --port possible" makes silent degradation
+    // the only sane default).
+    let mut nmea2000_links: Vec<Nmea2000Link> = Vec::new();
+    for bus in manifest.buses.iter() {
+        if bus.kind != BusKind::Nmea2000Can {
+            continue;
+        }
+        let Some(&iface) = port_map.get(bus.id.as_str()) else {
+            continue;
+        };
+        let sensors = nmea2000_sensors(bus.id.as_str(), manifest.sensors.as_slice());
+        if sensors.is_empty() {
+            eprintln!(
+                "coxswain-hosted: bus {:?} mapped but no sensor on it uses driver \"nmea2000\"; \
+                 leaving the interface unopened",
+                bus.id.as_str()
+            );
+            continue;
+        }
+        let socket = can::open_can(iface).map_err(|e| format!("{iface}: {e}"))?;
+        let rx = can::spawn_reader(socket, boot);
+        nmea2000_links.push(Nmea2000Link {
+            bus_id: bus.id.as_str().to_string(),
+            assembler: FastPacketAssembler::new(),
+            rx,
+            sensors,
+            errors: N2kErrorCounters::default(),
+        });
     }
 
     // RC (D-025): `[rc]` names a crsf_uart bus, mapped via --port exactly
@@ -1160,6 +1323,38 @@ fn run() -> Result<(), String> {
             }
         }
 
+        // Real N2K: drain each mapped bus's raw CAN frames into its
+        // fast-packet assembler (frames pushed in arrival order, per
+        // `FastPacketAssembler::push`'s own contract), and dispatch a
+        // completed decode to every sensor whose manifest quirks (pgns,
+        // source pinning) claim it. Enrichment publish only (D-011): never
+        // core.ingest, since coxswain-n2k has no MeasurementKind mapping.
+        for link in &mut nmea2000_links {
+            while let Ok((frame, _acquired_at)) = link.rx.try_recv() {
+                match link.assembler.push(frame.can_id, &frame.data[..frame.len]) {
+                    Ok(Some(decoded)) => {
+                        let (pgn, message) = match &decoded.outcome {
+                            Outcome::Message(m) => (m.pgn(), m),
+                            // Routine bus traffic outside this crate's PGN
+                            // set (module doc comment on coxswain-n2k): a
+                            // shared bus carries plenty we do not decode.
+                            Outcome::Unknown { .. } => continue,
+                        };
+                        for sensor in &link.sensors {
+                            if sensor.matches(pgn, decoded.source_address) {
+                                publish(
+                                    endpoint.publish_n2k(wall, message, &sensor.source_id),
+                                    &mut publish_error_logged,
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {} // fast-packet transfer still in progress
+                    Err(e) => link.errors.record(&link.bus_id, e),
+                }
+            }
+        }
+
         let out = core.tick(now);
         if let Some(sim) = sim.as_mut() {
             // Effectors present -> the plant is driven by what the
@@ -1320,5 +1515,119 @@ mod tests {
         // (coxswain-hosted/tests/desk_rig.rs's rudderboat_direct_effort_rig
         // println: "esc 1633 us").
         assert_eq!(render_us(pwm(false), 300.0, 180.0, 100.0), 1633);
+    }
+
+    // ------------------------------------------------------------- N2K wiring
+
+    use coxswain_contract::BoundedList;
+    use coxswain_manifest::{FixedStr32, Nmea2000Quirks};
+
+    #[test]
+    fn source_filter_any_accepts_every_address() {
+        assert_eq!(parse_n2k_sources("any"), SourceFilter::Any);
+        assert_eq!(parse_n2k_sources("ANY"), SourceFilter::Any);
+        assert_eq!(parse_n2k_sources(""), SourceFilter::Any);
+        assert!(SourceFilter::Any.matches(0));
+        assert!(SourceFilter::Any.matches(253));
+    }
+
+    #[test]
+    fn source_filter_pinned_accepts_only_listed_addresses() {
+        let filter = parse_n2k_sources("10, 20");
+        assert_eq!(filter, SourceFilter::Pinned(vec![10, 20]));
+        assert!(filter.matches(10));
+        assert!(filter.matches(20));
+        assert!(!filter.matches(30));
+    }
+
+    #[test]
+    fn source_filter_pinned_ignores_a_malformed_entry_rather_than_matching_it() {
+        // "x" does not parse as a u8; it is dropped, not treated as a
+        // wildcard, so the remaining valid entry still pins correctly.
+        let filter = parse_n2k_sources("10,x");
+        assert_eq!(filter, SourceFilter::Pinned(vec![10]));
+        assert!(!filter.matches(99));
+    }
+
+    fn n2k_sensor(name: &str, bus: &str, pgns: &[u32], sources: &str) -> SensorEntry {
+        SensorEntry {
+            name: FixedStr32::new(name).unwrap(),
+            driver: FixedStr32::new("nmea2000").unwrap(),
+            bus: FixedStr32::new(bus).unwrap(),
+            nmea2000: Some(Nmea2000Quirks {
+                pgns: BoundedList::from_slice(pgns).unwrap(),
+                sources: FixedStr32::new(sources).unwrap(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn nmea2000_sensors_selects_only_this_bus_and_driver() {
+        let sensors = [
+            n2k_sensor("n2k_wind", "instruments", &[130306], "any"),
+            // Wrong bus: excluded.
+            n2k_sensor("other_bus", "elsewhere", &[130306], "any"),
+            // Right bus, wrong driver: excluded.
+            SensorEntry {
+                name: FixedStr32::new("gnss_main").unwrap(),
+                driver: FixedStr32::new("nmea0183").unwrap(),
+                bus: FixedStr32::new("instruments").unwrap(),
+                ..Default::default()
+            },
+        ];
+        let filters = nmea2000_sensors("instruments", &sensors);
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].source_id, "n2k_wind");
+        assert_eq!(filters[0].pgns, vec![130306]);
+    }
+
+    /// A "nmea2000"-driven sensor with no `[sensor.nmea2000]` table selects
+    /// nothing (no pgns list to match against), same "declared but inert"
+    /// treatment as other unwired sensors in this profile.
+    #[test]
+    fn nmea2000_sensors_skips_a_sensor_without_the_quirk_table() {
+        let sensors = [SensorEntry {
+            name: FixedStr32::new("n2k_wind").unwrap(),
+            driver: FixedStr32::new("nmea2000").unwrap(),
+            bus: FixedStr32::new("instruments").unwrap(),
+            nmea2000: None,
+            ..Default::default()
+        }];
+        assert!(nmea2000_sensors("instruments", &sensors).is_empty());
+    }
+
+    #[test]
+    fn sensor_filter_matches_requires_both_pgn_and_source() {
+        let filter = Nmea2000SensorFilter {
+            source_id: "n2k_wind".to_string(),
+            pgns: vec![130306],
+            sources: SourceFilter::Pinned(vec![10]),
+        };
+        assert!(filter.matches(130306, 10));
+        // Right source, wrong PGN: routine bus traffic this sensor did not
+        // ask for.
+        assert!(!filter.matches(127250, 10));
+        // Right PGN, wrong source: the D-014-shaped pinning story for N2K.
+        assert!(!filter.matches(130306, 99));
+    }
+
+    /// Two sensors sharing one bus each select their own PGN, independent
+    /// of the other's presence (seahorse.toml's "instruments" bus shape,
+    /// multiple enrichment sensors on one CAN bus).
+    #[test]
+    fn two_sensors_on_one_bus_each_select_their_own_pgn() {
+        let sensors = [
+            n2k_sensor("n2k_wind", "instruments", &[130306], "any"),
+            n2k_sensor("n2k_depth", "instruments", &[128267], "any"),
+        ];
+        let filters = nmea2000_sensors("instruments", &sensors);
+        assert_eq!(filters.len(), 2);
+        let wind = filters.iter().find(|f| f.source_id == "n2k_wind").unwrap();
+        let depth = filters.iter().find(|f| f.source_id == "n2k_depth").unwrap();
+        assert!(wind.matches(130306, 5));
+        assert!(!wind.matches(128267, 5));
+        assert!(depth.matches(128267, 5));
+        assert!(!depth.matches(130306, 5));
     }
 }
