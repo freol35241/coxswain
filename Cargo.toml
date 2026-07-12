@@ -5,6 +5,7 @@ members = [
     "crates/coxswain-model",
     "crates/coxswain-estimator",
     "crates/coxswain-guidance",
+    "crates/coxswain-allocation",
     "crates/coxswain-supervisor",
     "crates/coxswain-manifest",
     "crates/coxswain-nmea0183",

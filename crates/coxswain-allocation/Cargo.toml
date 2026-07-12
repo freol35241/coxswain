@@ -1,0 +1,14 @@
+[package]
+name = "coxswain-allocation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+coxswain-contract = { path = "../coxswain-contract" }
+# no_std math per CLAUDE.md: nalgebra for the fixed-size weighted
+# pseudo-inverse (Cholesky on <=8x8 normal equations), libm for the trig the
+# effector column model needs without std.
+nalgebra = { version = "0.34", default-features = false, features = ["libm"] }
+libm = "0.2"

@@ -27,6 +27,7 @@ jobs:
           -p coxswain-model
           -p coxswain-estimator
           -p coxswain-guidance
+          -p coxswain-allocation
           -p coxswain-supervisor
           -p coxswain-manifest
           -p coxswain-nmea0183
