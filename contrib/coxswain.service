@@ -7,8 +7,8 @@
 # enrichment; its absence at boot is not a startup failure.
 #
 # Placeholders below (manifest path, pubkey, --port bus=device mappings, RC
-# and actuator device paths) are per-vessel commissioning data, filled in
-# when the unit is installed, not shipped as-is.
+# device path) are per-vessel commissioning data, filled in when the unit is
+# installed, not shipped as-is.
 
 [Unit]
 Description=Coxswain vessel control and autonomy stack
@@ -20,8 +20,8 @@ ExecStart=/usr/local/bin/coxswain-hosted \
     --manifest /etc/coxswain/vessel.cxmanifest \
     --pubkey /etc/coxswain/vessel.pubkey \
     --port gnss_serial=/dev/ttyUSB0 \
-    --rc-port /dev/ttyUSB1 --rc-claimant-id 1 \
-    --actuator-port /dev/ttyUSB2
+    --port actuator_bridge=/dev/ttyUSB2 \
+    --rc-port /dev/ttyUSB1 --rc-claimant-id 1
     # --connect tcp/<companion-computer>:7447   # Keelson/zenoh, optional
 
 # The control loop is the vessel's safety-critical process: if it dies,

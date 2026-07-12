@@ -391,6 +391,7 @@ dependencies = [
 name = "coxswain-hosted"
 version = "0.1.0"
 dependencies = [
+ "coxswain-allocation",
  "coxswain-contract",
  "coxswain-crsf",
  "coxswain-drivers",

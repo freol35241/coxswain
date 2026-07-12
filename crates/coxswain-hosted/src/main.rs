@@ -1,7 +1,8 @@
 //! The Linux-hosted profile binary: manifest from file, zenoh session up
 //! (Phase 5). I/O backend is the simulator by default, or real serial ports
-//! per manifest bus plus RC/actuator (Phase 6; docs/TASKS.md "coxswain-hosted
-//! on real /dev ports").
+//! per manifest bus plus RC (Phase 6; docs/TASKS.md "coxswain-hosted
+//! on real /dev ports"); the actuator link is a manifest bus too (D-026/
+//! D-027 Phase 6b), mapped the same way as any other.
 //!
 //! One monotonic clock drives everything: `Timestamp` is nanoseconds since
 //! boot from `std::time::Instant`, and every measurement (simulated or read
@@ -18,8 +19,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Instant, SystemTime};
 
 use coxswain_contract::{
-    ClaimantId, GeoPoint, License, Measurement, ModelParams, PowerStatus, SensorId, SensorRole,
-    Setpoint, Timestamp, VesselState,
+    ClaimantId, EffectorKind, GeoPoint, License, Measurement, ModelParams, PowerStatus, SensorId,
+    SensorRole, Setpoint, Timestamp, VesselState,
 };
 use coxswain_crsf::{FrameReader, ParseOutcome};
 use coxswain_drivers::actuator_serial::{ActuatorSerialDriver, PowerReportReader};
@@ -27,7 +28,7 @@ use coxswain_drivers::gnss0183::{self, Gnss0183Driver};
 use coxswain_drivers::rc::{self, RcAdapter};
 use coxswain_hosted::{ArmError, ClaimError, Core, TickOutput};
 use coxswain_keelson::{ConnEvent, ConnReplyResult, VesselEndpoint};
-use coxswain_manifest::{BusKind, ChecksumMode, Nmea0183Quirks, SensorEntry};
+use coxswain_manifest::{BusKind, ChecksumMode, Nmea0183Quirks, PwmCalibration, SensorEntry};
 use coxswain_nmea0183::Quirks as Nmea0183ParserQuirks;
 use coxswain_sim::{GnssModel, HeadingModel, Simulator, YawRateModel};
 use zenoh::Wait;
@@ -57,13 +58,13 @@ const SIM_SEED: u64 = 1;
 const NMEA0183_FALLBACK_STD_M: f64 = 25.0;
 const NMEA0183_HEADING_STD_RAD: f64 = 0.02;
 
-// RC and the actuator link are conn-node-local serial (`Args` doc comment),
-// with no manifest bus to carry a baud, so the profile fixes one. CRSF's
-// real link runs 420000 baud, which is not a POSIX `Bxxxx` rate; on Linux
-// `serial::open_serial` reaches for termios2/BOTHER to hit it exactly (see
-// serial.rs).
+// RC is conn-node-local serial (`Args` doc comment), with no manifest bus to
+// carry a baud, so the profile fixes one. CRSF's real link runs 420000 baud,
+// which is not a POSIX `Bxxxx` rate; on Linux `serial::open_serial` reaches
+// for termios2/BOTHER to hit it exactly (see serial.rs). The actuator link
+// is a manifest bus now (D-026/D-027): its baud comes from the bus entry's
+// own `rate`, same as the GNSS bus.
 const RC_BAUD_HINT: u32 = 420_000;
-const ACTUATOR_BAUD: u32 = 115_200;
 
 /// RC channel mapping and stick/switch thresholds: CRSF/ELRS convention,
 /// not yet manifest-configurable (the schema has no place to declare RC
@@ -85,7 +86,7 @@ fn rc_config() -> rc::Config {
 const USAGE: &str = "usage: coxswain-hosted --manifest <blob.cxmanifest> --pubkey <hex-or-file> \
                      [--connect <endpoint>] [--listen <endpoint>] [--sim] \
                      [--port <bus_id>=<device>]... \
-                     [--rc-port <device> --rc-claimant-id <id>] [--actuator-port <device>]";
+                     [--rc-port <device> --rc-claimant-id <id>]";
 
 /// Where the simulated vessel floats when the manifest has no geofence: off
 /// Gothenburg, same waters as the Seahorse example and the closed-loop tests.
@@ -107,19 +108,20 @@ struct Args {
     sim: bool,
     /// Manifest bus id -> real device path, repeated (`--port a=/dev/x
     /// --port b=/dev/y`). Logical port names, not Linux paths (the manifest
-    /// declares peripherals, not a host filesystem).
+    /// declares peripherals, not a host filesystem). The actuator_uart bus
+    /// (D-026/D-027) is mapped the same way as the GNSS bus now; RC remains
+    /// the one conn-node-local link with no manifest bus of its own (below).
     ports: Vec<(String, String)>,
-    /// RC and the actuator link are conn-node-local serial, not manifest
-    /// buses today (the schema has no place to declare them yet); CLI
-    /// options stand in until that lands.
+    /// RC is conn-node-local serial, not a manifest bus today (the schema
+    /// has no place to declare it yet); these CLI options stand in until
+    /// that lands.
     rc_port: Option<String>,
     rc_claimant_id: Option<u16>,
-    actuator_port: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let (mut manifest, mut pubkey, mut connect, mut listen) = (None, None, None, None);
-    let (mut rc_port, mut rc_claimant_id, mut actuator_port) = (None, None, None);
+    let (mut rc_port, mut rc_claimant_id) = (None, None);
     let mut sim = false;
     let mut ports = Vec::new();
     let mut iter = args.iter();
@@ -144,7 +146,6 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 let raw = iter.next().ok_or(USAGE)?;
                 rc_claimant_id = Some(raw.parse::<u16>().map_err(|_| USAGE)?);
             }
-            "--actuator-port" => value(&mut actuator_port)?,
             _ => return Err(USAGE.to_string()),
         }
     }
@@ -166,7 +167,6 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         ports,
         rc_port,
         rc_claimant_id,
-        actuator_port,
     })
 }
 
@@ -418,6 +418,139 @@ fn gnss0183_config(wiring: &Nmea0183Wiring, checksum: ChecksumMode) -> gnss0183:
     }
 }
 
+// ------------------------------------------------------------ actuator link
+//
+// $CXOUT rendering (D-026/D-027): the allocator (coxswain-hosted::Core) has
+// already turned guidance's tau into per-effector physical outputs indexed
+// parallel to `VesselConfig::effectors`; this profile's job is only to map
+// each one through its manifest calibration into microseconds and place it
+// on the wire at its declared channel. No vessel knowledge crosses onto the
+// wire itself (D-027): the far end just copies fields to PWM channels.
+
+/// One channel's render-time wiring: which entry in the allocator's output
+/// (and `VesselConfig::effectors`) it reads, its calibration, and the
+/// physical limits `render_us` scales against. `effector_index` doubles as
+/// both indices because `coxswain-manifest::compile` builds the render
+/// table (`CompiledManifest::effectors`) and the allocator geometry
+/// (`VesselConfig::effectors`) from the same loop, in the same order.
+#[derive(Copy, Clone, Debug)]
+struct EffectorChannel {
+    effector_index: usize,
+    pwm: PwmCalibration,
+    /// Physical output at the `us_max` endpoint (thrust N or angle rad);
+    /// asymmetric for a thruster (`max_thrust_fwd_n`), symmetric for a
+    /// rudder (`max_angle_rad`) since `EffectorKind::Rudder` carries one
+    /// angle limit for both directions.
+    max_pos: f64,
+    /// Physical output magnitude at the `us_min` endpoint (before
+    /// `reversed` swaps which endpoint that is).
+    max_neg: f64,
+}
+
+fn effector_limits(kind: &EffectorKind) -> (f64, f64) {
+    match *kind {
+        EffectorKind::FixedThruster {
+            max_thrust_fwd_n,
+            max_thrust_rev_n,
+            ..
+        } => (max_thrust_fwd_n, max_thrust_rev_n),
+        EffectorKind::Rudder { max_angle_rad, .. } => (max_angle_rad, max_angle_rad),
+    }
+}
+
+/// Groups the compiled manifest's effectors by their `actuator_uart` bus,
+/// channel-ordered, one group per bus that has at least one effector on it.
+/// Channels are positional on the wire (`$CXOUT` fields are field `i` for
+/// channel `i`), so a bus whose declared channels are not contiguous from 0
+/// is a boot error here rather than a silently misrendered line; this is a
+/// manifest-shape check, so it runs regardless of sim vs. real-serial mode.
+/// Simple by design (CLAUDE.md): this graduates to a manifest compile rule
+/// in v0.4.x once the schema settles further, per D-022's sequencing.
+fn actuator_bus_channels(
+    manifest: &coxswain_manifest::CompiledManifest,
+) -> Result<Vec<(String, Vec<EffectorChannel>)>, String> {
+    let mut by_bus: HashMap<&str, Vec<(u16, EffectorChannel)>> = HashMap::new();
+    for (i, entry) in manifest.effectors.as_slice().iter().enumerate() {
+        let (max_pos, max_neg) = effector_limits(&manifest.config.effectors.as_slice()[i].kind);
+        by_bus.entry(entry.bus.as_str()).or_default().push((
+            entry.channel,
+            EffectorChannel {
+                effector_index: i,
+                pwm: entry.pwm,
+                max_pos,
+                max_neg,
+            },
+        ));
+    }
+    let mut out = Vec::new();
+    for bus in manifest
+        .buses
+        .iter()
+        .filter(|b| b.kind == BusKind::ActuatorUart)
+    {
+        let Some(mut entries) = by_bus.remove(bus.id.as_str()) else {
+            continue;
+        };
+        entries.sort_by_key(|(channel, _)| *channel);
+        for (expected, (channel, _)) in entries.iter().enumerate() {
+            if *channel as usize != expected {
+                return Err(format!(
+                    "bus {:?}: effector channels must be contiguous from 0 (found channel \
+                     {channel} at position {expected})",
+                    bus.id.as_str()
+                ));
+            }
+        }
+        out.push((
+            bus.id.as_str().to_string(),
+            entries.into_iter().map(|(_, ch)| ch).collect(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Physical output (newtons or radians, the allocator's per-effector value)
+/// through `PwmCalibration`'s piecewise-linear mapping (D-027): 0 ->
+/// `us_center`, `+max_pos` -> the "high" endpoint, `-max_neg` -> the "low"
+/// endpoint, `reversed` swapping which of `us_min`/`us_max` is which
+/// endpoint. Clamped to `[us_min, us_max]` and rounded to the nearest
+/// microsecond.
+fn render_us(pwm: PwmCalibration, max_pos: f64, max_neg: f64, value: f64) -> u16 {
+    let (low_us, high_us) = if pwm.reversed {
+        (pwm.us_max, pwm.us_min)
+    } else {
+        (pwm.us_min, pwm.us_max)
+    };
+    let center = pwm.us_center as f64;
+    let us = if value >= 0.0 {
+        let frac = if max_pos > 0.0 {
+            (value / max_pos).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        center + frac * (high_us as f64 - center)
+    } else {
+        let frac = if max_neg > 0.0 {
+            (-value / max_neg).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        center + frac * (low_us as f64 - center)
+    };
+    us.round().clamp(pwm.us_min as f64, pwm.us_max as f64) as u16
+}
+
+/// One mapped `actuator_uart` bus: the open port, its channel-ordered render
+/// table, and the reader thread for the reverse-direction `$CXPWR` reports
+/// (D-021 "command-then-report lite", unchanged by the move from a CLI-fixed
+/// port to a manifest bus).
+struct ActuatorLink {
+    port: std::fs::File,
+    channels: Vec<EffectorChannel>,
+    power_rx: Receiver<(u8, Timestamp)>,
+    power_reader: PowerReportReader,
+}
+
 /// Applies one parsed CRSF frame's events to the core (D-025). Kill maps to
 /// disarm, re-issued every frame while engaged (dead-man doctrine: cheap,
 /// idempotent, and the caller's choice per coxswain-drivers::rc's doc
@@ -529,16 +662,30 @@ fn run() -> Result<(), String> {
         for &id in estimator.imu.as_slice() {
             sim.add_yaw_rate(id, YawRateModel::new(YAW_RATE_RATE_HZ, YAW_RATE_STD_RADPS));
         }
+        // Effector table wired into the plant (D-026): sim mode drives the
+        // plant from allocator output (`apply_outputs`, below in the tick
+        // loop) rather than raw tau whenever the manifest declares
+        // effectors, so saturation and underactuation are in play even
+        // without hardware (D-020).
+        if !manifest.config.effectors.is_empty() {
+            sim.set_effectors(manifest.config.effectors.as_slice());
+        }
         Some(sim)
     } else {
         None
     };
 
+    // Effector render table (D-026/D-027), grouped by actuator_uart bus and
+    // channel-validated regardless of sim vs. real-serial mode (see the
+    // function doc comment).
+    let actuator_groups = actuator_bus_channels(&manifest)?;
+
     // Bus port map: logical manifest bus id -> real device path (not a
     // Linux path the manifest itself carries: buses name conn-node
-    // peripherals). Only nmea0183_uart buses have a driver in this profile
-    // today (Phase 6's GNSS-over-0183 item); mapping any other bus kind is
-    // rejected rather than silently doing nothing.
+    // peripherals). nmea0183_uart and actuator_uart buses have a driver in
+    // this profile (Phase 6's GNSS-over-0183 item, Phase 6b's $CXOUT item);
+    // mapping any other bus kind is rejected rather than silently doing
+    // nothing.
     let mut port_map: HashMap<&str, &str> = HashMap::new();
     for (bus_id, path) in &args.ports {
         let bus = manifest
@@ -546,7 +693,7 @@ fn run() -> Result<(), String> {
             .iter()
             .find(|b| b.id.as_str() == bus_id)
             .ok_or_else(|| format!("--port {bus_id}=...: no such bus in the manifest"))?;
-        if bus.kind != BusKind::Nmea0183Uart {
+        if !matches!(bus.kind, BusKind::Nmea0183Uart | BusKind::ActuatorUart) {
             return Err(format!(
                 "--port {bus_id}=...: bus kind {:?} has no driver in this hosted profile yet",
                 bus.kind
@@ -557,7 +704,9 @@ fn run() -> Result<(), String> {
     // Self-sufficiency (invariant 1, D-009): with the simulator not standing
     // in, every inner_loop sensor's bus needs a working path or boot fails.
     // An enrichment-only bus with no mapping just doesn't stream; a warning
-    // says so, but nothing about the control loop depends on it.
+    // says so, but nothing about the control loop depends on it. An
+    // actuator_uart bus carrying effectors gets the same D-009 treatment:
+    // the vessel cannot actuate without it.
     if !sim_enabled {
         for bus in manifest.buses.iter() {
             if port_map.contains_key(bus.id.as_str()) {
@@ -568,6 +717,19 @@ fn run() -> Result<(), String> {
                 // own bind-failure boot-error check (D-009); it needs no
                 // --port, so it would otherwise wrongly fall into the
                 // generic "no driver for that bus kind yet" error below.
+                continue;
+            }
+            if bus.kind == BusKind::ActuatorUart {
+                if actuator_groups.iter().any(|(id, _)| id == bus.id.as_str()) {
+                    return Err(format!(
+                        "bus {:?} carries effectors but has no --port mapping \
+                         (self-sufficiency, D-009): pass --port {}=<device>",
+                        bus.id.as_str(),
+                        bus.id.as_str()
+                    ));
+                }
+                // No effectors on this bus: nothing to actuate, so an
+                // unmapped actuator_uart bus here is inert, not a gap.
                 continue;
             }
             let inner_loop_here = manifest
@@ -717,23 +879,33 @@ fn run() -> Result<(), String> {
         }
         _ => None,
     };
-    // The actuator link is bidirectional (D-021 "command-then-report
-    // lite"): `port` stays open for `write_demand`, and a `try_clone`
-    // duplicates the fd for a reader thread on the same pattern as the GNSS
-    // and RC links (`spawn_byte_reader`'s own doc comment), draining the
-    // far end's $CXPWR reports.
-    let mut actuator_port = None;
-    let mut actuator_rx = None;
-    if let Some(path) = &args.actuator_port {
-        let port = serial::open_serial(path, ACTUATOR_BAUD).map_err(|e| format!("{path}: {e}"))?;
+    // Each mapped actuator_uart bus is bidirectional (D-021 "command-then-
+    // report lite"): `port` stays open for `write_outputs`, and a
+    // `try_clone` duplicates the fd for a reader thread on the same pattern
+    // as the GNSS and RC links (`spawn_byte_reader`'s own doc comment),
+    // draining the far end's $CXPWR reports.
+    let mut actuator_links: Vec<ActuatorLink> = Vec::new();
+    for (bus_id, channels) in &actuator_groups {
+        let Some(&path) = port_map.get(bus_id.as_str()) else {
+            continue;
+        };
+        let bus = manifest
+            .buses
+            .iter()
+            .find(|b| b.id.as_str() == bus_id.as_str())
+            .expect("bus id sourced from manifest.buses in actuator_bus_channels");
+        let port = serial::open_serial(path, bus.rate).map_err(|e| format!("{path}: {e}"))?;
         let reader_handle = port
             .try_clone()
             .map_err(|e| format!("{path}: clone for the power-report reader: {e}"))?;
-        actuator_rx = Some(spawn_byte_reader(reader_handle, boot));
-        actuator_port = Some(port);
+        actuator_links.push(ActuatorLink {
+            port,
+            channels: channels.clone(),
+            power_rx: spawn_byte_reader(reader_handle, boot),
+            power_reader: PowerReportReader::new(),
+        });
     }
     let actuator_driver = ActuatorSerialDriver::new();
-    let mut power_reader = PowerReportReader::new();
     // Flips true on the first $CXPWR report so the boot-default-to-measured
     // transition logs exactly once (see the ingestion block below); the
     // default itself lives in `Core::new` and needs no change here.
@@ -886,7 +1058,7 @@ fn run() -> Result<(), String> {
             }
         }
 
-        // Real power reports: the actuator link's reverse direction
+        // Real power reports: each actuator link's reverse direction
         // (coxswain-drivers::actuator_serial's module doc comment), drained
         // the same way as the other real-driver byte streams above and fed
         // into the core exactly where the sim backend feeds its voltage.
@@ -895,9 +1067,9 @@ fn run() -> Result<(), String> {
         // doc comment); that is a deliberate open item, not an oversight,
         // left for its own failsafe-matrix decision rather than invented
         // here.
-        if let Some(rx) = &actuator_rx {
-            while let Ok((byte, acquired_at)) = rx.try_recv() {
-                match power_reader.push(byte, acquired_at) {
+        for link in &mut actuator_links {
+            while let Ok((byte, acquired_at)) = link.power_rx.try_recv() {
+                match link.power_reader.push(byte, acquired_at) {
                     Some(Ok(status)) => {
                         if !power_report_received {
                             eprintln!(
@@ -919,24 +1091,42 @@ fn run() -> Result<(), String> {
 
         let out = core.tick(now);
         if let Some(sim) = sim.as_mut() {
-            sim.apply_command(&out.command);
+            // Effectors present -> the plant is driven by what the
+            // allocator actually rendered (D-026/D-020); no effector table
+            // -> unchanged tau-direct behavior.
+            match out.outputs.as_ref() {
+                Some(outputs) => sim.apply_outputs(outputs),
+                None => sim.apply_command(&out.command),
+            }
         }
-        // The actuator serial link is transmit-only and conn-node-local
-        // (`Args` doc comment): one $CXACT line per tick from the effective
-        // demand, including zero while disarmed (the dead-man doctrine the
-        // wire format's own doc comment describes; the far end's watchdog
-        // is what a withheld line would defeat).
-        if let Some(port) = actuator_port.as_mut() {
-            let mut sink = |bytes: &[u8]| {
-                let _ = port.write_all(bytes);
-            };
-            if actuator_driver
-                .write_demand(&mut sink, out.command.demand)
-                .is_err()
-                && !driver_error_logged
-            {
-                eprintln!("coxswain-hosted: actuator demand not finite (continuing)");
-                driver_error_logged = true;
+        // Each mapped actuator_uart link is transmit-only (D-021): one
+        // $CXOUT line per tick from the allocator's per-effector output,
+        // rendered through this effector's manifest calibration, including
+        // the calibrated zero-demand microseconds while disarmed (the
+        // dead-man doctrine the wire format's own doc comment describes;
+        // the far end's watchdog is what a withheld line would defeat).
+        if !actuator_links.is_empty() {
+            let outputs = out.outputs.as_ref().expect(
+                "an actuator link exists only when the manifest declares effectors, which is \
+                 exactly when Core builds an allocator (Core::new)",
+            );
+            for link in &mut actuator_links {
+                let us: Vec<u16> = link
+                    .channels
+                    .iter()
+                    .map(|ch| {
+                        render_us(
+                            ch.pwm,
+                            ch.max_pos,
+                            ch.max_neg,
+                            outputs.values.as_slice()[ch.effector_index],
+                        )
+                    })
+                    .collect();
+                let mut sink = |bytes: &[u8]| {
+                    let _ = link.port.write_all(bytes);
+                };
+                actuator_driver.write_outputs(&mut sink, &us);
             }
         }
 
@@ -993,5 +1183,71 @@ fn main() -> ExitCode {
             eprintln!("coxswain-hosted: {message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rudderboat-shaped calibration (crates/coxswain-manifest/tests/
+    /// rudderboat.toml): `us_min=1100, us_center=1500, us_max=1900`, not
+    /// reversed.
+    fn pwm(reversed: bool) -> PwmCalibration {
+        PwmCalibration {
+            us_min: 1100,
+            us_center: 1500,
+            us_max: 1900,
+            reversed,
+        }
+    }
+
+    #[test]
+    fn zero_value_renders_center_regardless_of_asymmetric_limits() {
+        // Thruster-shaped: max_pos != max_neg (D-027's asymmetric fwd/rev).
+        assert_eq!(render_us(pwm(false), 300.0, 180.0, 0.0), 1500);
+        assert_eq!(render_us(pwm(true), 300.0, 180.0, 0.0), 1500);
+    }
+
+    #[test]
+    fn endpoints_map_to_us_min_and_us_max() {
+        assert_eq!(render_us(pwm(false), 300.0, 180.0, 300.0), 1900);
+        assert_eq!(render_us(pwm(false), 300.0, 180.0, -180.0), 1100);
+    }
+
+    #[test]
+    fn reversed_swaps_which_endpoint_each_sign_maps_to() {
+        assert_eq!(render_us(pwm(true), 300.0, 180.0, 300.0), 1100);
+        assert_eq!(render_us(pwm(true), 300.0, 180.0, -180.0), 1900);
+    }
+
+    #[test]
+    fn beyond_the_limit_clamps_to_the_endpoint_not_past_it() {
+        assert_eq!(render_us(pwm(false), 300.0, 180.0, 3000.0), 1900);
+        assert_eq!(render_us(pwm(false), 300.0, 180.0, -3000.0), 1100);
+    }
+
+    #[test]
+    fn fractional_microseconds_round_half_away_from_zero() {
+        // frac = 0.00125 of a 400 us span above center = 0.5 us exactly;
+        // 1500.5 rounds up to 1501, not down to 1500.
+        assert_eq!(render_us(pwm(false), 1.0, 1.0, 0.00125), 1501);
+    }
+
+    #[test]
+    fn symmetric_rudder_limit_uses_the_same_max_both_directions() {
+        // Rudder-shaped: one angle limit for both directions (D-026's
+        // EffectorKind::Rudder carries a single max_angle_rad).
+        assert_eq!(render_us(pwm(false), 0.6, 0.6, 0.6), 1900);
+        assert_eq!(render_us(pwm(false), 0.6, 0.6, -0.6), 1100);
+    }
+
+    #[test]
+    fn known_observed_fraction_matches_the_desk_rig_golden() {
+        // ESC at 100 N of a 300 N forward limit: matches the value the
+        // rudderboat desk-rig scenario observes on the wire
+        // (coxswain-hosted/tests/desk_rig.rs's rudderboat_direct_effort_rig
+        // println: "esc 1633 us").
+        assert_eq!(render_us(pwm(false), 300.0, 180.0, 100.0), 1633);
     }
 }

@@ -20,14 +20,20 @@ procurement shortlist.
   before it reaches the parser; an unpinned bus caps at enrichment.
 - CRSF over UART from an RC receiver (RC channels, link statistics).
   Kill switch, takeover switch, surge/yaw sticks per D-025.
-- Actuator command out: one `$CXACT,<surge_n>,<sway_n>,<yaw_nm>*HH` line
-  per 100 ms control tick over UART. The far end must fail safe on
-  silence (recommended: zero thrust after 500 ms without a valid line).
+- Actuator command out: one `$CXOUT,<us0>,<us1>,...*HH` line per 100 ms
+  control tick over UART, one integer-microsecond field per manifest-
+  declared effector channel (D-026/D-027). Full contract is the module doc
+  comment on coxswain-drivers/src/actuator_serial.rs; the far end must fail
+  safe on silence (recommended: calibrated zero/center after 500 ms without
+  a valid line). Allocation (tau to per-effector output) and the physical-
+  to-microsecond rendering both run at the conn node from manifest
+  calibration, so the far end carries no vessel knowledge: it copies fields
+  to PWM channels and watches the line for silence, nothing more.
 - Power report in, same UART, reverse direction: the far end sends
   `$CXPWR,<voltage_v>*HH`, recommended 1 Hz, from an INA2xx-class monitor
   on the actuator MCU. Command-then-report lite ahead of Cyphal
   (D-021, D-010); the parser ignores any other traffic on the wire
-  (an echoed `$CXACT`, say), so nothing further is required of the far
+  (an echoed `$CXOUT`, say), so nothing further is required of the far
   end beyond emitting the line.
 - Hosted profile serial: standard POSIX bauds via termios; on Linux, any
   other exact rate (CRSF's 420000, notably) via termios2/BOTHER.
@@ -41,10 +47,11 @@ procurement shortlist.
 2. An ExpressLRS (CRSF) receiver wired to the conn node, plus any ELRS
    transmitter. SBUS is the fallback if hardware dictates (parser not
    yet written; write it only if forced).
-3. A far-end actuator controller: any small MCU that parses `$CXACT`
-   and drives the vessel's ESC/servo hardware, failing safe on silence.
-   This is the one piece of custom far-end firmware in the bring-up
-   path; the Phase 9 actuator node replaces it.
+3. A far-end actuator controller: any small MCU that parses `$CXOUT` and
+   drives the vessel's ESC/servo hardware from the microseconds it
+   carries, failing safe on silence. This is the one piece of custom
+   far-end firmware in the bring-up path; the Phase 9 actuator node
+   replaces it.
 4. Power monitoring reaching the failsafe matrix: the actuator far end
    measures the battery (INA2xx-class monitor) and reports
    `$CXPWR,<voltage_v>*HH` at about 1 Hz back on the actuator serial
@@ -78,8 +85,11 @@ ordering anything.
   matrix (coxswain-drivers/src/actuator_serial.rs); the healthy default
   applies only until the first report arrives. Report staleness (what
   happens if reports stop) is not handled and remains an open item.
-- RC and actuator serial links are CLI options, not manifest buses;
-  promoting them into the schema is an open item recorded in the code.
+- Closed: the actuator serial link is a manifest `actuator_uart` bus now
+  (D-026/D-027), mapped via `--port <bus_id>=<device>` like any other bus;
+  an unmapped bus carrying effectors is a boot error (self-sufficiency,
+  D-009). RC remains the one CLI option, not a manifest bus; promoting it
+  into the schema is an open item recorded in the code.
 - Baud for the GNSS bus comes from the manifest bus entry; confirm the
   chosen compass actually speaks its rated sentences at that baud with
   heading at 5 Hz or better.

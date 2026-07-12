@@ -1,5 +1,5 @@
-//! Serial actuator backend: transmit-only demand-to-line encoder behind the
-//! driver trait (docs/TASKS.md Phase 6; D-021).
+//! Serial actuator backend: transmit-only per-channel-output-to-line encoder
+//! behind the driver trait (docs/TASKS.md Phase 6; D-021, D-026, D-027).
 //!
 //! ## Bring-up transport, not the reference one
 //!
@@ -12,45 +12,51 @@
 //!
 //! ## Wire format (the spec for whoever writes the far-end firmware)
 //!
-//! One ASCII line per demand:
+//! One ASCII line per tick, positional integer microseconds, one field per
+//! declared channel:
 //!
 //! ```text
-//! $CXACT,<surge_n>,<sway_n>,<yaw_nm>*HH\r\n
+//! $CXOUT,<us0>,<us1>,...*HH\r\n
 //! ```
 //!
-//! NMEA-0183-style framing (`CXACT` reads as talker `CX`, sentence id `ACT`,
+//! NMEA-0183-style framing (`CXOUT` reads as talker `CX`, sentence id `OUT`,
 //! same five-character address shape as `GPGGA`) so the far end can reuse
 //! any 0183 tokenizer rather than a bespoke one. `HH` is the standard XOR
 //! checksum, uppercase hex, over every byte between `$` and `*` (this
 //! module's tests replay each golden line through `coxswain-nmea0183`'s own
-//! checksum logic to prove the framing matches). Each of `surge_n`,
-//! `sway_n`, `yaw_nm` is fixed notation with exactly one decimal digit,
-//! never an exponent: forces and moments at vessel scale never need one
-//! (see `MAX_MAGNITUDE_N`). `ForceDemand` is the generalized tau guidance
-//! produces (surge/sway newtons, yaw newton-meters); thrust allocation to
-//! physical actuators is post-MVP (`coxswain_contract::ForceDemand`'s own
-//! doc comment), so this backend transmits tau itself and lets the device
-//! on the far end map it onto its actuators.
+//! checksum logic to prove the framing matches). Allocation (D-026) has
+//! already turned guidance's generalized tau into per-effector physical
+//! outputs and rendered those through the manifest-declared calibration
+//! (`coxswain_manifest::PwmCalibration`) into microseconds before this
+//! module ever sees a value; the far end copies each field straight to its
+//! matching PWM channel and carries no vessel knowledge (D-027). Field `i`
+//! is channel `i`, the conn node's own boot-time check that declared
+//! channels are contiguous from 0.
 //!
 //! ## Dead-man doctrine: the line rate is the keepalive
 //!
 //! There is no per-line acknowledgement and no heartbeat field. The caller
-//! is expected to call `write_demand` every control tick (100 ms nominal)
-//! with the current demand, including a zero `ForceDemand` while disarmed
-//! or idle, so a line always goes out on schedule. The far end must fail
-//! safe on silence (a watchdog on line arrival, not on any field inside the
-//! line): the same doctrine Keelson setpoint streams already use.
-//! Enforcing that timeout is the far end's job; this module only
-//! guarantees it never withholds a line just because the demand is zero.
+//! is expected to call `write_outputs` every control tick (100 ms nominal)
+//! with the current outputs, including the calibrated zero-demand
+//! microseconds (`us_center` for a symmetric thruster) while disarmed or
+//! idle, so a line always goes out on schedule. The far end must fail safe
+//! on silence (a watchdog on line arrival, not on any field inside the
+//! line, recommended zero/center after 500 ms): the same doctrine Keelson
+//! setpoint streams already use. Enforcing that timeout is the far end's
+//! job; this module only guarantees it never withholds a line just because
+//! the demand is zero. The far end can hardcode its own silence values from
+//! the same calibrated zero-demand microseconds this module renders while
+//! disarmed, since both derive from the same manifest calibration.
 //!
 //! ## Rendering is the last boundary before the wire
 //!
 //! No allocation: numbers are hand-rolled into a stack buffer rather than
 //! going through `format!`, which needs an allocator this crate does not
-//! have. A NaN or infinite field is refused with a typed error and nothing
-//! is written to the sink; upstream guards (guidance, supervisor) should
-//! make a non-finite demand unreachable, so this is defense at the last
-//! boundary, not the primary guard.
+//! have. Values are already integer microseconds by the time they reach
+//! this module (the allocator refuses non-finite tau upstream, and
+//! calibration rendering clamps to `[us_min, us_max]`), so there is no
+//! NaN/infinity case left to guard here, unlike the tau-direct `$CXACT`
+//! predecessor this module replaces.
 //!
 //! ## Power reports: the reverse direction of the same link
 //!
@@ -63,38 +69,34 @@
 //! $CXPWR,<voltage_v>*HH\r\n
 //! ```
 //!
-//! Same shape as `$CXACT`: `CXPWR` is talker `CX`, sentence id `PWR`, `HH`
+//! Same shape as `$CXOUT`: `CXPWR` is talker `CX`, sentence id `PWR`, `HH`
 //! the standard XOR checksum over every byte between `$` and `*`. One
 //! decimal digit is the recommendation for the far end, not something this
 //! parser enforces (see `PowerReportReader`); recommended report rate is
 //! 1 Hz, but the far end owns the rate and the parser does not care.
 //! `PowerReportReader` is the push-based reader for this direction, the
-//! same shape as `write_demand` is for the outgoing one.
+//! same shape as `write_outputs` is for the outgoing one.
 
-use coxswain_contract::{ForceDemand, PowerStatus, Timestamp};
+use coxswain_contract::{PowerStatus, Timestamp};
 
 use crate::Driver;
 
-/// Bound on the rendered magnitude of any one field (newtons or
-/// newton-meters). No real vessel's demand approaches this; a value this
-/// large signals a runaway upstream computation, not a legitimate command,
-/// so it saturates rather than growing the rendered line past its fixed
-/// width. Distinct from the NaN/inf case: this is a finite, just
-/// implausible, value.
-pub const MAX_MAGNITUDE_N: f64 = 999_999.9;
+/// Channels this module will ever render in one line. Matches
+/// `coxswain_contract::MAX_EFFECTORS`: the wire carries one field per
+/// manifest-declared effector on this bus, and the effector table itself is
+/// bounded to that many entries.
+const MAX_CHANNELS: usize = coxswain_contract::MAX_EFFECTORS;
 
-/// `"$CXACT,"` (7) + three fields at worst case `"-999999.9"` (9 bytes
-/// each) with two separating commas (9*3 + 2 = 29) + `"*HH"` (3) +
-/// `"\r\n"` (2) = 41.
-const MAX_LINE_LEN: usize = 41;
+/// `"$CXOUT"` (6) + up to `MAX_CHANNELS` fields, each a leading comma plus
+/// up to 5 digits (`u16::MAX` is `"65535"`) = `MAX_CHANNELS * 6` + `"*HH"`
+/// (3) + `"\r\n"` (2).
+const MAX_LINE_LEN: usize = 6 + MAX_CHANNELS * 6 + 3 + 2;
 
-/// Errors `ActuatorSerialDriver::write_demand` and `Driver` methods can
-/// surface.
+/// Errors `Driver` methods can surface. `write_outputs` itself cannot fail
+/// (module doc comment: rendering integer microseconds has no NaN/infinity
+/// case left to guard).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// A field was NaN or +-infinity. Refused at the source: no line is
-    /// written, not even a partial one.
-    NonFinite,
     /// `Driver::read_with_timestamp` was called on this transmit-only
     /// driver; see the `impl Driver` doc comment.
     TransmitOnly,
@@ -113,34 +115,28 @@ impl ActuatorSerialDriver {
         Self
     }
 
-    /// Renders `demand` as one `$CXACT,...*HH\r\n` line (module doc
-    /// comment) and hands it to `sink` in a single call. Refuses without
-    /// writing anything if any field is NaN or infinite.
-    pub fn write_demand(
-        &self,
-        sink: &mut dyn FnMut(&[u8]),
-        demand: ForceDemand,
-    ) -> Result<(), Error> {
-        if !demand.surge_n.is_finite() || !demand.sway_n.is_finite() || !demand.yaw_nm.is_finite() {
-            return Err(Error::NonFinite);
-        }
-
+    /// Renders `us` as one `$CXOUT,<us0>,<us1>,...*HH\r\n` line (module doc
+    /// comment), one field per channel, and hands it to `sink` in a single
+    /// call. Channels beyond `MAX_CHANNELS` are dropped rather than
+    /// panicking (`Driver` methods stay total); the effector table this
+    /// slice is rendered from is itself bounded to `MAX_CHANNELS` entries
+    /// (`coxswain_contract::MAX_EFFECTORS`), so this never actually
+    /// truncates a real manifest's output.
+    pub fn write_outputs(&self, sink: &mut dyn FnMut(&[u8]), us: &[u16]) {
         let mut buf = [0u8; MAX_LINE_LEN];
         let mut pos = 0;
-        for &b in b"$CXACT," {
+        for &b in b"$CXOUT" {
             buf[pos] = b;
             pos += 1;
         }
-        write_field(&mut buf, &mut pos, demand.surge_n);
-        buf[pos] = b',';
-        pos += 1;
-        write_field(&mut buf, &mut pos, demand.sway_n);
-        buf[pos] = b',';
-        pos += 1;
-        write_field(&mut buf, &mut pos, demand.yaw_nm);
+        for &v in us.iter().take(MAX_CHANNELS) {
+            buf[pos] = b',';
+            pos += 1;
+            write_uint(&mut buf, &mut pos, v as u64);
+        }
 
         // Checksum covers everything between `$` and `*`: buf[1..pos] is
-        // exactly that (the address plus the three fields just written),
+        // exactly that (the address plus the channel fields just written),
         // matching coxswain-nmea0183's own `strip_checksum` fold.
         let checksum = buf[1..pos].iter().fold(0u8, |acc, &b| acc ^ b);
         buf[pos] = b'*';
@@ -152,7 +148,6 @@ impl ActuatorSerialDriver {
         pos += 1;
 
         sink(&buf[..pos]);
-        Ok(())
     }
 }
 
@@ -180,7 +175,7 @@ impl Driver for ActuatorSerialDriver {
     /// `init`/`self_test` are reachable through the same `Driver` interface
     /// as every other driver in the workspace, same honest-deviation
     /// pattern as `gnss0183::Gnss0183Driver::read_with_timestamp`; always
-    /// errors rather than fabricating a reading. `write_demand` is the
+    /// errors rather than fabricating a reading. `write_outputs` is the
     /// primary surface.
     fn read_with_timestamp(
         &mut self,
@@ -208,17 +203,17 @@ pub enum PowerError {
 /// (module doc comment on why "unrecognized" is not an error): generous
 /// versus any real `$CXPWR,<voltage>*HH` line (well under 20 bytes for any
 /// voltage a small vessel's DC bus would ever report), and comfortably past
-/// `ActuatorSerialDriver::MAX_LINE_LEN` (41, this module's own worst-case
-/// `$CXACT` line without its `\r\n`) so a full echoed `$CXACT` is captured
+/// `ActuatorSerialDriver::MAX_LINE_LEN` (59, this module's own worst-case
+/// `$CXOUT` line without its `\r\n`) so a full echoed `$CXOUT` is captured
 /// intact and skipped by its address, not truncated into a false read.
-const MAX_POWER_LINE_LEN: usize = 48;
+const MAX_POWER_LINE_LEN: usize = 64;
 
 /// `$CXPWR`'s five-character address, `TTSSS` shape (talker `CX`, sentence
-/// id `PWR`), same convention `$CXACT` documents at the top of this module.
+/// id `PWR`), same convention `$CXOUT` documents at the top of this module.
 const CXPWR_ADDRESS: [u8; 5] = *b"CXPWR";
 
 /// Push-based reader for `$CXPWR` reports arriving on the actuator link:
-/// the reverse direction of `$CXACT` (module doc comment). Byte-fed and
+/// the reverse direction of `$CXOUT` (module doc comment). Byte-fed and
 /// pure, same shape as `coxswain_nmea0183::SentenceReader` and
 /// `gnss0183::Gnss0183Driver::push`: no UART, no clock, no allocation.
 ///
@@ -229,7 +224,7 @@ const CXPWR_ADDRESS: [u8; 5] = *b"CXPWR";
 /// address it does not recognize -- `CXPWR` included -- comes back as
 /// `ParseError::UnsupportedSentence` with the field body already discarded
 /// (this module's own write-path tests rely on exactly that to cross-check
-/// `$CXACT`'s checksum). There is no hook to reach the voltage field even
+/// `$CXOUT`'s checksum). There is no hook to reach the voltage field even
 /// after the checksum passes, short of forking that crate to teach it a
 /// sentence type that belongs to this point-to-point link, not to a
 /// general-purpose 0183 bus. `SentenceReader` also checksum-verifies
@@ -246,7 +241,7 @@ const CXPWR_ADDRESS: [u8; 5] = *b"CXPWR";
 /// because it tolerates an external, uncontrolled bus (manifest quirk
 /// flags exist for exactly that case). This link is ours end to end: the
 /// far end is the actuator firmware this repo specifies, its only other
-/// traffic is an echo of the `$CXACT` lines we sent it, and the only
+/// traffic is an echo of the `$CXOUT` lines we sent it, and the only
 /// consumer here is the voltage. So a line whose address is not `CXPWR`
 /// -- an echo, noise, anything else -- is skipped without an error, the
 /// same treatment `SentenceReader` already gives bytes before the first
@@ -274,7 +269,7 @@ impl PowerReportReader {
     /// read here, same as `Gnss0183Driver::push`). `Some` exactly when a
     /// line terminator ends a `$CXPWR` line: `Ok` with the parsed report,
     /// `Err` once the address matched but something inside the line was
-    /// wrong. Any other line -- an echoed `$CXACT`, noise, a line that
+    /// wrong. Any other line -- an echoed `$CXOUT`, noise, a line that
     /// outgrows the buffer before a terminator -- resolves to `None`
     /// (this type's own doc comment on why unknown addresses are quiet
     /// here).
@@ -360,7 +355,7 @@ fn parse_power_line(
     let expected = (hi << 4) | lo;
     // Fold covers address+comma+field, `$` and `*hh` excluded: the same
     // span `coxswain-nmea0183`'s own checksum fold covers, and the span
-    // `write_demand`'s checksum above covers for the outgoing direction.
+    // `write_outputs`'s checksum above covers for the outgoing direction.
     let actual = address
         .iter()
         .chain(core::iter::once(&b','))
@@ -399,39 +394,9 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Clamps to `+-MAX_MAGNITUDE_N`, then renders `[sign] integer '.' digit`,
-/// rounding half away from zero on the magnitude. No `f64::round`: a
-/// cast-and-compare on the already-nonnegative magnitude does that part.
-/// `clamp` and the sign negation are plain comparisons, not libm, so this
-/// still pulls in nothing beyond core float arithmetic (no new dependency
-/// edge).
-fn write_field(buf: &mut [u8], pos: &mut usize, value: f64) {
-    let clamped = value.clamp(-MAX_MAGNITUDE_N, MAX_MAGNITUDE_N);
-    let magnitude = if clamped < 0.0 { -clamped } else { clamped };
-
-    let scaled = magnitude * 10.0;
-    let mut tenths = scaled as u64; // truncates toward zero; scaled >= 0
-    if scaled - (tenths as f64) >= 0.5 {
-        tenths += 1;
-    }
-
-    // Sign is suppressed when rounding collapses the magnitude to zero: a
-    // demand of, say, -0.02 N renders "0.0", never "-0.0", so the far end
-    // never has to reason about negative zero.
-    if clamped < 0.0 && tenths != 0 {
-        buf[*pos] = b'-';
-        *pos += 1;
-    }
-    write_uint(buf, pos, tenths / 10);
-    buf[*pos] = b'.';
-    *pos += 1;
-    buf[*pos] = b'0' + (tenths % 10) as u8;
-    *pos += 1;
-}
-
 /// Writes `n`'s decimal digits, at least one (`"0"` for `n == 0`). Capacity
-/// 8 is headroom over the 6 digits `MAX_MAGNITUDE_N`'s whole part ever
-/// produces.
+/// 8 is headroom over the 5 digits a `u16` microsecond field ever produces
+/// (`u16::MAX` is `"65535"`).
 fn write_uint(buf: &mut [u8], pos: &mut usize, mut n: u64) {
     let mut digits = [0u8; 8];
     let mut count = 0;
@@ -461,18 +426,9 @@ fn write_hex_byte(buf: &mut [u8], pos: &mut usize, byte: u8) {
 mod tests {
     use super::*;
 
-    fn demand(surge_n: f64, sway_n: f64, yaw_nm: f64) -> ForceDemand {
-        ForceDemand {
-            surge_n,
-            sway_n,
-            yaw_nm,
-        }
-    }
-
     /// Renders one line into a fixed buffer and returns the written slice's
-    /// length; panics (via `unwrap`) on `Err`, which is the point for these
-    /// happy-path tests.
-    fn render(demand: ForceDemand) -> ([u8; MAX_LINE_LEN], usize) {
+    /// length.
+    fn render(us: &[u16]) -> ([u8; MAX_LINE_LEN], usize) {
         let driver = ActuatorSerialDriver::new();
         let mut buf = [0u8; MAX_LINE_LEN];
         let mut len = 0usize;
@@ -480,13 +436,13 @@ mod tests {
             buf[len..len + bytes.len()].copy_from_slice(bytes);
             len += bytes.len();
         };
-        driver.write_demand(&mut sink, demand).unwrap();
+        driver.write_outputs(&mut sink, us);
         (buf, len)
     }
 
     /// Independently re-verifies a rendered line's checksum by replaying it
     /// through `coxswain-nmea0183`'s own parser (no line terminator, per
-    /// its one-shot `parse_sentence` contract). `CXACT` is a well-formed
+    /// its one-shot `parse_sentence` contract). `CXOUT` is a well-formed
     /// five-character address but not a sentence type that crate parses,
     /// so a correct checksum surfaces as `UnsupportedSentence`; a wrong one
     /// would surface as `ChecksumMismatch` instead, which is exactly the
@@ -503,84 +459,65 @@ mod tests {
     }
 
     #[test]
-    fn zero_demand_renders_golden_line() {
-        let (buf, len) = render(demand(0.0, 0.0, 0.0));
-        assert_eq!(&buf[..len], b"$CXACT,0.0,0.0,0.0*4F\r\n");
+    fn single_channel_renders_golden_line() {
+        // Checksum hand-verified: XOR of "CXOUT,1500" is 0x7D.
+        let (buf, len) = render(&[1500]);
+        assert_eq!(&buf[..len], b"$CXOUT,1500*7D\r\n");
         assert_checksum_matches_0183_parser(&buf[..len]);
     }
 
     #[test]
-    fn known_demand_renders_golden_line() {
-        // Checksum hand-verified: XOR of "CXACT,100.0,-25.5,3.2" is 0x50.
-        let (buf, len) = render(demand(100.0, -25.5, 3.2));
-        assert_eq!(&buf[..len], b"$CXACT,100.0,-25.5,3.2*50\r\n");
+    fn twin_thruster_center_renders_golden_line() {
+        // Checksum hand-verified: XOR of "CXOUT,1500,1500" is 0x55.
+        let (buf, len) = render(&[1500, 1500]);
+        assert_eq!(&buf[..len], b"$CXOUT,1500,1500*55\r\n");
         assert_checksum_matches_0183_parser(&buf[..len]);
     }
 
     #[test]
-    fn rounding_and_negative_values_render_correctly() {
-        // -0.05 -> -0.1, 12.34 -> 12.3, -123.456 -> -123.5 (hand-computed,
-        // round half away from zero on the magnitude). Checksum of
-        // "CXACT,-0.1,12.3,-123.5" hand-verified as 0x7B.
-        let (buf, len) = render(demand(-0.05, 12.34, -123.456));
-        assert_eq!(&buf[..len], b"$CXACT,-0.1,12.3,-123.5*7B\r\n");
+    fn asymmetric_channels_render_golden_line() {
+        // Checksum hand-verified: XOR of "CXOUT,1100,1900" is 0x5D.
+        let (buf, len) = render(&[1100, 1900]);
+        assert_eq!(&buf[..len], b"$CXOUT,1100,1900*5D\r\n");
         assert_checksum_matches_0183_parser(&buf[..len]);
     }
 
     #[test]
-    fn round_half_up_carries_into_the_whole_part() {
-        // 0.95 -> 1.0, -0.95 -> -1.0: the tenths total (10) rolls into the
-        // integer part rather than clamping the fractional digit at 9.
-        let (buf, len) = render(demand(0.95, -0.95, 0.0));
-        assert_eq!(&buf[..len], b"$CXACT,1.0,-1.0,0.0*62\r\n");
-    }
-
-    #[test]
-    fn small_negative_value_rounds_to_zero_without_a_minus_sign() {
-        // -0.02 rounds to zero magnitude; the sign is suppressed rather
-        // than emitting "-0.0" (module doc comment / write_field comment).
-        let (buf, len) = render(demand(0.0, -0.02, 0.0));
-        assert_eq!(&buf[..len], b"$CXACT,0.0,0.0,0.0*4F\r\n");
-    }
-
-    #[test]
-    fn large_magnitudes_clamp_without_an_exponent() {
-        // Both signs, one field left small, to confirm clamping is
-        // per-field, not all-or-nothing.
-        let (buf, len) = render(demand(5_000_000.0, -5_000_000.0, 0.0));
-        assert_eq!(&buf[..len], b"$CXACT,999999.9,-999999.9,0.0*62\r\n");
+    fn zero_and_max_u16_render_without_an_extra_digit() {
+        // Checksum hand-verified: XOR of "CXOUT,0,65535" is 0x55.
+        let (buf, len) = render(&[0, 65535]);
+        assert_eq!(&buf[..len], b"$CXOUT,0,65535*55\r\n");
         assert_checksum_matches_0183_parser(&buf[..len]);
     }
 
     #[test]
     fn worst_case_line_fits_exactly_in_the_line_buffer() {
-        // All three fields clamped negative: the longest line this module
-        // can ever produce, 41 bytes (MAX_LINE_LEN's derivation). A wrong
+        // MAX_CHANNELS fields all at u16::MAX: the longest line this module
+        // can ever produce, 59 bytes (MAX_LINE_LEN's derivation). A wrong
         // buffer size would panic on the write, not silently truncate.
-        let (buf, len) = render(demand(-5_000_000.0, -5_000_000.0, -5_000_000.0));
+        // Checksum hand-verified: XOR of "CXOUT,65535,65535,65535,65535,
+        // 65535,65535,65535,65535" is 0x55.
+        let (buf, len) = render(&[u16::MAX; MAX_CHANNELS]);
         assert_eq!(len, MAX_LINE_LEN);
-        assert_eq!(&buf[..len], b"$CXACT,-999999.9,-999999.9,-999999.9*5B\r\n");
+        assert_eq!(
+            &buf[..len],
+            b"$CXOUT,65535,65535,65535,65535,65535,65535,65535,65535*55\r\n"
+        );
         assert_checksum_matches_0183_parser(&buf[..len]);
     }
 
     #[test]
-    fn nan_surge_is_refused_and_sink_receives_nothing() {
-        let driver = ActuatorSerialDriver::new();
-        let mut bytes_seen = 0usize;
-        let mut sink = |bytes: &[u8]| bytes_seen += bytes.len();
-        let result = driver.write_demand(&mut sink, demand(f64::NAN, 0.0, 0.0));
-        assert_eq!(result, Err(Error::NonFinite));
-        assert_eq!(bytes_seen, 0);
-    }
-
-    #[test]
-    fn infinite_yaw_is_refused_and_sink_receives_nothing() {
-        let driver = ActuatorSerialDriver::new();
-        let mut bytes_seen = 0usize;
-        let mut sink = |bytes: &[u8]| bytes_seen += bytes.len();
-        let result = driver.write_demand(&mut sink, demand(0.0, 0.0, f64::NEG_INFINITY));
-        assert_eq!(result, Err(Error::NonFinite));
-        assert_eq!(bytes_seen, 0);
+    fn channels_beyond_max_channels_are_dropped_not_panicked() {
+        // Driver::write_outputs stays total (module doc comment on Error):
+        // one extra channel past MAX_CHANNELS is silently dropped rather
+        // than overflowing the fixed buffer.
+        let mut us = [1500u16; MAX_CHANNELS + 1];
+        us[MAX_CHANNELS] = 9999;
+        let (buf, len) = render(&us);
+        assert_eq!(
+            &buf[..len],
+            b"$CXOUT,1500,1500,1500,1500,1500,1500,1500,1500*55\r\n"
+        );
     }
 
     #[test]
@@ -629,7 +566,7 @@ mod tests {
 
     /// Independently re-verifies a `$CXPWR` line's checksum by replaying it
     /// through `coxswain-nmea0183`'s own parser, same trick
-    /// `assert_checksum_matches_0183_parser` uses for `$CXACT`: `CXPWR` is a
+    /// `assert_checksum_matches_0183_parser` uses for `$CXOUT`: `CXPWR` is a
     /// well-formed five-character address this crate does not parse, so a
     /// correct checksum surfaces as `UnsupportedSentence` and a wrong one as
     /// `ChecksumMismatch`.
@@ -717,10 +654,10 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_cxact_echo_is_skipped_without_error() {
-        // A far end may echo the $CXACT lines it receives, or emit other
+    fn interleaved_cxout_echo_is_skipped_without_error() {
+        // A far end may echo the $CXOUT lines it receives, or emit other
         // traffic; this reader's own doc comment on why an unrecognized
-        // address is quiet, not an error. The golden $CXACT line from the
+        // address is quiet, not an error. The golden $CXOUT line from the
         // write-path tests above stands in for the echo: fed in full,
         // including its terminator, it must produce no result at all (not
         // even an error) before the genuine CXPWR report that follows on
@@ -728,7 +665,7 @@ mod tests {
         // cleanly rather than getting stuck.
         let t = Timestamp::from_nanos(1_000);
         let mut reader = PowerReportReader::new();
-        feed_silently(&mut reader, b"$CXACT,0.0,0.0,0.0*4F\r\n", t);
+        feed_silently(&mut reader, b"$CXOUT,1500,1500*55\r\n", t);
         let status = feed(&mut reader, b"$CXPWR,12.6*79", t).unwrap().unwrap();
 
         assert_eq!(status.voltage_v, 12.6);

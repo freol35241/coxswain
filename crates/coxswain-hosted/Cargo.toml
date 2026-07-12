@@ -10,6 +10,9 @@ coxswain-contract = { path = "../coxswain-contract" }
 coxswain-estimator = { path = "../coxswain-estimator" }
 coxswain-guidance = { path = "../coxswain-guidance" }
 coxswain-supervisor = { path = "../coxswain-supervisor" }
+# Control allocation (D-026): maps guidance's tau onto per-effector outputs
+# from the manifest-declared effector table.
+coxswain-allocation = { path = "../coxswain-allocation" }
 # The binary boots from a compiled blob; default features are the no_std
 # reader plus the hash, which is all it needs.
 coxswain-manifest = { path = "../coxswain-manifest" }

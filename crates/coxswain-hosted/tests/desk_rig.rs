@@ -10,33 +10,48 @@
 //! rig exercises an independent code path that doesn't need to share state
 //! with the others.
 //!
-//! - `gnss_fusion_rig`: boots the binary with only the GNSS bus mapped to a
-//!   pty. A harness-side `coxswain-sim` plant is truth; every 200 ms (5 Hz,
-//!   both sentences, per the 2026-07-10 experiment's conclusion that 5 Hz
-//!   heading suffices without a gyro) it's rendered into checksummed
-//!   GGA+HDT and written to the pty master. Asserts the binary's estimator
-//!   converges on truth and the tick loop never gapped.
+//! The manifest (`MANIFEST_TEMPLATE`) declares a twin differential thruster
+//! pair on an `actuator_uart` bus (D-026/D-027): allocation runs inside the
+//! binary under test, so every rig now needs that bus mapped to a pty too
+//! (self-sufficiency, D-009), even the ones that never arm thrust.
+//!
+//! - `gnss_fusion_rig`: boots the binary with the GNSS bus mapped to a pty
+//!   (plus the actuator bus, drained but otherwise unused). A harness-side
+//!   `coxswain-sim` plant is truth; every 200 ms (5 Hz, both sentences, per
+//!   the 2026-07-10 experiment's conclusion that 5 Hz heading suffices
+//!   without a gyro) it's rendered into checksummed GGA+HDT and written to
+//!   the pty master. Asserts the binary's estimator converges on truth and
+//!   the tick loop never gapped.
 //! - `rc_authority_rig`: boots the binary with the GNSS bus plus the RC and
-//!   actuator CLI ports all mapped to ptys, closing the full physical loop
-//!   (actuator demand -> harness plant -> truth -> GNSS sentences -> the
-//!   binary's estimator). Scripts a teleop arm (over Keelson, the existing
-//!   claimant path; RC has no arm switch of its own, D-025's kill-first
-//!   sequencing), an RC takeover preempting teleop by manifest priority,
-//!   stick effort driving the plant, a kill disarming it, and a kill
-//!   release. See that test's doc comment for why the final assertion is
-//!   "the RC claimant's link stays alive", not "thrust resumes": nothing in
-//!   the RC adapter re-arms.
+//!   actuator ports all mapped to ptys (the actuator link is a manifest bus
+//!   now, mapped via `--port` like any other), closing the full physical
+//!   loop (allocated thruster outputs -> harness plant -> truth -> GNSS
+//!   sentences -> the binary's estimator). Scripts a teleop arm (over
+//!   Keelson, the existing claimant path; RC has no arm switch of its own,
+//!   D-025's kill-first sequencing), an RC takeover preempting teleop by
+//!   manifest priority, stick effort driving the plant, a kill disarming
+//!   it, and a kill release. See that test's doc comment for why the final
+//!   assertion is "the RC claimant's link stays alive", not "thrust
+//!   resumes": nothing in the RC adapter re-arms.
 //! - `power_report_rig`: boots the binary with the GNSS bus and the
-//!   actuator port mapped, no RC. Writes `$CXPWR` reports on the actuator
+//!   actuator bus mapped, no RC. Writes `$CXPWR` reports on the actuator
 //!   pty master (the real link's reverse direction, coxswain-drivers::
 //!   actuator_serial's module doc comment) and asserts the failsafe matrix
 //!   v1's report-only low-voltage behavior (a fresh arm attempt refused,
 //!   the existing armed state untouched) followed by a critical-voltage
 //!   forced disarm.
+//! - `rudderboat_direct_effort_rig`: a second manifest fixture
+//!   (`RUDDERBOAT_MANIFEST_TEMPLATE`), the underactuated ESC-plus-rudder
+//!   shape from crates/coxswain-manifest/tests/rudderboat.toml, teleop
+//!   only. Teleop's `DirectEffort` setpoint bypasses guidance, so this
+//!   exercises the allocator's $CXOUT rendering directly: combined
+//!   surge+yaw effort moves the ESC field above center and the rudder
+//!   field off center in the sign-predicted direction, and zero effort
+//!   returns both to center.
 //!
-//! Requires zenohd on PATH for `rc_authority_rig` and `power_report_rig`
-//! (same as integration_zenoh.rs); `gnss_fusion_rig` needs no router at
-//! all, since it drives no claimant.
+//! Requires zenohd on PATH for `rc_authority_rig`, `power_report_rig`, and
+//! `rudderboat_direct_effort_rig` (same as integration_zenoh.rs);
+//! `gnss_fusion_rig` needs no router at all, since it drives no claimant.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -49,11 +64,66 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use coxswain_contract::{ActuatorCommand, ClaimantId, ForceDemand, GeoPoint, Timestamp};
+use coxswain_contract::{
+    ActuatorOutputs, BoundedList, ClaimantId, EffectorConfig, EffectorId, EffectorKind,
+    ForceDemand, GeoPoint, Setpoint, Timestamp,
+};
 use coxswain_keelson::{ClaimantClient, ConnReplyResult};
 use coxswain_model::LocalFrame;
 use coxswain_sim::Simulator;
 use zenoh::Wait;
+
+/// Physical limit mirrored from `MANIFEST_TEMPLATE`'s twin thruster
+/// effectors: symmetric fwd/rev, so the same value scales both directions
+/// of the harness's own `us_to_newtons` inverse below.
+const THRUSTER_MAX_N: f64 = 150.0;
+/// `[effector.pwm]` calibration mirrored from `MANIFEST_TEMPLATE`.
+const PWM_US_MIN: u16 = 1100;
+const PWM_US_CENTER: u16 = 1500;
+const PWM_US_MAX: u16 = 1900;
+
+/// Inverse of the hosted binary's PWM rendering for this symmetric
+/// calibration (main.rs's `render_us` is private to the bin target, and
+/// this is the harness's own ~5 lines, not worth sharing): microseconds
+/// back to newtons, linear through center.
+fn us_to_newtons(us: u16) -> f64 {
+    let span = if us >= PWM_US_CENTER {
+        PWM_US_MAX - PWM_US_CENTER
+    } else {
+        PWM_US_CENTER - PWM_US_MIN
+    };
+    (us as f64 - PWM_US_CENTER as f64) / span as f64 * THRUSTER_MAX_N
+}
+
+/// Twin differential thrusters mirroring `MANIFEST_TEMPLATE`'s
+/// `[[effector]]` table: the harness's own copy of the geometry so
+/// `PlantLoop` can drive the truth plant through `Simulator::apply_outputs`
+/// exactly as the real allocator does (D-026/D-020), independent of the
+/// binary under test.
+fn twin_thrusters() -> [EffectorConfig; 2] {
+    [
+        EffectorConfig {
+            id: EffectorId(0),
+            kind: EffectorKind::FixedThruster {
+                pos_x_m: 0.0,
+                pos_y_m: 1.0,
+                azimuth_rad: 0.0,
+                max_thrust_fwd_n: THRUSTER_MAX_N,
+                max_thrust_rev_n: THRUSTER_MAX_N,
+            },
+        },
+        EffectorConfig {
+            id: EffectorId(1),
+            kind: EffectorKind::FixedThruster {
+                pos_x_m: 0.0,
+                pos_y_m: -1.0,
+                azimuth_rad: 0.0,
+                max_thrust_fwd_n: THRUSTER_MAX_N,
+                max_thrust_rev_n: THRUSTER_MAX_N,
+            },
+        },
+    ]
+}
 
 const SEED: &[u8] = include_bytes!("../../coxswain-manifest/tests/test_key.seed");
 
@@ -112,6 +182,42 @@ kind     = "nmea0183_uart"
 port     = "gnss0"
 baud     = 115200
 checksum = "required"
+
+[[bus]]
+id       = "actuator"
+kind     = "actuator_uart"
+port     = "actuator0"
+baud     = 115200
+
+[[effector]]
+id      = "thruster_port"
+kind    = "fixed_thruster"
+bus     = "actuator"
+channel = 0
+pos_x_m           = 0.0
+pos_y_m           = 1.0
+azimuth_rad       = 0.0
+max_thrust_fwd_n  = 150.0
+max_thrust_rev_n  = 150.0
+[effector.pwm]
+us_min    = 1100
+us_center = 1500
+us_max    = 1900
+
+[[effector]]
+id      = "thruster_stbd"
+kind    = "fixed_thruster"
+bus     = "actuator"
+channel = 1
+pos_x_m           = 0.0
+pos_y_m           = -1.0
+azimuth_rad       = 0.0
+max_thrust_fwd_n  = 150.0
+max_thrust_rev_n  = 150.0
+[effector.pwm]
+us_min    = 1100
+us_center = 1500
+us_max    = 1900
 
 [[sensor]]
 id      = "gnss_main"
@@ -172,6 +278,119 @@ fn build_blob() -> (Vec<u8>, String) {
     (blob, pubkey_hex)
 }
 
+/// The underactuated rudderboat shape (crates/coxswain-manifest/tests/
+/// rudderboat.toml's effector table, D-026/D-027): one ESC astern of the
+/// origin, one rudder further astern, both on the actuator_uart bus, no RC
+/// (this scenario only needs teleop's DirectEffort path).
+const RUDDERBOAT_MANIFEST_TEMPLATE: &str = r#"
+[manifest]
+schema_version = 3
+vessel_id      = "cx-desk-rig-rudderboat-01"
+name           = "Desk Rig Rudderboat"
+revision       = 1
+author         = "test"
+date           = "2026-07-11"
+
+[conn_node]
+board       = "hosted"
+watchdog_ms = 250
+
+[[bus]]
+id       = "gnss0183"
+kind     = "nmea0183_uart"
+port     = "gnss0"
+baud     = 115200
+checksum = "required"
+
+[[bus]]
+id       = "actuator"
+kind     = "actuator_uart"
+port     = "actuator0"
+baud     = 115200
+
+[[effector]]
+id      = "esc_main"
+kind    = "fixed_thruster"
+bus     = "actuator"
+channel = 0
+pos_x_m           = -1.20
+pos_y_m           = 0.00
+azimuth_rad       = 0.0
+max_thrust_fwd_n  = 300.0
+max_thrust_rev_n  = 180.0
+[effector.pwm]
+us_min    = 1100
+us_center = 1500
+us_max    = 1900
+
+[[effector]]
+id      = "rudder_main"
+kind    = "rudder"
+bus     = "actuator"
+channel = 1
+pos_x_m                    = -1.80
+side_force_n_per_rad_mps2  = 400.0
+max_angle_rad              = 0.6
+min_effective_speed_mps    = 0.5
+[effector.pwm]
+us_min    = 1100
+us_center = 1500
+us_max    = 1900
+
+[[sensor]]
+id      = "gnss_main"
+role    = "gnss"
+driver  = "nmea0183"
+bus     = "gnss0183"
+license = "inner_loop"
+
+[[sensor]]
+id      = "heading_main"
+role    = "heading"
+driver  = "nmea0183"
+bus     = "gnss0183"
+license = "inner_loop"
+
+[[claimant]]
+name     = "teleop"
+id       = 7
+priority = 0
+
+[estimator]
+model   = "fossen_3dof"
+gnss    = ["gnss_main"]
+heading = ["heading_main"]
+
+[estimator.params]
+mass_kg   = 180.0
+izz_kg_m2 = 70.0
+x_udot    = -15.0
+y_vdot    = -110.0
+n_rdot    = -60.0
+x_u       = -28.0
+y_v       = -180.0
+n_r       = -90.0
+
+[supervisor]
+claimant_heartbeat_ms      = 1000
+conn_grant_default         = "none"
+position_degraded_after_ms = 3000
+low_voltage_v               = 12.0
+critical_voltage_v          = 11.4
+"#;
+
+fn build_rudderboat_blob() -> (Vec<u8>, String) {
+    let manifest = coxswain_manifest::compile(RUDDERBOAT_MANIFEST_TEMPLATE)
+        .expect("rudderboat desk-rig manifest compiles");
+    let seed: [u8; 32] = SEED.try_into().expect("seed file is 32 bytes");
+    let blob = coxswain_manifest::write(&manifest, &seed);
+    let pubkey_hex: String = coxswain_manifest::public_key(&seed)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    (blob, pubkey_hex)
+}
+
 // -------------------------------------------------------------------- pty
 
 /// Opens a pty pair via the standard POSIX bring-up sequence
@@ -216,7 +435,7 @@ fn open_pty_pair() -> (File, String) {
 
     // Raw mode on the master too: canonical-mode line editing or CR/LF
     // translation on this side would corrupt both the NMEA and CRSF bytes
-    // going out and the $CXACT bytes coming back.
+    // going out and the $CXOUT bytes coming back.
     // SAFETY: master_fd is open and valid.
     let mut term: libc::termios = unsafe { std::mem::zeroed() };
     unsafe {
@@ -413,36 +632,38 @@ fn dist_m(a: GeoPoint, b: GeoPoint) -> f64 {
     n.hypot(e)
 }
 
-// ------------------------------------------------------------- $CXACT read
+// ------------------------------------------------------------- $CXOUT read
 
-/// Parses one `$CXACT,<surge>,<sway>,<yaw>*hh` line (coxswain-drivers::
-/// actuator_serial's wire format). The checksum isn't re-verified here:
-/// that module's own tests already pin its correctness independently: this
-/// harness only needs the demand values.
-fn parse_cxact(line: &str) -> Option<(f64, f64, f64)> {
+/// Parses one `$CXOUT,<us0>,<us1>*hh` line (coxswain-drivers::
+/// actuator_serial's wire format; the desk rig's manifest declares exactly
+/// two effectors, so exactly two fields). The checksum isn't re-verified
+/// here: that module's own tests already pin its correctness independently;
+/// this harness only needs the channel values, and the 0183 tokenizer
+/// compatibility the wire format claims is exercised directly through
+/// `coxswain_nmea0183::parse_sentence` in the tests below.
+fn parse_cxout(line: &str) -> Option<(u16, u16)> {
     let body = line.trim().strip_prefix('$')?;
     let (fields, _checksum) = body.split_once('*')?;
     let mut parts = fields.split(',');
-    if parts.next()? != "CXACT" {
+    if parts.next()? != "CXOUT" {
         return None;
     }
-    let surge: f64 = parts.next()?.parse().ok()?;
-    let sway: f64 = parts.next()?.parse().ok()?;
-    let yaw: f64 = parts.next()?.parse().ok()?;
-    Some((surge, sway, yaw))
+    let us0: u16 = parts.next()?.parse().ok()?;
+    let us1: u16 = parts.next()?.parse().ok()?;
+    Some((us0, us1))
 }
 
 /// Spawns a thread that reads lines off `port` and forwards each complete
-/// `$CXACT` demand. Mirrors `spawn_byte_reader` in the binary under test in
-/// spirit (a dedicated reading thread feeding a channel) but reads whole
-/// lines since the harness has no per-byte timestamping need.
-fn spawn_cxact_reader(port: File) -> Receiver<(f64, f64, f64)> {
+/// `$CXOUT` channel pair. Mirrors `spawn_byte_reader` in the binary under
+/// test in spirit (a dedicated reading thread feeding a channel) but reads
+/// whole lines since the harness has no per-byte timestamping need.
+fn spawn_cxout_reader(port: File) -> Receiver<(u16, u16)> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(port).lines() {
             let Ok(line) = line else { break };
-            if let Some(demand) = parse_cxact(&line)
-                && tx.send(demand).is_err()
+            if let Some(channels) = parse_cxout(&line)
+                && tx.send(channels).is_err()
             {
                 break;
             }
@@ -577,55 +798,54 @@ fn collect_for(rx: &Receiver<Status>, duration: Duration) -> Vec<Status> {
 }
 
 /// Drives `coxswain-sim`'s plant as truth on a fixed 200 ms cadence (5 Hz,
-/// module doc comment): each tick, applies the latest `$CXACT` demand
-/// received (if any) before stepping the plant, then renders truth into
-/// GGA+HDT and writes it to the GNSS master. No virtual sensors are
-/// registered on the `Simulator`, so `step` only integrates the plant and
-/// always returns an empty measurement list; sentence rendering is entirely
-/// this harness's own, not the simulator's sensor models, which is the
-/// point: it exercises the real 0183 driver instead.
+/// module doc comment): each tick, applies the latest `$CXOUT` channel pair
+/// received (if any), converted back to newtons and through the same
+/// `twin_thrusters` effector table the manifest declares
+/// (`Simulator::apply_outputs`, D-026/D-020), before stepping the plant,
+/// then renders truth into GGA+HDT and writes it to the GNSS master. No
+/// virtual sensors are registered on the `Simulator`, so `step` only
+/// integrates the plant and always returns an empty measurement list;
+/// sentence rendering is entirely this harness's own, not the simulator's
+/// sensor models, which is the point: it exercises the real 0183 driver
+/// instead.
 struct PlantLoop {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
     /// Truth snapshots the assertions read back; latest write wins.
     truth: Arc<Mutex<(GeoPoint, f64)>>,
-    /// The most recent `$CXACT` demand actually applied to the plant (zero
-    /// until the first line arrives); how `rc_authority_rig` observes the
-    /// real actuator serial path without a second reader on the same port.
-    demand: Arc<Mutex<ForceDemand>>,
+    /// The most recent `$CXOUT` channel pair actually applied to the plant
+    /// (calibrated center, i.e. zero thrust, until the first line arrives);
+    /// how `rc_authority_rig` observes the real actuator serial path
+    /// without a second reader on the same port.
+    channels: Arc<Mutex<(u16, u16)>>,
 }
 
 impl PlantLoop {
-    fn start(mut gnss_master: File, cxact: Option<Receiver<(f64, f64, f64)>>) -> Self {
+    fn start(mut gnss_master: File, cxout: Option<Receiver<(u16, u16)>>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let truth = Arc::new(Mutex::new((origin(), 0.0)));
         let truth_out = Arc::clone(&truth);
-        let demand = Arc::new(Mutex::new(ForceDemand {
-            surge_n: 0.0,
-            sway_n: 0.0,
-            yaw_nm: 0.0,
-        }));
-        let demand_out = Arc::clone(&demand);
+        let channels = Arc::new(Mutex::new((PWM_US_CENTER, PWM_US_CENTER)));
+        let channels_out = Arc::clone(&channels);
         let handle = std::thread::spawn(move || {
             let mut sim = Simulator::new(&fossen_params(), origin(), Timestamp::from_nanos(0), 1)
                 .expect("harness plant constructs");
+            sim.set_effectors(&twin_thrusters());
             let period = Duration::from_millis(200);
             while !stopping.load(Ordering::Relaxed) {
                 let tick_start = Instant::now();
-                if let Some(rx) = &cxact {
-                    while let Ok((surge_n, sway_n, yaw_nm)) = rx.try_recv() {
-                        *demand_out.lock().unwrap() = ForceDemand {
-                            surge_n,
-                            sway_n,
-                            yaw_nm,
-                        };
+                if let Some(rx) = &cxout {
+                    while let Ok(pair) = rx.try_recv() {
+                        *channels_out.lock().unwrap() = pair;
                     }
                 }
-                let applied = *demand_out.lock().unwrap();
-                sim.apply_command(&ActuatorCommand {
+                let (us0, us1) = *channels_out.lock().unwrap();
+                let values = BoundedList::from_slice(&[us_to_newtons(us0), us_to_newtons(us1)])
+                    .expect("2 effectors fits MAX_EFFECTORS");
+                sim.apply_outputs(&ActuatorOutputs {
                     t: sim.now(),
-                    demand: applied,
+                    values,
                 });
                 let _ = sim.step(period);
                 let truth_state = sim.truth();
@@ -646,7 +866,7 @@ impl PlantLoop {
             stop,
             handle: Some(handle),
             truth,
-            demand,
+            channels,
         }
     }
 
@@ -654,8 +874,8 @@ impl PlantLoop {
         *self.truth.lock().unwrap()
     }
 
-    fn demand_now(&self) -> ForceDemand {
-        *self.demand.lock().unwrap()
+    fn channels_now(&self) -> (u16, u16) {
+        *self.channels.lock().unwrap()
     }
 }
 
@@ -740,8 +960,10 @@ const STICK_HIGH_US: u16 = 2012; // full deflection, channel_to_us's own nominal
 
 // ------------------------------------------------------------------ tests
 
-/// The 0183 GNSS half: real pty bytes in, fused position out. No claimant,
-/// no router, no actuator: isolates the read path this task adds.
+/// The 0183 GNSS half: real pty bytes in, fused position out. No claimant:
+/// isolates the read path this task adds. The manifest's actuator_uart bus
+/// still needs a mapped port (self-sufficiency, D-009: it carries
+/// effectors), so a pty stands in here too, drained but otherwise unused.
 #[test]
 fn gnss_fusion_rig() {
     let tmp = make_tmp("gnss");
@@ -751,12 +973,19 @@ fn gnss_fusion_rig() {
 
     let (gnss_master, gnss_slave) = open_pty_pair();
     let plant = PlantLoop::start(gnss_master, None);
+    let (actuator_master, actuator_slave) = open_pty_pair();
+    let _actuator_drain = spawn_cxout_reader(actuator_master);
 
     let (mut vessel, status_rx) = spawn_vessel(
         &blob_path,
         &pubkey_hex,
         None,
-        &["--port".to_string(), format!("gnss0183={gnss_slave}")],
+        &[
+            "--port".to_string(),
+            format!("gnss0183={gnss_slave}"),
+            "--port".to_string(),
+            format!("actuator={actuator_slave}"),
+        ],
     );
 
     // The estimator needs a handful of real fixes to initialize; bounded,
@@ -808,8 +1037,8 @@ fn rc_authority_rig() {
     let (gnss_master, gnss_slave) = open_pty_pair();
     let (rc_master, rc_slave) = open_pty_pair();
     let (actuator_master, actuator_slave) = open_pty_pair();
-    let cxact_rx = spawn_cxact_reader(actuator_master);
-    let plant = PlantLoop::start(gnss_master, Some(cxact_rx));
+    let cxout_rx = spawn_cxout_reader(actuator_master);
+    let plant = PlantLoop::start(gnss_master, Some(cxout_rx));
     let rc = RcTransmitter::start(rc_master);
 
     let port = free_port();
@@ -850,8 +1079,8 @@ fn rc_authority_rig() {
             rc_slave,
             "--rc-claimant-id".to_string(),
             "1".to_string(),
-            "--actuator-port".to_string(),
-            actuator_slave,
+            "--port".to_string(),
+            format!("actuator={actuator_slave}"),
         ],
     );
 
@@ -890,12 +1119,16 @@ fn rc_authority_rig() {
     assert!(took_over.armed, "arming did not survive the RC preemption");
     println!("rc authority: RC holds the conn at t={:.1}s", took_over.t_s);
 
-    // Surge stick full forward: $CXACT should carry nonzero surge, and
-    // closing the loop through the harness's plant should show the vessel
-    // actually accelerating, not just the wire carrying a number.
+    // Surge stick full forward: allocation (D-026) splits pure surge evenly
+    // across the twin thrusters (coxswain-allocation's own napkin case), so
+    // $CXOUT should carry both channels above center, and closing the loop
+    // through the harness's plant should show the vessel actually
+    // accelerating, not just the wire carrying a number.
     rc.set(SURGE_CHANNEL, STICK_HIGH_US);
-    let surge_demand = wait_for_cxact(&plant, Duration::from_secs(5), |surge_n| surge_n > 10.0);
-    println!("rc authority: $CXACT surge {surge_demand:.1} N");
+    let (us0, us1) = wait_for_cxout(&plant, Duration::from_secs(5), |us0, us1| {
+        us0 > PWM_US_CENTER && us1 > PWM_US_CENTER
+    });
+    println!("rc authority: $CXOUT channels {us0} {us1} us (center {PWM_US_CENTER})");
     std::thread::sleep(Duration::from_secs(2));
     let (_, surge_after) = plant.truth_now();
     println!("rc authority: plant surge {surge_after:.3} m/s after effort");
@@ -904,18 +1137,23 @@ fn rc_authority_rig() {
         "plant did not accelerate under RC effort"
     );
 
-    // Kill switch: disarm within a bounded number of ticks, $CXACT drops to
-    // zero demand. `$CXACT` is the tick-resolution evidence (one line per
-    // 100 ms control tick): it zeroing bounds the actual disarm latency far
-    // tighter than the 1 Hz stdout status line below can, which only proves
-    // disarm happened sometime in whatever second it landed in.
+    // Kill switch: disarm within a bounded number of ticks, $CXOUT drops to
+    // the calibrated zero-demand microseconds (center). `$CXOUT` is the
+    // tick-resolution evidence (one line per 100 ms control tick): it
+    // centering bounds the actual disarm latency far tighter than the 1 Hz
+    // stdout status line below can, which only proves disarm happened
+    // sometime in whatever second it landed in.
     let kill_at = Instant::now();
     rc.set(KILL_CHANNEL, SWITCH_HIGH_US);
-    let zeroed = wait_for_cxact(&plant, Duration::from_secs(5), |surge_n| {
-        surge_n.abs() < 1e-6
+    let (us0, us1) = wait_for_cxout(&plant, Duration::from_secs(5), |us0, us1| {
+        us0 == PWM_US_CENTER && us1 == PWM_US_CENTER
     });
-    let cxact_latency = kill_at.elapsed();
-    assert_eq!(zeroed, 0.0, "actuator demand did not zero after kill");
+    let cxout_latency = kill_at.elapsed();
+    assert_eq!(
+        (us0, us1),
+        (PWM_US_CENTER, PWM_US_CENTER),
+        "actuator output did not center after kill"
+    );
     let disarmed = wait_for(
         &status_rx,
         Duration::from_secs(5),
@@ -923,10 +1161,10 @@ fn rc_authority_rig() {
         |s| !s.armed,
     );
     println!(
-        "rc authority: $CXACT zeroed {:.0} ms after kill (includes the harness's own 50 ms RC \
+        "rc authority: $CXOUT centered {:.0} ms after kill (includes the harness's own 50 ms RC \
          transmit period and the plant loop's 200 ms poll, not just the control loop's); \
          status confirmed disarmed by t={:.1}s",
-        cxact_latency.as_millis(),
+        cxout_latency.as_millis(),
         disarmed.t_s
     );
 
@@ -987,12 +1225,12 @@ fn power_report_rig() {
     let mut power_writer = actuator_master
         .try_clone()
         .expect("clone the actuator pty master for writing $CXPWR");
-    // Drains the vessel's own $CXACT stream, unused here (this rig never
+    // Drains the vessel's own $CXOUT stream, unused here (this rig never
     // arms thrust output): the pty's finite kernel buffer would otherwise
     // fill and block the vessel's writes within seconds, same reasoning as
-    // `rc_authority_rig`'s `cxact_rx`. Kept alive (bound, not dropped) for
+    // `rc_authority_rig`'s `cxout_rx`. Kept alive (bound, not dropped) for
     // the whole test so the draining thread keeps running.
-    let _cxact_rx = spawn_cxact_reader(actuator_master);
+    let _cxout_rx = spawn_cxout_reader(actuator_master);
     let plant = PlantLoop::start(gnss_master, None);
 
     let port = free_port();
@@ -1026,8 +1264,8 @@ fn power_report_rig() {
         &[
             "--port".to_string(),
             format!("gnss0183={gnss_slave}"),
-            "--actuator-port".to_string(),
-            actuator_slave,
+            "--port".to_string(),
+            format!("actuator={actuator_slave}"),
         ],
     );
 
@@ -1105,7 +1343,7 @@ fn power_report_rig() {
     // disarm (coxswain-supervisor::Supervisor::tick, FailsafeCause::
     // CriticalVoltage). Unlike `rc_authority_rig`'s kill scenario, this rig
     // never arms any thrust (teleop sends no effort), so there is no
-    // $CXACT-zeroing evidence to bound the reaction at true tick
+    // $CXOUT-centering evidence to bound the reaction at true tick
     // resolution; the 1 Hz stdout status line is the only observable
     // surface here, so the printed latency is an upper bound set mostly by
     // that cadence, not a measurement of the supervisor's actual (one
@@ -1141,20 +1379,184 @@ fn power_report_rig() {
     let _ = zenohd.wait();
 }
 
-/// Polls `plant`'s most recently applied `$CXACT` surge demand until `pred`
-/// holds, bounded by `timeout`. `PlantLoop::demand_now` is written by the
+/// The underactuated rudderboat shape, direct-effort half: teleop's
+/// `DirectEffort` setpoint bypasses guidance entirely (coxswain-contract::
+/// Setpoint's own doc comment on that variant), so this exercises the
+/// allocator's rendering onto $CXOUT directly, independent of any control
+/// law. Combined surge+yaw effort should push the ESC field above center
+/// and the rudder field off center in the direction the sign convention
+/// predicts: `pos_x_m` astern (negative) means a positive commanded yaw
+/// moment allocates a *negative* rudder angle (mirrors coxswain-
+/// allocation's own `rudder_closed_form_above_the_speed_floor` test), and
+/// the rudder's speed-scheduled authority floor (`min_effective_speed_mps`)
+/// keeps that response finite at rest, no motion required. Zero effort
+/// returns both fields to the calibrated center.
+#[test]
+fn rudderboat_direct_effort_rig() {
+    let tmp = make_tmp("rudderboat");
+    let (blob, pubkey_hex) = build_rudderboat_blob();
+    let blob_path = tmp.0.join("desk-rig-rudderboat.cxmanifest");
+    std::fs::write(&blob_path, &blob).unwrap();
+
+    let (gnss_master, gnss_slave) = open_pty_pair();
+    // Truth stays at rest; this scenario only checks what DirectEffort
+    // renders onto the wire, not closed-loop plant dynamics, so the plant
+    // gets no actuator feedback (`None`) and free-drifts at zero thrust.
+    let _plant = PlantLoop::start(gnss_master, None);
+    let (actuator_master, actuator_slave) = open_pty_pair();
+    let cxout_rx = spawn_cxout_reader(actuator_master);
+
+    let port = free_port();
+    let endpoint = format!("tcp/127.0.0.1:{port}");
+    let mut zenohd = Command::new("zenohd")
+        .args(["--listen", &endpoint, "--no-multicast-scouting"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("zenohd on PATH (see .devcontainer/postCreate.sh)");
+    {
+        let deadline = Instant::now() + BRING_UP;
+        loop {
+            match zenoh::open(client_config(&endpoint)).wait() {
+                Ok(session) => {
+                    session.close().wait().unwrap();
+                    break;
+                }
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "zenohd never became ready: {e}");
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    let (mut vessel, status_rx) = spawn_vessel(
+        &blob_path,
+        &pubkey_hex,
+        Some(&endpoint),
+        &[
+            "--port".to_string(),
+            format!("gnss0183={gnss_slave}"),
+            "--port".to_string(),
+            format!("actuator={actuator_slave}"),
+        ],
+    );
+
+    let session = zenoh::open(client_config(&endpoint)).wait().unwrap();
+    let teleop = ClaimantClient::new(
+        session,
+        "keelson",
+        "cx-desk-rig-rudderboat-01",
+        ClaimantId(7),
+    );
+    assert_eq!(rpc("register", || teleop.register()), ConnReplyResult::Ok);
+    assert_eq!(
+        rpc("request_conn", || teleop.request_conn()),
+        ConnReplyResult::Ok
+    );
+    let deadline = Instant::now() + BRING_UP;
+    loop {
+        match rpc("arm", || teleop.arm()) {
+            ConnReplyResult::Ok => break,
+            ConnReplyResult::RefusedEstimator | ConnReplyResult::RefusedPosition => {}
+            other => panic!("arm refused: {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "teleop arm never succeeded");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let armed = wait_for(&status_rx, BRING_UP, "armed under teleop", |s| {
+        s.armed && s.conn == "held:7"
+    });
+    println!("rudderboat direct effort: armed at t={:.1}s", armed.t_s);
+
+    let (esc_us, rudder_us) = drive_effort_until(
+        &teleop,
+        &cxout_rx,
+        ForceDemand {
+            surge_n: 100.0,
+            sway_n: 0.0,
+            yaw_nm: 5.0,
+        },
+        Duration::from_secs(5),
+        |esc, rudder| esc > PWM_US_CENTER && rudder != PWM_US_CENTER,
+    );
+    println!(
+        "rudderboat direct effort: esc {esc_us} us, rudder {rudder_us} us \
+         (center {PWM_US_CENTER})"
+    );
+    assert!(esc_us > PWM_US_CENTER, "ESC did not move above center");
+    assert!(
+        rudder_us < PWM_US_CENTER,
+        "rudder did not deflect in the expected direction: {rudder_us} us"
+    );
+
+    let (esc_us, rudder_us) = drive_effort_until(
+        &teleop,
+        &cxout_rx,
+        ForceDemand {
+            surge_n: 0.0,
+            sway_n: 0.0,
+            yaw_nm: 0.0,
+        },
+        Duration::from_secs(5),
+        |esc, rudder| esc == PWM_US_CENTER && rudder == PWM_US_CENTER,
+    );
+    println!("rudderboat direct effort: zero demand centers both ({esc_us}, {rudder_us})");
+
+    let _ = vessel.kill();
+    let _ = vessel.wait();
+    let _ = zenohd.kill();
+    let _ = zenohd.wait();
+}
+
+/// Republishes `demand` as a teleop `DirectEffort` setpoint every 300 ms
+/// (safely under the manifest's 1000 ms claimant heartbeat, since the
+/// setpoint stream doubles as the heartbeat) while polling `$CXOUT` lines
+/// off `cxout_rx` until `pred` holds, bounded by `timeout`.
+fn drive_effort_until(
+    teleop: &ClaimantClient,
+    cxout_rx: &Receiver<(u16, u16)>,
+    demand: ForceDemand,
+    timeout: Duration,
+    pred: impl Fn(u16, u16) -> bool,
+) -> (u16, u16) {
+    let deadline = Instant::now() + timeout;
+    let republish_period = Duration::from_millis(300);
+    let mut last_publish = Instant::now() - republish_period;
+    loop {
+        if last_publish.elapsed() >= republish_period {
+            teleop
+                .publish_setpoint(&Setpoint::DirectEffort(demand))
+                .unwrap();
+            last_publish = Instant::now();
+        }
+        if let Ok((us0, us1)) = cxout_rx.recv_timeout(Duration::from_millis(100))
+            && pred(us0, us1)
+        {
+            return (us0, us1);
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for $CXOUT");
+    }
+}
+
+/// Polls `plant`'s most recently applied `$CXOUT` channel pair until `pred`
+/// holds, bounded by `timeout`. `PlantLoop::channels_now` is written by the
 /// same thread that reads the actuator pty, so this is genuinely observing
 /// bytes that crossed the real serial port, not a shortcut around it.
-fn wait_for_cxact(plant: &PlantLoop, timeout: Duration, pred: impl Fn(f64) -> bool) -> f64 {
+fn wait_for_cxout(
+    plant: &PlantLoop,
+    timeout: Duration,
+    pred: impl Fn(u16, u16) -> bool,
+) -> (u16, u16) {
     let deadline = Instant::now() + timeout;
     loop {
-        let surge_n = plant.demand_now().surge_n;
-        if pred(surge_n) {
-            return surge_n;
+        let (us0, us1) = plant.channels_now();
+        if pred(us0, us1) {
+            return (us0, us1);
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for actuator demand"
+            "timed out waiting for actuator output"
         );
         std::thread::sleep(Duration::from_millis(50));
     }

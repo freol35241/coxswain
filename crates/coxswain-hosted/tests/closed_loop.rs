@@ -11,9 +11,9 @@ use core::time::Duration;
 
 use coxswain_contract::{
     ArmingState, BoundedList, ClaimantId, ClaimantPriority, ConnGrantDefault, ConnState,
-    EstimatorConfig, ForceDemand, Fossen3DofParams, GeoPoint, GeofenceAction, GeofenceConfig,
-    License, ModelParams, PowerStatus, SensorConfig, SensorId, SensorRole, Setpoint,
-    SupervisorConfig, Timestamp, VesselConfig,
+    EffectorConfig, EffectorId, EffectorKind, EstimatorConfig, ForceDemand, Fossen3DofParams,
+    GeoPoint, GeofenceAction, GeofenceConfig, License, ModelParams, PowerStatus, SensorConfig,
+    SensorId, SensorRole, Setpoint, SupervisorConfig, Timestamp, VesselConfig,
 };
 use coxswain_hosted::{ArmError, Core, FailsafeCause, TickOutput};
 use coxswain_model::LocalFrame;
@@ -35,6 +35,11 @@ const ZERO: ForceDemand = ForceDemand {
     sway_n: 0.0,
     yaw_nm: 0.0,
 };
+
+/// Guidance's drift-and-reapproach radius (D-026), mirrored here as
+/// coxswain-guidance's own closed_loop.rs test does, independent of
+/// guidance's private constant.
+const DRIFT_RADIUS_M: f64 = 4.0;
 
 /// Seahorse example params from docs/manifest-schema.md.
 fn seahorse() -> Fossen3DofParams {
@@ -102,6 +107,44 @@ fn config(geofence: GeofenceConfig) -> VesselConfig {
         },
         effectors: BoundedList::new(),
     }
+}
+
+/// ESC (centerline thruster) plus a rudder astern (D-026): no sway
+/// authority, no yaw authority at rest, the underactuated shape guidance's
+/// drift-and-reapproach hold exists for. Mirrors coxswain-guidance's own
+/// closed_loop.rs fixture of the same name and coxswain-allocation's
+/// `esc_and_rudder` test fixture.
+fn esc_and_rudder() -> [EffectorConfig; 2] {
+    [
+        EffectorConfig {
+            id: EffectorId(0),
+            kind: EffectorKind::FixedThruster {
+                pos_x_m: 1.0,
+                pos_y_m: 0.0,
+                azimuth_rad: 0.0,
+                max_thrust_fwd_n: 200.0,
+                max_thrust_rev_n: 120.0,
+            },
+        },
+        EffectorConfig {
+            id: EffectorId(1),
+            kind: EffectorKind::Rudder {
+                pos_x_m: -1.5,
+                side_force_n_per_rad_mps2: 400.0,
+                max_angle_rad: 0.6,
+                min_effective_speed_mps: 0.5,
+            },
+        },
+    ]
+}
+
+/// Same vessel config `config` builds, with the underactuated effector
+/// table wired in so `Core::new` derives capability from it and builds an
+/// allocator (D-026).
+fn underactuated_config(geofence: GeofenceConfig) -> VesselConfig {
+    let mut c = config(geofence);
+    c.effectors = BoundedList::from_slice(&esc_and_rudder()).unwrap();
+    c
 }
 
 struct Harness {
@@ -175,6 +218,78 @@ impl Harness {
 
     fn bring_up(&mut self) {
         self.connect();
+        self.core.arm(TELEOP).unwrap();
+    }
+}
+
+/// Same shape as `Harness`, wired to the underactuated effector table
+/// (D-026): `step` drives the plant through `Simulator::apply_outputs` with
+/// `Core::tick`'s allocator output rather than `apply_command`, so
+/// saturation and the rudder's speed-scheduled authority are in play, the
+/// same honest loop coxswain-guidance's own `UnderactuatedBench` runs
+/// (guidance/tests/closed_loop.rs), extended here through the estimator and
+/// supervisor.
+struct UnderactuatedHarness {
+    core: Core,
+    sim: Simulator,
+    frame: LocalFrame,
+}
+
+impl UnderactuatedHarness {
+    fn new(geofence: GeofenceConfig) -> Self {
+        let mut sim = Simulator::new(&seahorse(), origin(), Timestamp::from_nanos(0), 1).unwrap();
+        sim.add_gnss(GNSS, GnssModel::new(5.0, 0.5));
+        sim.add_heading(COMPASS, HeadingModel::new(10.0, 0.5_f64.to_radians()));
+        sim.add_yaw_rate(GYRO, YawRateModel::new(20.0, 0.005));
+        sim.set_effectors(&esc_and_rudder());
+        Self {
+            core: Core::new(&underactuated_config(geofence)),
+            sim,
+            frame: LocalFrame::new(origin()),
+        }
+    }
+
+    fn step(&mut self) -> TickOutput {
+        for m in self.sim.step(TICK) {
+            self.core.ingest(&m).expect("measurement rejected");
+        }
+        self.core.power(PowerStatus {
+            t: self.sim.now(),
+            voltage_v: self.sim.voltage(),
+        });
+        let out = self.core.tick(self.sim.now());
+        let outputs = out.outputs.as_ref().expect(
+            "the effector table is non-empty (underactuated_config), so Core::new built an \
+             allocator and every tick produces outputs",
+        );
+        self.sim.apply_outputs(outputs);
+        out
+    }
+
+    fn t(&self) -> f64 {
+        self.sim.now().as_nanos() as f64 / 1e9
+    }
+
+    fn truth_local(&self) -> (f64, f64) {
+        self.frame.to_local(self.sim.truth().pose.position)
+    }
+
+    fn heartbeat_due(&self) -> bool {
+        self.sim.now().as_nanos().is_multiple_of(HEARTBEAT_NS)
+    }
+
+    fn heartbeat(&mut self) {
+        let now = self.sim.now();
+        self.core.heartbeat(TELEOP, now).unwrap();
+    }
+
+    fn bring_up(&mut self) {
+        for _ in 0..10 {
+            self.step();
+        }
+        let now = self.sim.now();
+        self.core.register(TELEOP, now).unwrap();
+        self.core.request_conn(TELEOP, now).unwrap();
         self.core.arm(TELEOP).unwrap();
     }
 }
@@ -543,4 +658,85 @@ fn higher_priority_claimant_preempts_conn_cleanly() {
     assert!(h.core.release_conn(TELEOP).is_err());
     let out = h.step();
     assert_eq!(out.directive.conn, ConnState::Held(RC));
+}
+
+/// Scenario 8 (D-026/D-027): the underactuated rudderboat (ESC + rudder, no
+/// sway or at-rest yaw authority) through the full loop -- estimator,
+/// supervisor, guidance, allocator, `sim.apply_outputs` -- transits, then
+/// loses its claimant mid-transit. The failsafe StationKeep hold falls
+/// inside guidance's drift-and-reapproach radius (D-026: a hull without sway
+/// authority gets drift-and-reapproach instead of a DP-style point hold), so
+/// the vessel should coast to a stop and the allocator's achieved tau (the
+/// honest, post-allocation demand `TickOutput::command` carries) should go
+/// quiet once inside the drift radius, then stay within a defensible bound
+/// of the loss point.
+#[test]
+fn underactuated_claimant_lost_enters_drift_hold() {
+    let mut h = UnderactuatedHarness::new(no_fence());
+    h.bring_up();
+    h.core.set_setpoint(TELEOP, north(1.2));
+
+    let mut last_hb = h.t();
+    let mut detection: Option<(f64, (f64, f64))> = None;
+    let mut max_excursion = 0.0_f64;
+    let mut settled = true;
+    let mut quiet_inside_drift = true;
+    while h.t() < 180.0 {
+        if h.t() < 60.0 && h.heartbeat_due() {
+            h.heartbeat();
+            last_hb = h.t();
+        }
+        let out = h.step();
+        match detection {
+            None => {
+                if out.directive.failsafe == Some(FailsafeCause::ClaimantLost) {
+                    assert_eq!(out.directive.conn, ConnState::Unheld);
+                    detection = Some((h.t(), h.truth_local()));
+                }
+            }
+            Some((_, at_detection)) => {
+                let d = dist(h.truth_local(), at_detection);
+                max_excursion = max_excursion.max(d);
+                if h.t() >= 150.0 && d > 10.0 {
+                    settled = false;
+                }
+                // "Demand goes quiet" (task wording): once truth has coasted
+                // inside the drift radius of the loss point, the achieved
+                // tau the allocator actually rendered (`command.demand`,
+                // the D-026 achieved-not-demanded value `Core::tick` feeds
+                // back) should be exactly zero, matching guidance's own
+                // drift-and-reapproach quiet regime.
+                if d < DRIFT_RADIUS_M && out.command.demand != ZERO {
+                    quiet_inside_drift = false;
+                }
+            }
+        }
+    }
+    let (t_detect, _) = detection.expect("claimant loss never detected");
+    println!(
+        "underactuated claimant lost: last heartbeat {last_hb:.1} s, detected {t_detect:.1} s, \
+         max excursion {max_excursion:.2} m"
+    );
+    // Revocation within claimant_heartbeat (1 s) plus one 100 ms tick, same
+    // bound as claimant_lost_revokes_and_holds.
+    assert!(
+        t_detect - last_hb <= 1.0 + 0.1 + 1e-6,
+        "detected {:.2} s after the last heartbeat",
+        t_detect - last_hb
+    );
+    assert!(
+        quiet_inside_drift,
+        "achieved tau was nonzero while inside the drift radius"
+    );
+    // Bound: guidance-only (coxswain-guidance's own
+    // underactuated_claimant_lost_latches_and_holds) observed a 7.81 m
+    // excursion coasting under drag after guidance goes quiet at the drift
+    // boundary, asserted there at <=9 m. This full loop observes 7.98 m
+    // with this seed, essentially the same coasting distance (the module
+    // doc comment's "couple of meters of slack" over guidance-only numbers
+    // does not show up here: the hold target is the estimate at detection,
+    // but the coast-to-stop distance is a plant/drag property, not an
+    // estimation one); 10 m keeps a modest margin over the observed value.
+    assert!(max_excursion < 10.0, "excursion {max_excursion:.2} m");
+    assert!(settled, "left the 10 m hold circle during the last 30 s");
 }

@@ -8,8 +8,9 @@
 //! three services stay fate-sharing and directly testable. The tick driver
 //! is the Phase 4 verification instrument.
 
+use coxswain_allocation::Allocator;
 use coxswain_contract::{
-    ActuationCapability, ActuatorCommand, ArmingState, ClaimantId, ConnState, EstimatorHealth,
+    ActuatorCommand, ActuatorOutputs, ArmingState, ClaimantId, ConnState, EstimatorHealth,
     ForceDemand, Measurement, PowerStatus, Setpoint, Timestamp, VesselConfig, VesselState,
 };
 use coxswain_estimator::Estimator;
@@ -21,12 +22,15 @@ pub use coxswain_supervisor::{ArmError, ClaimError, Directive, FailsafeCause};
 
 /// One tick's outputs: the command sent to the actuator path plus the state,
 /// health, and directive it was derived from, for telemetry and tests.
+/// `outputs` is the allocator's per-effector rendering of `command.demand`;
+/// `None` with no effector table (tau-direct, no allocation stage).
 #[derive(Copy, Clone, Debug)]
 pub struct TickOutput {
     pub command: ActuatorCommand,
     pub state: Option<VesselState>,
     pub health: EstimatorHealth,
     pub directive: Directive,
+    pub outputs: Option<ActuatorOutputs>,
 }
 
 /// The composed core: one estimator, one guidance, one supervisor, driven by
@@ -36,6 +40,10 @@ pub struct Core {
     estimator: Estimator,
     guidance: Guidance,
     supervisor: Supervisor,
+    /// Allocation stage (D-026): `None` with an empty manifest effector
+    /// table, which keeps `tick` byte-identical to the pre-allocation
+    /// tau-direct behavior.
+    allocator: Option<Allocator>,
     power: PowerStatus,
     /// Latest setpoint per claimant. Sized to the supervisor registry: a
     /// sender beyond it could never hold the conn, so dropping it is safe.
@@ -44,12 +52,23 @@ pub struct Core {
 
 impl Core {
     pub fn new(config: &VesselConfig) -> Self {
+        let effectors = config.effectors.as_slice();
         Self {
             estimator: Estimator::new(config),
-            // Full actuation until the hosted task derives the capability
-            // from the manifest effector table (D-026).
-            guidance: Guidance::new(config, ActuationCapability::FULL),
+            // Capability derived from the same effector table the allocator
+            // below is built from, so guidance and the allocator can never
+            // disagree about what the hull can do (D-026).
+            guidance: Guidance::new(config, coxswain_allocation::capability(effectors)),
             supervisor: Supervisor::new(config),
+            // `Allocator::new` only fails on a malformed effector table
+            // (non-finite or non-positive fields); coxswain-manifest's
+            // compiler already validates every one of those at commissioning
+            // time (mirrors coxswain-allocation::ConfigError, per its own
+            // doc comment), so a compiled manifest reaching here is
+            // guaranteed valid.
+            allocator: (!effectors.is_empty()).then(|| {
+                Allocator::new(effectors).expect("manifest compile validates the effector table")
+            }),
             // Nominal 13.0 V rather than 0 V: a zero default would trip
             // critical voltage before the first report. Real deployments
             // publish power from boot; power staleness is revisited in
@@ -139,13 +158,41 @@ impl Core {
                 yaw_nm: 0.0,
             },
         };
-        let command = ActuatorCommand { t: now, demand };
+        // Allocation (D-026): the effector table cannot always deliver the
+        // demanded tau exactly (saturation, an underactuated hull), so
+        // `allocate` returns both the per-effector outputs and the honestly
+        // achieved tau. The achieved value, not the demand, is what goes
+        // into the estimator's hydrodynamic prior (`command` below) and the
+        // published command telemetry: the prior models the vessel's actual
+        // response, and feeding it an effort the actuators never delivered
+        // would have it converge on a wrong hydrodynamic state. With no
+        // effector table this stage is skipped and `demand` passes through
+        // unchanged, byte-identical to the pre-allocation behavior.
+        let surge_mps = state.as_ref().map(|s| s.velocity.surge_mps).unwrap_or(0.0);
+        let (command_demand, outputs) = match &self.allocator {
+            Some(allocator) => {
+                let allocation = allocator.allocate(demand, surge_mps);
+                (
+                    allocation.achieved,
+                    Some(ActuatorOutputs {
+                        t: now,
+                        values: allocation.values,
+                    }),
+                )
+            }
+            None => (demand, None),
+        };
+        let command = ActuatorCommand {
+            t: now,
+            demand: command_demand,
+        };
         self.estimator.command(&command);
         TickOutput {
             command,
             state,
             health,
             directive,
+            outputs,
         }
     }
 }
