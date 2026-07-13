@@ -9,37 +9,13 @@ It runs on the vessel's own hardware and does what its name says: keeps
 track of where the vessel is and how it is moving, steers it, and answers
 for who is allowed to command it at any moment.
 
-```
-              autonomy        teleoperation       shore console
-                  │                 │                   │
-                  └──────── interface adapters ────────┘
-                                   │
- ══════════════════════════════════╪═════ the self-sufficiency line ═════
-  everything above this line is enrichment; the vessel keeps
-  control with all of it dead
-                                   │ claims, setpoints, heartbeats
- ┌─ conn node ─────────────────────▼─────────────────────────────┐
- │                          ┌─────────────┐                      │
- │   RC receiver ──────────►│ supervisor  │◄──── vessel manifest │
- │   (local claimant)       │  owns the   │      signed, per-    │
- │                          │  conn       │      vessel: sensors,│
- │                          └──────┬──────┘      trust, failsafes│
- │                                 │ effective setpoint          │
- │   ┌───────────┐  state   ┌──────▼──────┐  force  ┌──────────┐ │
- │   │ estimator │─────────►│  guidance   │────────►│ actuator │ │
- │   │   (EKF)   │          │             │  demand │ backend  │ │
- │   └─────▲─────┘          └─────────────┘         └────┬─────┘ │
- │         │ manifest-licensed sensors only              │       │
- └─────────┼─────────────────────────────────────────────┼───────┘
-           │                                             │
-    GNSS, heading, IMU                            thrusters, rudder
-    NMEA 0183 / 2000 (listen-only)                (actuator nodes)
-```
+![Coxswain architecture: enrichment sources reach the vessel through interface adapters above the self-sufficiency line; below it the conn node runs the supervisor, estimator, guidance, allocation, and actuator backend against manifest-licensed sensors and effectors.](docs/architecture.drawio.svg)
 
-(Between guidance and the actuator backend sits a conn-node allocation
-stage, not drawn above: it maps guidance's generalized force onto the
-vessel's manifest-declared effectors, and the backend carries the
-resulting per-channel outputs, not the force demand itself.)
+The source file is a draw.io-editable SVG: it renders here and opens for
+editing at [diagrams.net](https://app.diagrams.net). Between guidance and the
+actuator backend, the allocation stage maps guidance's generalized force onto
+the vessel's manifest-declared effectors, so the actuator wire carries
+per-channel outputs (`$CXOUT`), not the force demand itself.
 
 Everything above the line enriches the vessel: perception, mission
 autonomy, teleoperation, fleet and shore systems. All of it reaches the
