@@ -23,12 +23,13 @@ use coxswain_contract::{
     SensorRole, Setpoint, Timestamp, VesselState,
 };
 use coxswain_crsf::{FrameReader, ParseOutcome};
-use coxswain_drivers::actuator_serial::{ActuatorSerialDriver, PowerReportReader};
+use coxswain_drivers::actuator_serial::{ActuatorSerialDriver, PowerReportReader, PwmChannel};
 use coxswain_drivers::gnss0183::{self, Gnss0183Driver};
+use coxswain_drivers::output::{ActuatorSink, OutputBackend, OutputFrame};
 use coxswain_drivers::rc::{self, RcAdapter};
 use coxswain_hosted::{ArmError, ClaimError, Core, TickOutput};
 use coxswain_keelson::{ConnEvent, ConnReplyResult, VesselEndpoint};
-use coxswain_manifest::{BusKind, ChecksumMode, Nmea0183Quirks, PwmCalibration, SensorEntry};
+use coxswain_manifest::{BusKind, ChecksumMode, Nmea0183Quirks, SensorEntry};
 use coxswain_n2k::{DecodeError, FastPacketAssembler, Outcome};
 use coxswain_nmea0183::Quirks as Nmea0183ParserQuirks;
 use coxswain_sim::{GnssModel, HeadingModel, Simulator, YawRateModel};
@@ -541,26 +542,6 @@ struct Nmea2000Link {
 // on the wire at its declared channel. No vessel knowledge crosses onto the
 // wire itself (D-027): the far end just copies fields to PWM channels.
 
-/// One channel's render-time wiring: which entry in the allocator's output
-/// (and `VesselConfig::effectors`) it reads, its calibration, and the
-/// physical limits `render_us` scales against. `effector_index` doubles as
-/// both indices because `coxswain-manifest::compile` builds the render
-/// table (`CompiledManifest::effectors`) and the allocator geometry
-/// (`VesselConfig::effectors`) from the same loop, in the same order.
-#[derive(Copy, Clone, Debug)]
-struct EffectorChannel {
-    effector_index: usize,
-    pwm: PwmCalibration,
-    /// Physical output at the `us_max` endpoint (thrust N or angle rad);
-    /// asymmetric for a thruster (`max_thrust_fwd_n`), symmetric for a
-    /// rudder (`max_angle_rad`) since `EffectorKind::Rudder` carries one
-    /// angle limit for both directions.
-    max_pos: f64,
-    /// Physical output magnitude at the `us_min` endpoint (before
-    /// `reversed` swaps which endpoint that is).
-    max_neg: f64,
-}
-
 fn effector_limits(kind: &EffectorKind) -> (f64, f64) {
     match *kind {
         EffectorKind::FixedThruster {
@@ -580,15 +561,19 @@ fn effector_limits(kind: &EffectorKind) -> (f64, f64) {
 /// sorts into wire order, it doesn't re-check that rule.
 fn actuator_bus_channels(
     manifest: &coxswain_manifest::CompiledManifest,
-) -> Vec<(String, Vec<EffectorChannel>)> {
-    let mut by_bus: HashMap<&str, Vec<(u16, EffectorChannel)>> = HashMap::new();
+) -> Vec<(String, Vec<PwmChannel>)> {
+    let mut by_bus: HashMap<&str, Vec<(u16, PwmChannel)>> = HashMap::new();
     for (i, entry) in manifest.effectors.as_slice().iter().enumerate() {
         let (max_pos, max_neg) = effector_limits(&manifest.config.effectors.as_slice()[i].kind);
+        let pwm = entry.pwm;
         by_bus.entry(entry.bus.as_str()).or_default().push((
             entry.channel,
-            EffectorChannel {
+            PwmChannel {
                 effector_index: i,
-                pwm: entry.pwm,
+                us_min: pwm.us_min,
+                us_center: pwm.us_center,
+                us_max: pwm.us_max,
+                reversed: pwm.reversed,
                 max_pos,
                 max_neg,
             },
@@ -612,46 +597,33 @@ fn actuator_bus_channels(
     out
 }
 
-/// Physical output (newtons or radians, the allocator's per-effector value)
-/// through `PwmCalibration`'s piecewise-linear mapping (D-027): 0 ->
-/// `us_center`, `+max_pos` -> the "high" endpoint, `-max_neg` -> the "low"
-/// endpoint, `reversed` swapping which of `us_min`/`us_max` is which
-/// endpoint. Clamped to `[us_min, us_max]` and rounded to the nearest
-/// microsecond.
-fn render_us(pwm: PwmCalibration, max_pos: f64, max_neg: f64, value: f64) -> u16 {
-    let (low_us, high_us) = if pwm.reversed {
-        (pwm.us_max, pwm.us_min)
-    } else {
-        (pwm.us_min, pwm.us_max)
-    };
-    let center = pwm.us_center as f64;
-    let us = if value >= 0.0 {
-        let frac = if max_pos > 0.0 {
-            (value / max_pos).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        center + frac * (high_us as f64 - center)
-    } else {
-        let frac = if max_neg > 0.0 {
-            (-value / max_neg).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        center + frac * (low_us as f64 - center)
-    };
-    us.round().clamp(pwm.us_min as f64, pwm.us_max as f64) as u16
-}
-
-/// One mapped `actuator_uart` bus: the open port, its channel-ordered render
-/// table, and the reader thread for the reverse-direction `$CXPWR` reports
-/// (D-021 "command-then-report lite", unchanged by the move from a CLI-fixed
-/// port to a manifest bus).
+/// One mapped `actuator_uart` bus: the open port, its serial output backend
+/// (which now owns the per-channel PWM calibration and renders to microseconds
+/// itself, D-027/D-028), and the reader thread for the reverse-direction
+/// `$CXPWR` reports (D-021 "command-then-report lite").
 struct ActuatorLink {
     port: std::fs::File,
-    channels: Vec<EffectorChannel>,
+    backend: ActuatorSerialDriver,
     power_rx: Receiver<(u8, Timestamp)>,
     power_reader: PowerReportReader,
+}
+
+/// Writes an output backend's emitted serial lines to the actuator port. An
+/// `actuator_uart` bus only ever yields serial lines, so a CAN frame here is a
+/// wiring bug (a Cyphal backend would be paired with a CAN sink instead).
+struct SerialSink<'a>(&'a mut std::fs::File);
+
+impl ActuatorSink for SerialSink<'_> {
+    fn emit(&mut self, frame: OutputFrame) {
+        match frame {
+            OutputFrame::Serial(bytes) => {
+                let _ = self.0.write_all(bytes);
+            }
+            OutputFrame::Can { .. } => {
+                unreachable!("actuator_uart backend emits serial lines, not CAN frames")
+            }
+        }
+    }
 }
 
 /// Applies one parsed CRSF frame's events to the core (D-025). Kill maps to
@@ -1109,12 +1081,14 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("{path}: clone for the power-report reader: {e}"))?;
         actuator_links.push(ActuatorLink {
             port,
-            channels: channels.clone(),
+            backend: ActuatorSerialDriver::new(
+                coxswain_contract::BoundedList::from_slice(channels)
+                    .expect("effector count is bounded by MAX_EFFECTORS"),
+            ),
             power_rx: spawn_byte_reader(reader_handle, boot),
             power_reader: PowerReportReader::new(),
         });
     }
-    let actuator_driver = ActuatorSerialDriver::new();
     // Flips true on the first $CXPWR report so the boot-default-to-measured
     // transition logs exactly once (see the ingestion block below); the
     // default itself lives in `Core::new` and needs no change here.
@@ -1382,22 +1356,9 @@ fn run() -> Result<(), String> {
                  exactly when Core builds an allocator (Core::new)",
             );
             for link in &mut actuator_links {
-                let us: Vec<u16> = link
-                    .channels
-                    .iter()
-                    .map(|ch| {
-                        render_us(
-                            ch.pwm,
-                            ch.max_pos,
-                            ch.max_neg,
-                            outputs.values.as_slice()[ch.effector_index],
-                        )
-                    })
-                    .collect();
-                let mut sink = |bytes: &[u8]| {
-                    let _ = link.port.write_all(bytes);
-                };
-                actuator_driver.write_outputs(&mut sink, &us);
+                let ActuatorLink { backend, port, .. } = link;
+                let mut sink = SerialSink(port);
+                backend.write_outputs(outputs.values.as_slice(), &mut sink);
             }
         }
 
@@ -1461,66 +1422,10 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    /// Rudderboat-shaped calibration (crates/coxswain-manifest/tests/
-    /// rudderboat.toml): `us_min=1100, us_center=1500, us_max=1900`, not
-    /// reversed.
-    fn pwm(reversed: bool) -> PwmCalibration {
-        PwmCalibration {
-            us_min: 1100,
-            us_center: 1500,
-            us_max: 1900,
-            reversed,
-        }
-    }
-
-    #[test]
-    fn zero_value_renders_center_regardless_of_asymmetric_limits() {
-        // Thruster-shaped: max_pos != max_neg (D-027's asymmetric fwd/rev).
-        assert_eq!(render_us(pwm(false), 300.0, 180.0, 0.0), 1500);
-        assert_eq!(render_us(pwm(true), 300.0, 180.0, 0.0), 1500);
-    }
-
-    #[test]
-    fn endpoints_map_to_us_min_and_us_max() {
-        assert_eq!(render_us(pwm(false), 300.0, 180.0, 300.0), 1900);
-        assert_eq!(render_us(pwm(false), 300.0, 180.0, -180.0), 1100);
-    }
-
-    #[test]
-    fn reversed_swaps_which_endpoint_each_sign_maps_to() {
-        assert_eq!(render_us(pwm(true), 300.0, 180.0, 300.0), 1100);
-        assert_eq!(render_us(pwm(true), 300.0, 180.0, -180.0), 1900);
-    }
-
-    #[test]
-    fn beyond_the_limit_clamps_to_the_endpoint_not_past_it() {
-        assert_eq!(render_us(pwm(false), 300.0, 180.0, 3000.0), 1900);
-        assert_eq!(render_us(pwm(false), 300.0, 180.0, -3000.0), 1100);
-    }
-
-    #[test]
-    fn fractional_microseconds_round_half_away_from_zero() {
-        // frac = 0.00125 of a 400 us span above center = 0.5 us exactly;
-        // 1500.5 rounds up to 1501, not down to 1500.
-        assert_eq!(render_us(pwm(false), 1.0, 1.0, 0.00125), 1501);
-    }
-
-    #[test]
-    fn symmetric_rudder_limit_uses_the_same_max_both_directions() {
-        // Rudder-shaped: one angle limit for both directions (D-026's
-        // EffectorKind::Rudder carries a single max_angle_rad).
-        assert_eq!(render_us(pwm(false), 0.6, 0.6, 0.6), 1900);
-        assert_eq!(render_us(pwm(false), 0.6, 0.6, -0.6), 1100);
-    }
-
-    #[test]
-    fn known_observed_fraction_matches_the_desk_rig_golden() {
-        // ESC at 100 N of a 300 N forward limit: matches the value the
-        // rudderboat desk-rig scenario observes on the wire
-        // (coxswain-hosted/tests/desk_rig.rs's rudderboat_direct_effort_rig
-        // println: "esc 1633 us").
-        assert_eq!(render_us(pwm(false), 300.0, 180.0, 100.0), 1633);
-    }
+    // The physical-output-to-microseconds render tests moved to
+    // coxswain-drivers with `render_us` itself (D-028): the serial backend now
+    // owns the calibration, and the hosted profile only translates the
+    // manifest into it.
 
     // ------------------------------------------------------------- N2K wiring
 

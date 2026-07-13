@@ -27,6 +27,7 @@ use coxswain_contract::Timestamp;
 
 pub mod actuator_serial;
 pub mod gnss0183;
+pub mod output;
 pub mod rc;
 
 /// init, self-test, timestamped read: the three capabilities every driver

@@ -24,21 +24,23 @@
 //! any 0183 tokenizer rather than a bespoke one. `HH` is the standard XOR
 //! checksum, uppercase hex, over every byte between `$` and `*` (this
 //! module's tests replay each golden line through `coxswain-nmea0183`'s own
-//! checksum logic to prove the framing matches). Allocation (D-026) has
-//! already turned guidance's generalized tau into per-effector physical
-//! outputs and rendered those through the manifest-declared calibration
-//! (`coxswain_manifest::PwmCalibration`) into microseconds before this
-//! module ever sees a value; the far end copies each field straight to its
-//! matching PWM channel and carries no vessel knowledge (D-027). Field `i`
-//! is channel `i`, the conn node's own boot-time check that declared
-//! channels are contiguous from 0.
+//! checksum logic to prove the framing matches). Allocation (D-026) turns
+//! guidance's generalized tau into per-effector physical outputs; this backend
+//! renders each through its manifest-declared PWM calibration into
+//! microseconds (D-028: the output backend trait sits at the physical-units
+//! boundary, so the rendering that used to live in the hosted wiring is now
+//! here, and a Cyphal node instead gets the physical value and calibrates
+//! locally). The far end copies each field straight to its matching PWM
+//! channel and carries no vessel knowledge (D-027). Field `i` is channel `i`,
+//! the conn node's own boot-time check that declared channels are contiguous
+//! from 0.
 //!
 //! ## Dead-man doctrine: the line rate is the keepalive
 //!
 //! There is no per-line acknowledgement and no heartbeat field. The caller
 //! is expected to call `write_outputs` every control tick (100 ms nominal)
-//! with the current outputs, including the calibrated zero-demand
-//! microseconds (`us_center` for a symmetric thruster) while disarmed or
+//! with the current per-effector physical outputs, including zero demand
+//! (which renders to `us_center` for a symmetric thruster) while disarmed or
 //! idle, so a line always goes out on schedule. The far end must fail safe
 //! on silence (a watchdog on line arrival, not on any field inside the
 //! line, recommended zero/center after 500 ms): the same doctrine Keelson
@@ -52,10 +54,10 @@
 //!
 //! No allocation: numbers are hand-rolled into a stack buffer rather than
 //! going through `format!`, which needs an allocator this crate does not
-//! have. Values are already integer microseconds by the time they reach
-//! this module (the allocator refuses non-finite tau upstream, and
-//! calibration rendering clamps to `[us_min, us_max]`), so there is no
-//! NaN/infinity case left to guard here, unlike the tau-direct `$CXACT`
+//! have. `render_us` clamps each physical output to `[us_min, us_max]` and
+//! the allocator refuses non-finite tau upstream, so by the time a value
+//! reaches the line builder it is a bounded integer microsecond with no
+//! NaN/infinity case left to guard, unlike the tau-direct `$CXACT`
 //! predecessor this module replaces.
 //!
 //! ## Power reports: the reverse direction of the same link
@@ -77,9 +79,10 @@
 //! `PowerReportReader` is the push-based reader for this direction, the
 //! same shape as `write_outputs` is for the outgoing one.
 
-use coxswain_contract::{PowerStatus, Timestamp};
+use coxswain_contract::{BoundedList, PowerStatus, Timestamp};
 
 use crate::Driver;
+use crate::output::{ActuatorSink, OutputBackend, OutputFrame};
 
 /// Channels this module will ever render in one line. Matches
 /// `coxswain_contract::MAX_EFFECTORS`: the wire carries one field per
@@ -102,17 +105,75 @@ pub enum Error {
     TransmitOnly,
 }
 
-/// Transmit-only actuator backend. Holds no state: the wire format has no
-/// per-connection framing to track and, being transmit-only (D-021), no
-/// report path to buffer against. The sink (a UART write, a test buffer)
-/// is injected per call, same discipline as the caller-injected clock in
-/// the driver trait's timestamping policy.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct ActuatorSerialDriver;
+/// One wire channel's calibration, the plain-config mirror of
+/// `coxswain_manifest::PwmCalibration` plus the effector's physical limits
+/// (design constraint: this crate takes plain values, never manifest types,
+/// same as `gnss0183::Config`).
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct PwmChannel {
+    /// Index into the allocator's per-effector `values` this channel reads.
+    /// Wire channels are positional (`$CXOUT` field `i`), so the caller passes
+    /// them in channel order; this index maps each back to its effector.
+    pub effector_index: usize,
+    pub us_min: u16,
+    pub us_center: u16,
+    pub us_max: u16,
+    /// Swaps which endpoint the positive and negative physical outputs map to.
+    pub reversed: bool,
+    /// Physical output at the positive endpoint (thrust N or angle rad).
+    pub max_pos: f64,
+    /// Physical output magnitude at the negative endpoint (before `reversed`).
+    pub max_neg: f64,
+}
+
+/// Physical output (newtons or radians, the allocator's per-effector value)
+/// through the channel's piecewise-linear PWM calibration (D-027): 0 ->
+/// `us_center`, `+max_pos` -> the positive endpoint, `-max_neg` -> the
+/// negative endpoint, `reversed` swapping which of `us_min`/`us_max` each
+/// endpoint is. Clamped to `[us_min, us_max]`.
+fn render_us(ch: &PwmChannel, value: f64) -> u16 {
+    let (low_us, high_us) = if ch.reversed {
+        (ch.us_max, ch.us_min)
+    } else {
+        (ch.us_min, ch.us_max)
+    };
+    let center = ch.us_center as f64;
+    let us = if value >= 0.0 {
+        let frac = if ch.max_pos > 0.0 {
+            (value / ch.max_pos).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        center + frac * (high_us as f64 - center)
+    } else {
+        let frac = if ch.max_neg > 0.0 {
+            (-value / ch.max_neg).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        center + frac * (low_us as f64 - center)
+    };
+    // Round to the nearest microsecond. `f64::round` needs libm, which this
+    // no_std crate does not carry, so clamp first (the result is always the
+    // positive `[us_min, us_max]` range) and round the positive value with
+    // `+ 0.5` truncation, which equals round-half-up there.
+    let clamped = us.clamp(ch.us_min as f64, ch.us_max as f64);
+    (clamped + 0.5) as u16
+}
+
+/// Transmit-only serial actuator backend. Holds its per-channel PWM
+/// calibration (D-027: the serial far end is dumb, so microsecond rendering
+/// happens here at the conn node). The sink is injected per call, same
+/// discipline as the caller-injected clock in the driver trait's timestamping
+/// policy.
+#[derive(Clone, Debug)]
+pub struct ActuatorSerialDriver {
+    channels: BoundedList<PwmChannel, MAX_CHANNELS>,
+}
 
 impl ActuatorSerialDriver {
-    pub fn new() -> Self {
-        Self
+    pub fn new(channels: BoundedList<PwmChannel, MAX_CHANNELS>) -> Self {
+        Self { channels }
     }
 
     /// Renders `us` as one `$CXOUT,<us0>,<us1>,...*HH\r\n` line (module doc
@@ -122,7 +183,7 @@ impl ActuatorSerialDriver {
     /// slice is rendered from is itself bounded to `MAX_CHANNELS` entries
     /// (`coxswain_contract::MAX_EFFECTORS`), so this never actually
     /// truncates a real manifest's output.
-    pub fn write_outputs(&self, sink: &mut dyn FnMut(&[u8]), us: &[u16]) {
+    fn render_line(&self, sink: &mut dyn FnMut(&[u8]), us: &[u16]) {
         let mut buf = [0u8; MAX_LINE_LEN];
         let mut pos = 0;
         for &b in b"$CXOUT" {
@@ -148,6 +209,24 @@ impl ActuatorSerialDriver {
         pos += 1;
 
         sink(&buf[..pos]);
+    }
+}
+
+impl OutputBackend for ActuatorSerialDriver {
+    /// Renders each declared channel's physical output to microseconds through
+    /// its calibration, then emits one `$CXOUT` line. `values` is the
+    /// allocator's per-effector output; each channel reads its own
+    /// `effector_index` (a channel whose index is out of range renders as zero
+    /// demand rather than panicking, keeping this total).
+    fn write_outputs(&mut self, values: &[f64], sink: &mut dyn ActuatorSink) {
+        let mut us = [0u16; MAX_CHANNELS];
+        let mut n = 0;
+        for ch in self.channels.iter() {
+            let value = values.get(ch.effector_index).copied().unwrap_or(0.0);
+            us[n] = render_us(ch, value);
+            n += 1;
+        }
+        self.render_line(&mut |bytes| sink.emit(OutputFrame::Serial(bytes)), &us[..n]);
     }
 }
 
@@ -429,15 +508,59 @@ mod tests {
     /// Renders one line into a fixed buffer and returns the written slice's
     /// length.
     fn render(us: &[u16]) -> ([u8; MAX_LINE_LEN], usize) {
-        let driver = ActuatorSerialDriver::new();
+        let driver = ActuatorSerialDriver::new(BoundedList::new());
         let mut buf = [0u8; MAX_LINE_LEN];
         let mut len = 0usize;
         let mut sink = |bytes: &[u8]| {
             buf[len..len + bytes.len()].copy_from_slice(bytes);
             len += bytes.len();
         };
-        driver.write_outputs(&mut sink, us);
+        driver.render_line(&mut sink, us);
         (buf, len)
+    }
+
+    /// A `PwmChannel` for tests: symmetric-endpoint calibration (1500 center,
+    /// 1100..1900) unless `reversed`, reading effector `index`.
+    fn channel(index: usize, reversed: bool, max_pos: f64, max_neg: f64) -> PwmChannel {
+        PwmChannel {
+            effector_index: index,
+            us_min: 1100,
+            us_center: 1500,
+            us_max: 1900,
+            reversed,
+            max_pos,
+            max_neg,
+        }
+    }
+
+    fn channels(list: &[PwmChannel]) -> BoundedList<PwmChannel, MAX_CHANNELS> {
+        BoundedList::from_slice(list).unwrap()
+    }
+
+    /// Drives the `OutputBackend` surface with per-effector physical `values`
+    /// and returns the emitted `$CXOUT` line in a fixed buffer (no_std: no Vec).
+    fn emit_line(driver: &mut ActuatorSerialDriver, values: &[f64]) -> ([u8; MAX_LINE_LEN], usize) {
+        struct Collect {
+            buf: [u8; MAX_LINE_LEN],
+            len: usize,
+        }
+        impl ActuatorSink for Collect {
+            fn emit(&mut self, frame: OutputFrame) {
+                match frame {
+                    OutputFrame::Serial(bytes) => {
+                        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+                        self.len += bytes.len();
+                    }
+                    OutputFrame::Can { .. } => panic!("serial backend emitted a CAN frame"),
+                }
+            }
+        }
+        let mut sink = Collect {
+            buf: [0; MAX_LINE_LEN],
+            len: 0,
+        };
+        driver.write_outputs(values, &mut sink);
+        (sink.buf, sink.len)
     }
 
     /// Independently re-verifies a rendered line's checksum by replaying it
@@ -522,18 +645,83 @@ mod tests {
 
     #[test]
     fn init_and_self_test_always_succeed() {
-        let mut driver = ActuatorSerialDriver::new();
+        let mut driver = ActuatorSerialDriver::new(BoundedList::new());
         assert_eq!(driver.init(), Ok(()));
         assert_eq!(driver.self_test(), Ok(()));
     }
 
     #[test]
     fn read_with_timestamp_is_not_the_transmit_only_surface() {
-        let mut driver = ActuatorSerialDriver::new();
+        let mut driver = ActuatorSerialDriver::new(BoundedList::new());
         assert_eq!(
             driver.read_with_timestamp(Timestamp::from_nanos(0)),
             Err(Error::TransmitOnly)
         );
+    }
+
+    // ----------------------------------------------- physical -> us render
+
+    #[test]
+    fn render_us_center_is_us_center() {
+        assert_eq!(render_us(&channel(0, false, 300.0, 180.0), 0.0), 1500);
+        assert_eq!(render_us(&channel(0, true, 300.0, 180.0), 0.0), 1500);
+    }
+
+    #[test]
+    fn render_us_endpoints() {
+        assert_eq!(render_us(&channel(0, false, 300.0, 180.0), 300.0), 1900);
+        assert_eq!(render_us(&channel(0, false, 300.0, 180.0), -180.0), 1100);
+    }
+
+    #[test]
+    fn render_us_reversed_swaps_endpoints() {
+        assert_eq!(render_us(&channel(0, true, 300.0, 180.0), 300.0), 1100);
+        assert_eq!(render_us(&channel(0, true, 300.0, 180.0), -180.0), 1900);
+    }
+
+    #[test]
+    fn render_us_clamps_beyond_limits() {
+        assert_eq!(render_us(&channel(0, false, 300.0, 180.0), 3000.0), 1900);
+        assert_eq!(render_us(&channel(0, false, 300.0, 180.0), -3000.0), 1100);
+    }
+
+    #[test]
+    fn render_us_rounds_to_nearest() {
+        // 1500 + 0.00125 * 400 = 1500.5 -> 1501.
+        assert_eq!(render_us(&channel(0, false, 1.0, 1.0), 0.00125), 1501);
+        // 1500 + (100/300) * 400 = 1633.33 -> 1633.
+        assert_eq!(render_us(&channel(0, false, 300.0, 180.0), 100.0), 1633);
+    }
+
+    #[test]
+    fn render_us_symmetric_rudder_limits() {
+        assert_eq!(render_us(&channel(0, false, 0.6, 0.6), 0.6), 1900);
+        assert_eq!(render_us(&channel(0, false, 0.6, 0.6), -0.6), 1100);
+    }
+
+    // ------------------------------------------------ OutputBackend surface
+
+    #[test]
+    fn output_backend_renders_values_to_cxout_line() {
+        let mut driver = ActuatorSerialDriver::new(channels(&[
+            channel(0, false, 300.0, 180.0),
+            channel(1, false, 300.0, 180.0),
+        ]));
+        let (buf, len) = emit_line(&mut driver, &[0.0, 0.0]);
+        assert_eq!(&buf[..len], b"$CXOUT,1500,1500*55\r\n");
+    }
+
+    #[test]
+    fn output_backend_maps_each_channel_to_its_effector_index() {
+        // Wire channel order [reads effector 1, reads effector 0]: fields come
+        // out in channel order but each reads its mapped effector value.
+        let mut driver = ActuatorSerialDriver::new(channels(&[
+            channel(1, false, 300.0, 180.0),
+            channel(0, false, 300.0, 180.0),
+        ]));
+        // effector 0 = +max (1900), effector 1 = -max (1100).
+        let (buf, len) = emit_line(&mut driver, &[300.0, -180.0]);
+        assert_eq!(&buf[..len], b"$CXOUT,1100,1900*5D\r\n");
     }
 
     // ---------------------------------------------------------- CXPWR read
