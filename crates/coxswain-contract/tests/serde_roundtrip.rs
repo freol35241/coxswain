@@ -1,4 +1,4 @@
-//! JSON roundtrips of the serde-facing types. Values mirror the Seahorse
+//! JSON roundtrips of the serde-facing types. Values mirror the example vessel
 //! example in docs/manifest-schema.md for realism.
 
 use core::time::Duration;
@@ -26,7 +26,7 @@ fn sensor(id: u16, role: SensorRole, license: License, max_age_ms: u64) -> Senso
     }
 }
 
-fn seahorse_config() -> VesselConfig {
+fn example_config() -> VesselConfig {
     VesselConfig {
         sensors: BoundedList::from_slice(&[
             sensor(0, SensorRole::Gnss, License::InnerLoop, 200),
@@ -108,9 +108,9 @@ fn seahorse_config() -> VesselConfig {
 #[test]
 fn autonomy_defaults_to_unlisted() {
     // Not a roundtrip assertion; just documents that AUTONOMY is deliberately
-    // absent from `seahorse_config`'s claimant_priorities.
+    // absent from `example_config`'s claimant_priorities.
     assert!(
-        seahorse_config()
+        example_config()
             .supervisor
             .claimant_priorities
             .iter()
@@ -120,7 +120,7 @@ fn autonomy_defaults_to_unlisted() {
 
 #[test]
 fn vessel_config_roundtrip() {
-    let config = seahorse_config();
+    let config = example_config();
     let json = serde_json::to_string(&config).unwrap();
     let back: VesselConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(back, config);
@@ -128,7 +128,7 @@ fn vessel_config_roundtrip() {
 
 #[test]
 fn constant_velocity_model_roundtrip() {
-    let mut config = seahorse_config();
+    let mut config = example_config();
     config.estimator.model = ModelParams::ConstantVelocity;
     let json = serde_json::to_string(&config).unwrap();
     let back: VesselConfig = serde_json::from_str(&json).unwrap();

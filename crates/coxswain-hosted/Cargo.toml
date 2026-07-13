@@ -45,5 +45,5 @@ libc = "0.2"
 # Closed-loop scenario tests run the full loop against the simulator plant
 # (D-020); LocalFrame from coxswain-model does the test geometry.
 coxswain-model = { path = "../coxswain-model" }
-# The integration tests compile the Seahorse manifest themselves.
+# The integration tests compile the example vessel manifest themselves.
 coxswain-manifest = { path = "../coxswain-manifest", features = ["std"] }

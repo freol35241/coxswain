@@ -563,7 +563,7 @@ mod tests {
             ])
             .unwrap(),
             estimator: EstimatorConfig {
-                // Seahorse coefficients from docs/manifest-schema.md.
+                // example vessel coefficients from docs/manifest-schema.md.
                 model: ModelParams::Fossen3Dof(Fossen3DofParams {
                     mass_kg: 210.0,
                     izz_kg_m2: 95.0,

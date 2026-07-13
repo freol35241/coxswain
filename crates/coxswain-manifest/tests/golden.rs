@@ -1,11 +1,11 @@
-//! Golden-file tests: the Seahorse example from docs/manifest-schema.md,
+//! Golden-file tests: the Example vessel from docs/manifest-schema.md,
 //! verbatim, plus one rejection case per validation rule and blob tampering.
 
 use core::time::Duration;
 
 use coxswain_manifest::{CompileError, ReadError, ValidateError};
 
-const SEAHORSE: &str = include_str!("seahorse.toml");
+const EXAMPLE: &str = include_str!("example.toml");
 
 // Test key only; the seed is the ASCII string in tests/test_key.seed. Key
 // custody (who signs real vessels) is parked, see DECISIONS/TASKS.
@@ -15,14 +15,14 @@ fn seed() -> [u8; 32] {
     SEED.try_into().expect("seed file is 32 bytes")
 }
 
-/// Patch the Seahorse text; the anchor must exist so a doc edit that renames
+/// Patch the example vessel text; the anchor must exist so a doc edit that renames
 /// it fails loudly here instead of silently testing nothing.
 fn patched(anchor: &str, replacement: &str) -> String {
     assert!(
-        SEAHORSE.contains(anchor),
-        "anchor not found in seahorse.toml: {anchor:?}"
+        EXAMPLE.contains(anchor),
+        "anchor not found in example.toml: {anchor:?}"
     );
-    SEAHORSE.replace(anchor, replacement)
+    EXAMPLE.replace(anchor, replacement)
 }
 
 fn expect_invalid(source: &str) -> ValidateError {
@@ -33,30 +33,30 @@ fn expect_invalid(source: &str) -> ValidateError {
     }
 }
 
-fn seahorse_blob() -> Vec<u8> {
-    let manifest = coxswain_manifest::compile(SEAHORSE).expect("seahorse compiles");
+fn example_blob() -> Vec<u8> {
+    let manifest = coxswain_manifest::compile(EXAMPLE).expect("example compiles");
     coxswain_manifest::write(&manifest, &seed())
 }
 
 // ---------------------------------------------------------------- golden
 
 #[test]
-fn seahorse_compiles_and_roundtrips() {
-    let manifest = coxswain_manifest::compile(SEAHORSE).expect("seahorse compiles");
-    assert_eq!(manifest.vessel_id.as_str(), "se-rise-seahorse-01");
-    assert_eq!(manifest.name.as_str(), "Seahorse");
+fn example_compiles_and_roundtrips() {
+    let manifest = coxswain_manifest::compile(EXAMPLE).expect("example compiles");
+    assert_eq!(manifest.vessel_id.as_str(), "example-vessel-01");
+    assert_eq!(manifest.name.as_str(), "Example");
     assert_eq!(manifest.revision, 7);
     assert_eq!(manifest.schema_version, 4);
     assert_eq!(manifest.buses.len(), 6);
     assert_eq!(manifest.sensors.len(), 7);
     assert_eq!(manifest.actuator_nodes.len(), 3);
     assert_eq!(manifest.config.sensors.len(), 7);
-    // Seahorse's actuator story is Cyphal actuator_nodes, no [[effector]]
+    // the example vessel's actuator story is Cyphal actuator_nodes, no [[effector]]
     // table: an empty effector list is valid and means tau-direct legacy
     // behavior (D-026 fallback), not an error.
     assert!(manifest.effectors.is_empty());
     assert!(manifest.config.effectors.is_empty());
-    // Seahorse declares no [rc] section (optional, D-025); and no
+    // Example declares no [rc] section (optional, D-025); and no
     // power_stale_after_ms, so it takes the compiler's default.
     assert!(manifest.rc.is_none());
     assert_eq!(
@@ -87,8 +87,8 @@ fn seahorse_compiles_and_roundtrips() {
 
 #[test]
 fn compilation_is_deterministic() {
-    let a = seahorse_blob();
-    let b = seahorse_blob();
+    let a = example_blob();
+    let b = example_blob();
     assert_eq!(a, b);
     assert_eq!(
         coxswain_manifest::manifest_hash(&a),
@@ -98,7 +98,7 @@ fn compilation_is_deterministic() {
 
 #[test]
 fn estimator_lists_map_to_ids_in_order_of_appearance() {
-    let manifest = coxswain_manifest::compile(SEAHORSE).unwrap();
+    let manifest = coxswain_manifest::compile(EXAMPLE).unwrap();
     let estimator = &manifest.config.estimator;
     // gnss_main=0, imu_main=1, mag_main=2, gyro_retrofit=3, ...
     assert_eq!(estimator.gnss.as_slice(), &[coxswain_contract_id(0)]);
@@ -115,7 +115,7 @@ fn coxswain_contract_id(n: u16) -> coxswain_contract::SensorId {
 
 #[test]
 fn staleness_defaults_per_role_and_quirk_override() {
-    let manifest = coxswain_manifest::compile(SEAHORSE).unwrap();
+    let manifest = coxswain_manifest::compile(EXAMPLE).unwrap();
     let ages: Vec<Duration> = manifest
         .config
         .sensors
@@ -142,7 +142,7 @@ fn staleness_defaults_per_role_and_quirk_override() {
 
 #[test]
 fn geofence_ring_drops_closing_vertex_and_converts_to_radians() {
-    let manifest = coxswain_manifest::compile(SEAHORSE).unwrap();
+    let manifest = coxswain_manifest::compile(EXAMPLE).unwrap();
     let fence = &manifest.config.supervisor.geofence;
     assert!(fence.enabled);
     assert_eq!(fence.ring.len(), 4);
@@ -433,7 +433,7 @@ fn rejects_unknown_schema_version() {
 
 #[test]
 fn tampered_payload_fails_crc() {
-    let mut blob = seahorse_blob();
+    let mut blob = example_blob();
     blob[20] ^= 0x01;
     assert_eq!(
         coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed())),
@@ -443,7 +443,7 @@ fn tampered_payload_fails_crc() {
 
 #[test]
 fn tampered_signature_fails_verification() {
-    let mut blob = seahorse_blob();
+    let mut blob = example_blob();
     let last = blob.len() - 1;
     blob[last] ^= 0x01;
     assert_eq!(
@@ -454,7 +454,7 @@ fn tampered_signature_fails_verification() {
 
 #[test]
 fn wrong_public_key_fails_verification() {
-    let blob = seahorse_blob();
+    let blob = example_blob();
     let other = coxswain_manifest::public_key(&[7u8; 32]);
     assert_eq!(
         coxswain_manifest::read(&blob, &other),
@@ -464,7 +464,7 @@ fn wrong_public_key_fails_verification() {
 
 #[test]
 fn truncated_blob_is_rejected() {
-    let blob = seahorse_blob();
+    let blob = example_blob();
     let truncated = &blob[..blob.len() - 10];
     assert_eq!(
         coxswain_manifest::read(truncated, &coxswain_manifest::public_key(&seed())),
@@ -474,7 +474,7 @@ fn truncated_blob_is_rejected() {
 
 #[test]
 fn wrong_magic_is_rejected() {
-    let mut blob = seahorse_blob();
+    let mut blob = example_blob();
     blob[0] = b'X';
     assert_eq!(
         coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed())),
@@ -484,7 +484,7 @@ fn wrong_magic_is_rejected() {
 
 #[test]
 fn wrong_header_version_is_rejected() {
-    let mut blob = seahorse_blob();
+    let mut blob = example_blob();
     blob[4] = 9;
     assert_eq!(
         coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed())),
@@ -497,7 +497,7 @@ fn wrong_header_version_is_rejected() {
 // generic wrong-version test above.
 #[test]
 fn old_schema_version_blob_is_rejected() {
-    let mut blob = seahorse_blob();
+    let mut blob = example_blob();
     blob[4] = 3;
     assert_eq!(
         coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed())),
@@ -514,10 +514,10 @@ fn host_tool_compiles_and_inspects() {
     let tool = env!("CARGO_BIN_EXE_coxswain-manifest");
     let dir = std::env::temp_dir().join(format!("coxswain-manifest-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let toml_path = dir.join("seahorse.toml");
+    let toml_path = dir.join("example.toml");
     let seed_path = dir.join("test.seed");
-    let blob_path = dir.join("seahorse.cxmanifest");
-    std::fs::write(&toml_path, SEAHORSE).unwrap();
+    let blob_path = dir.join("example.cxmanifest");
+    std::fs::write(&toml_path, EXAMPLE).unwrap();
     std::fs::write(&seed_path, SEED).unwrap();
 
     let validate = Command::new(tool)
@@ -554,7 +554,7 @@ fn host_tool_compiles_and_inspects() {
         .unwrap();
     assert!(inspect.status.success(), "inspect failed: {inspect:?}");
     let stdout = String::from_utf8(inspect.stdout).unwrap();
-    assert!(stdout.contains("se-rise-seahorse-01"));
+    assert!(stdout.contains("example-vessel-01"));
     assert!(stdout.contains("revision:  7"));
     // The hash inspect prints is the hash compile printed.
     let compiled_hash = String::from_utf8(compile.stdout).unwrap();

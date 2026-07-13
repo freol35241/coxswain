@@ -24,14 +24,14 @@ use coxswain_model::LocalFrame;
 use zenoh::Wait;
 
 const BASE_PATH: &str = "keelson";
-const VESSEL_ID: &str = "se-rise-seahorse-01";
+const VESSEL_ID: &str = "example-vessel-01";
 const CLAIMANT: ClaimantId = ClaimantId(7);
 
 /// Bring-up bound: session readiness, RPC retries, arm retries. Generous for
 /// shared CI runners; each loop exits as soon as its condition holds.
 const BRING_UP: Duration = Duration::from_secs(30);
 
-const SEAHORSE: &str = include_str!("../../coxswain-manifest/tests/seahorse.toml");
+const EXAMPLE: &str = include_str!("../../coxswain-manifest/tests/example.toml");
 const SEED: &[u8] = include_bytes!("../../coxswain-manifest/tests/test_key.seed");
 
 // ------------------------------------------------------------ status lines
@@ -109,17 +109,17 @@ impl Drop for TempDir {
     }
 }
 
-/// Compile the Seahorse example with the checked-in test seed, geofence
-/// disabled: the Seahorse ring is in Gothenburg harbour and the sim would
+/// Compile the Example vessel with the checked-in test seed, geofence
+/// disabled: the example ring is in Gothenburg harbour and the sim would
 /// start on its first vertex, i.e. on the boundary; the fence has its own
 /// closed-loop scenario and buys nothing here. conn_grant_default stays
 /// "none" as authored.
 fn build_blob() -> (Vec<u8>, String) {
     let anchor = "enabled = true";
-    assert!(SEAHORSE.contains(anchor), "geofence anchor moved");
-    let source = SEAHORSE.replace(anchor, "enabled = false");
+    assert!(EXAMPLE.contains(anchor), "geofence anchor moved");
+    let source = EXAMPLE.replace(anchor, "enabled = false");
     assert!(source.contains("conn_grant_default      = \"none\""));
-    let manifest = coxswain_manifest::compile(&source).expect("patched seahorse compiles");
+    let manifest = coxswain_manifest::compile(&source).expect("patched example compiles");
     let seed: [u8; 32] = SEED.try_into().expect("seed file is 32 bytes");
     let blob = coxswain_manifest::write(&manifest, &seed);
     let pubkey_hex: String = coxswain_manifest::public_key(&seed)
@@ -177,7 +177,7 @@ impl Harness {
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = TempDir(dir);
         let (blob, pubkey_hex) = build_blob();
-        let blob_path = tmp.0.join("seahorse.cxmanifest");
+        let blob_path = tmp.0.join("example.cxmanifest");
         std::fs::write(&blob_path, &blob).unwrap();
 
         let port = free_port();

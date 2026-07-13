@@ -296,8 +296,8 @@ mod tests {
         }
     }
 
-    /// Seahorse example params from docs/manifest-schema.md.
-    fn seahorse() -> Fossen3DofParams {
+    /// Example vessel params from docs/manifest-schema.md.
+    fn example() -> Fossen3DofParams {
         Fossen3DofParams {
             mass_kg: 210.0,
             izz_kg_m2: 95.0,
@@ -341,7 +341,7 @@ mod tests {
     /// reduce to the constant-twist kinematics for position and heading.
     #[test]
     fn hydrodynamic_predict_holds_balanced_state() {
-        let p = seahorse();
+        let p = example();
         let model = ProcessModel::Hydrodynamic(Fossen3Dof::new(&p).unwrap());
         let (u, r) = (2.0, 0.05);
         // v = 0: C(nu) nu = [0, m_u u r, 0], D nu = [-x_u u, 0, -n_r r].
@@ -368,7 +368,7 @@ mod tests {
     /// zero; the constant-velocity model must leave them alone.
     #[test]
     fn hydrodynamic_predict_decays_unforced_velocity() {
-        let model = ProcessModel::Hydrodynamic(Fossen3Dof::new(&seahorse()).unwrap());
+        let model = ProcessModel::Hydrodynamic(Fossen3Dof::new(&example()).unwrap());
         let mut hydro = Ekf::init(0.0, 0.0, 1.0, 0.0, 0.1);
         hydro.x[3] = 2.0;
         let mut cv = hydro;
@@ -419,7 +419,7 @@ mod tests {
     /// exactly (same substep count, same per-step arithmetic).
     #[test]
     fn predict_substeps_match_manual_fine_steps() {
-        let model = ProcessModel::Hydrodynamic(Fossen3Dof::new(&seahorse()).unwrap());
+        let model = ProcessModel::Hydrodynamic(Fossen3Dof::new(&example()).unwrap());
         let tau = zero_tau();
         let mut coarse = Ekf::init(0.0, 0.0, 1.0, 0.3, 0.1);
         coarse.x[3] = 2.0;

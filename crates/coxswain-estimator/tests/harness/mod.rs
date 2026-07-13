@@ -361,12 +361,12 @@ pub fn merge(streams: Vec<Vec<Measurement>>) -> Vec<Measurement> {
 // ---------------------------------------------------------------------------
 // Force demands for the hydrodynamic prior.
 
-/// tau that balances the Seahorse dynamics at the given steady nu:
+/// tau that balances the example vessel dynamics at the given steady nu:
 /// M nu_dot = tau - C(nu) nu - D nu, so tau = C(nu) nu + D nu makes nu a
 /// fixed point and the model coasts along the truth trajectory exactly.
-/// Closed form for the diagonal M and D of the Seahorse coefficients.
+/// Closed form for the diagonal M and D of the example vessel coefficients.
 pub fn balancing_tau(truth: &Truth) -> ForceDemand {
-    let p = seahorse_fossen_params();
+    let p = example_fossen_params();
     let m_u = p.mass_kg - p.x_udot;
     let m_v = p.mass_kg - p.y_vdot;
     let (u, v, r) = (truth.u, truth.v, truth.r);
@@ -393,7 +393,7 @@ pub fn sample_commands(
 }
 
 // ---------------------------------------------------------------------------
-// Standard test config: Seahorse-like values, ids matching the samplers.
+// Standard test config: Example-like values, ids matching the samplers.
 
 fn sensor(id: SensorId, role: SensorRole, license: License, max_age_ms: u64) -> SensorConfig {
     SensorConfig {
@@ -404,9 +404,9 @@ fn sensor(id: SensorId, role: SensorRole, license: License, max_age_ms: u64) -> 
     }
 }
 
-/// Seahorse coefficients from docs/manifest-schema.md; also the source of
+/// example vessel coefficients from docs/manifest-schema.md; also the source of
 /// truth for `balancing_tau`.
-pub fn seahorse_fossen_params() -> Fossen3DofParams {
+pub fn example_fossen_params() -> Fossen3DofParams {
     Fossen3DofParams {
         mass_kg: 210.0,
         izz_kg_m2: 95.0,

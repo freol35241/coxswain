@@ -150,14 +150,14 @@ Compile the example vessel manifest and boot a simulated vessel:
 
 ```sh
 cargo run -p coxswain-manifest --features std -- \
-  compile crates/coxswain-manifest/tests/seahorse.toml \
-  --key crates/coxswain-manifest/tests/test_key.seed -o seahorse.cxmanifest
+  compile crates/coxswain-manifest/tests/example.toml \
+  --key crates/coxswain-manifest/tests/test_key.seed -o example.cxmanifest
 
 cargo run -p coxswain-manifest --features std -- \
   pubkey --key crates/coxswain-manifest/tests/test_key.seed
 
 cargo run -p coxswain-hosted -- \
-  --manifest seahorse.cxmanifest --pubkey <the printed hex> \
+  --manifest example.cxmanifest --pubkey <the printed hex> \
   --listen tcp/127.0.0.1:7447
 ```
 

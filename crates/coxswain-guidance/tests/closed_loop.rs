@@ -1,4 +1,4 @@
-//! Closed-loop guidance tests against the simulator plant (D-020), Seahorse
+//! Closed-loop guidance tests against the simulator plant (D-020), Example
 //! params from docs/manifest-schema.md. Truth is fed straight back as the
 //! state estimate at fixed 100 ms ticks: these exercise the guidance laws,
 //! not the estimator.
@@ -20,7 +20,7 @@ use coxswain_sim::Simulator;
 const TICK: Duration = Duration::from_millis(100);
 const TICK_S: f64 = 0.1;
 
-fn seahorse() -> Fossen3DofParams {
+fn example() -> Fossen3DofParams {
     Fossen3DofParams {
         mass_kg: 210.0,
         izz_kg_m2: 95.0,
@@ -37,7 +37,7 @@ fn config() -> VesselConfig {
     VesselConfig {
         sensors: BoundedList::new(),
         estimator: EstimatorConfig {
-            model: ModelParams::Fossen3Dof(seahorse()),
+            model: ModelParams::Fossen3Dof(example()),
             gnss: BoundedList::new(),
             imu: BoundedList::new(),
             heading: BoundedList::new(),
@@ -76,7 +76,7 @@ struct Bench {
 impl Bench {
     fn new(seed: u64) -> Self {
         Self {
-            sim: Simulator::new(&seahorse(), origin(), Timestamp::from_nanos(0), seed).unwrap(),
+            sim: Simulator::new(&example(), origin(), Timestamp::from_nanos(0), seed).unwrap(),
             guidance: Guidance::new(&config(), ActuationCapability::FULL),
             frame: LocalFrame::new(origin()),
         }
@@ -349,8 +349,7 @@ struct UnderactuatedBench {
 impl UnderactuatedBench {
     fn new(seed: u64) -> Self {
         let effectors = esc_and_rudder();
-        let mut sim =
-            Simulator::new(&seahorse(), origin(), Timestamp::from_nanos(0), seed).unwrap();
+        let mut sim = Simulator::new(&example(), origin(), Timestamp::from_nanos(0), seed).unwrap();
         sim.set_effectors(&effectors);
         Self {
             // Capability derived from the same table the allocator uses,

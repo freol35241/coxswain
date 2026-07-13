@@ -1,6 +1,6 @@
 //! Golden-file tests for the effector table (manifest v0.4, D-026/D-027):
 //! the Rudderboat example, plus one rejection case per new validation rule.
-//! Seahorse (golden.rs) deliberately carries no `[[effector]]` table, so
+//! Example (golden.rs) deliberately carries no `[[effector]]` table, so
 //! these rules need their own fixture.
 
 use core::time::Duration;

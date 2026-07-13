@@ -30,7 +30,7 @@ impl Variant {
     fn model(self) -> ModelParams {
         match self {
             Variant::ConstantVelocity => ModelParams::ConstantVelocity,
-            Variant::Hydrodynamic => ModelParams::Fossen3Dof(seahorse_fossen_params()),
+            Variant::Hydrodynamic => ModelParams::Fossen3Dof(example_fossen_params()),
         }
     }
 
@@ -511,7 +511,7 @@ fn no_gyro_degraded_heading_stays_finite() {
     ]);
     let commands = sample_commands(&traj, (0.0, 120.0), COMMAND_RATE_HZ);
     let mut est = Estimator::new(&test_config(ModelParams::Fossen3Dof(
-        seahorse_fossen_params(),
+        example_fossen_params(),
     )));
     let errs = run_probed(&mut est, &ms, &commands, &traj, 20.0, 120.0);
 

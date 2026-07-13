@@ -79,16 +79,16 @@ mod tests {
     #[test]
     fn pubsub_key_exact() {
         assert_eq!(
-            pubsub_key("rise", "seahorse", "location_fix", "coxswain"),
-            "rise/@v0/seahorse/pubsub/location_fix/coxswain"
+            pubsub_key("example", "vessel", "location_fix", "coxswain"),
+            "example/@v0/vessel/pubsub/location_fix/coxswain"
         );
     }
 
     #[test]
     fn rpc_key_exact() {
         assert_eq!(
-            rpc_key("rise", "seahorse", "conn_request", "coxswain"),
-            "rise/@v0/seahorse/@rpc/conn_request/coxswain"
+            rpc_key("example", "vessel", "conn_request", "coxswain"),
+            "example/@v0/vessel/@rpc/conn_request/coxswain"
         );
     }
 

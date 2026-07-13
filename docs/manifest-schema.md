@@ -28,13 +28,13 @@ Design rules encoded in this schema:
 
 ```toml
 # ============================================================
-# coxswain manifest: example vessel: RISE USV "Seahorse"
+# coxswain manifest: example vessel
 # ============================================================
 
 [manifest]
 schema_version = 4          # firmware refuses unknown major versions
-vessel_id      = "se-rise-seahorse-01"
-name           = "Seahorse"
+vessel_id      = "example-vessel-01"
+name           = "Example"
 revision       = 7          # monotonically increasing per vessel
 author         = "freol"
 date           = "2026-07-08"
@@ -69,9 +69,10 @@ mode     = "listen_only"      # transmit is a scoped later feature
 
 [[bus]]
 id       = "gnss_serial"
-kind     = "uart"
+kind     = "nmea0183_uart"
 port     = "uart4"
 baud     = 115200
+checksum = "required"         # strict by default; "optional" is a per-bus quirk
 
 [[bus]]
 id       = "legacy_gyro"
@@ -105,11 +106,14 @@ port     = "spi1"
 [[sensor]]
 id      = "gnss_main"
 role    = "gnss"
-driver  = "septentrio_sbf"
+driver  = "nmea0183"
 bus     = "gnss_serial"
 license = "inner_loop"
 pps     = "pps1"                     # timing input, if wired
 lever_arm_m = [1.20, 0.00, -0.85]    # antenna offset from vessel origin, x fwd, y stbd, z down
+[sensor.nmea0183]
+talkers   = ["GP", "GN"]             # accepted talker IDs
+sentences = ["GGA", "RMC"]           # position, plus SOG/COG
 
 [[sensor]]
 id      = "imu_main"
@@ -293,7 +297,7 @@ not a runtime setting. The mapping is piecewise linear through center: physical 
 (no thrust, amidships) maps to `us_center`, the negative limit to `us_min`, the positive
 limit to `us_max`; `reversed` swaps the endpoints. An empty `[[effector]]` table is
 valid and means tau-direct legacy behavior: no allocation stage, guidance's demand goes
-to the backend directly (today's Cyphal `[[actuator_node]]` story, e.g. Seahorse).
+to the backend directly (today's Cyphal `[[actuator_node]]` story, e.g. the example vessel).
 
 ```toml
 [[effector]]
@@ -451,7 +455,7 @@ graduates from a hosted-profile boot check to a compile-time rule.
    crude; explicit per-sensor noise parameters may belong in the manifest once the
    estimator design firms up. Per D-022 this schema does not guess ahead of the
    estimator, so it stays open until the estimator answers it.
-2. **Multiple GNSS / moving-baseline heading** (dual-antenna Mosaic setups): needs a
+2. **Multiple GNSS / moving-baseline heading** (dual-antenna GNSS setups): needs a
    pairing concept between two sensor entries.
 3. **Signing key custody.** D-017 settles that the blob is signed and that firmware
    carries the public key. It does not settle who holds the private key, how it rotates,

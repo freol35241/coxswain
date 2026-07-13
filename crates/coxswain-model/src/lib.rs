@@ -145,8 +145,8 @@ fn wrap_pi(psi: f64) -> f64 {
 mod tests {
     use super::*;
 
-    /// Seahorse example params from docs/manifest-schema.md.
-    fn seahorse() -> Fossen3DofParams {
+    /// Example vessel params from docs/manifest-schema.md.
+    fn example() -> Fossen3DofParams {
         Fossen3DofParams {
             mass_kg: 210.0,
             izz_kg_m2: 95.0,
@@ -160,7 +160,7 @@ mod tests {
     }
 
     fn model() -> Fossen3Dof {
-        Fossen3Dof::new(&seahorse()).unwrap()
+        Fossen3Dof::new(&example()).unwrap()
     }
 
     fn tau(surge: f64, sway: f64, yaw: f64) -> ForceDemand {
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn non_positive_inertia_rejected() {
-        let mut p = seahorse();
+        let mut p = example();
         p.mass_kg = -300.0;
         assert!(matches!(
             Fossen3Dof::new(&p),

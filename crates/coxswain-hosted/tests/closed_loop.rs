@@ -41,8 +41,8 @@ const ZERO: ForceDemand = ForceDemand {
 /// guidance's private constant.
 const DRIFT_RADIUS_M: f64 = 4.0;
 
-/// Seahorse example params from docs/manifest-schema.md.
-fn seahorse() -> Fossen3DofParams {
+/// Example vessel params from docs/manifest-schema.md.
+fn example() -> Fossen3DofParams {
     Fossen3DofParams {
         mass_kg: 210.0,
         izz_kg_m2: 95.0,
@@ -70,7 +70,7 @@ fn no_fence() -> GeofenceConfig {
     }
 }
 
-/// Seahorse supervisor block from docs/manifest-schema.md; the geofence is
+/// example vessel supervisor block from docs/manifest-schema.md; the geofence is
 /// per scenario.
 fn config(geofence: GeofenceConfig) -> VesselConfig {
     let sensor = |id, role| SensorConfig {
@@ -87,7 +87,7 @@ fn config(geofence: GeofenceConfig) -> VesselConfig {
         ])
         .unwrap(),
         estimator: EstimatorConfig {
-            model: ModelParams::Fossen3Dof(seahorse()),
+            model: ModelParams::Fossen3Dof(example()),
             gnss: BoundedList::from_slice(&[GNSS]).unwrap(),
             imu: BoundedList::from_slice(&[GYRO]).unwrap(),
             heading: BoundedList::from_slice(&[COMPASS]).unwrap(),
@@ -156,7 +156,7 @@ struct Harness {
 
 impl Harness {
     fn new(geofence: GeofenceConfig) -> Self {
-        let mut sim = Simulator::new(&seahorse(), origin(), Timestamp::from_nanos(0), 1).unwrap();
+        let mut sim = Simulator::new(&example(), origin(), Timestamp::from_nanos(0), 1).unwrap();
         sim.add_gnss(GNSS, GnssModel::new(5.0, 0.5));
         sim.add_heading(COMPASS, HeadingModel::new(10.0, 0.5_f64.to_radians()));
         sim.add_yaw_rate(GYRO, YawRateModel::new(20.0, 0.005));
@@ -238,7 +238,7 @@ struct UnderactuatedHarness {
 
 impl UnderactuatedHarness {
     fn new(geofence: GeofenceConfig) -> Self {
-        let mut sim = Simulator::new(&seahorse(), origin(), Timestamp::from_nanos(0), 1).unwrap();
+        let mut sim = Simulator::new(&example(), origin(), Timestamp::from_nanos(0), 1).unwrap();
         sim.add_gnss(GNSS, GnssModel::new(5.0, 0.5));
         sim.add_heading(COMPASS, HeadingModel::new(10.0, 0.5_f64.to_radians()));
         sim.add_yaw_rate(GYRO, YawRateModel::new(20.0, 0.005));

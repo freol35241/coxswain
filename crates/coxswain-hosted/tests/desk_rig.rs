@@ -133,7 +133,7 @@ const SEED: &[u8] = include_bytes!("../../coxswain-manifest/tests/test_key.seed"
 /// runners, every loop exits as soon as its condition holds.
 const BRING_UP: Duration = Duration::from_secs(30);
 
-/// Seahorse's own plant coefficients (docs/manifest-schema.md), reused so
+/// the example vessel's own plant coefficients (docs/manifest-schema.md), reused so
 /// the harness's truth plant and the vessel's estimator prior agree exactly.
 fn fossen_params() -> coxswain_contract::Fossen3DofParams {
     coxswain_contract::Fossen3DofParams {

@@ -86,7 +86,7 @@ for time-to-water (D-021), not for the reference deployment.
       no_std reader for the blob. Compiles onto the Phase 1 config struct.
 - [x] Host tool (bin in coxswain-manifest): validate + compile + sign + hash.
       Hash algorithm chosen and recorded in DECISIONS.md.
-- [x] Golden-file tests: the Seahorse example manifest from the schema doc
+- [x] Golden-file tests: the Example vessel manifest from the schema doc
       compiles, plus rejection cases for every validation rule and for a bad
       signature.
 - [x] coxswain-keelson: publish raw + fused sensor streams, health, conn state
@@ -121,14 +121,14 @@ Bring-up transports per D-021. Chosen for time-to-water, superseded in Phase 7.
       covariance) when the correction gap grows; the no-gyro + 1 Hz heading
       replay diverges to NaN today (diary 2026-07-10). Health must flag NaN
       as Fault. Gates first water.
-- [ ] IMU/mag drivers for the Seahorse hardware (embedded-hal, host-mockable).
+- [ ] IMU/mag drivers for the example hardware (embedded-hal, host-mockable).
       Off the first-water critical path: the 2026-07-10 replay experiment
       shows a 5 Hz 0183 heading source suffices (heading RMSE ~1.5 deg, NEES
       healthy). Returns if trial data disagrees or higher speeds demand it.
 - [x] PWM/serial actuator backend behind the driver trait. The conn/actuator
       role split (D-010) is preserved in software; the second firmware project
       is not yet required.
-- [x] docs/hardware.md: the supported device list. Name what is on Seahorse and
+- [x] docs/hardware.md: the supported device list. Name what is on the example vessel and
       nothing else. "Quirks in configuration, not code" invites an unbounded
       device zoo; this doc is the fence.
 - [x] coxswain-hosted on real /dev ports, systemd unit example.
@@ -228,7 +228,7 @@ this before freezing far-end firmware.
 - COLREGs advisor, perception integration
 - Signing key custody: rotation, multi-signer, who holds the private key.
   D-017 settles that we sign, not who signs.
-- System identification campaign for the Seahorse hull. Until it runs, the
+- System identification campaign for the example hull. Until it runs, the
   Fossen coefficients are best-effort estimates and the constant-velocity
   fallback carries the estimator. Nothing in Phases 0 through 5 depends on the
   coefficients being right, only on their shape being right.

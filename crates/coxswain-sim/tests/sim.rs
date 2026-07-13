@@ -21,8 +21,8 @@ const GYRO_ID: SensorId = SensorId(3);
 // Nonzero epoch so nothing accidentally relies on time zero.
 const T0: Timestamp = Timestamp::from_nanos(1_000_000_000);
 
-/// Seahorse example params from docs/manifest-schema.md.
-fn seahorse() -> Fossen3DofParams {
+/// Example vessel params from docs/manifest-schema.md.
+fn example() -> Fossen3DofParams {
     Fossen3DofParams {
         mass_kg: 210.0,
         izz_kg_m2: 95.0,
@@ -43,7 +43,7 @@ fn origin() -> GeoPoint {
 }
 
 fn sim(seed: u64) -> Simulator {
-    Simulator::new(&seahorse(), origin(), T0, seed).unwrap()
+    Simulator::new(&example(), origin(), T0, seed).unwrap()
 }
 
 fn cmd(surge_n: f64, sway_n: f64, yaw_nm: f64) -> ActuatorCommand {

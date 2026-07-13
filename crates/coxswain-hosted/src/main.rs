@@ -67,7 +67,7 @@ const USAGE: &str = "usage: coxswain-hosted --manifest <blob.cxmanifest> --pubke
                      [--port <bus_id>=<device>]... [--record-nmea <dir>]";
 
 /// Where the simulated vessel floats when the manifest has no geofence: off
-/// Gothenburg, same waters as the Seahorse example and the closed-loop tests.
+/// Gothenburg, same waters as the Example vessel and the closed-loop tests.
 fn default_origin() -> GeoPoint {
     GeoPoint {
         lat_rad: 57.67_f64.to_radians(),
@@ -417,7 +417,7 @@ fn gnss0183_config(wiring: &Nmea0183Wiring, checksum: ChecksumMode) -> gnss0183:
 // protect here regardless of what a sensor's license field says.
 
 /// A sensor's `nmea2000.sources` pinning: `"any"` (the manifest's own
-/// documented default, seahorse.toml) accepts every source address;
+/// documented default, example.toml) accepts every source address;
 /// otherwise a comma-separated list of decimal source addresses (0..=253)
 /// pins the sensor to those senders. canboat's "NAME" pinning is not
 /// implemented: the schema has no source-name table to resolve it against
@@ -452,7 +452,7 @@ fn parse_n2k_sources(raw: &str) -> SourceFilter {
 
 /// One sensor's manifest-declared N2K filter: which PGNs belong to it
 /// (`Nmea2000Quirks::pgns`) and which source addresses it accepts. Several
-/// enrichment sensors can share one physical CAN bus (seahorse.toml's
+/// enrichment sensors can share one physical CAN bus (example.toml's
 /// "instruments" bus), each selecting its own slice of the traffic.
 struct Nmea2000SensorFilter {
     /// The sensor's authored id, used as the Keelson source_id its decoded
@@ -953,7 +953,7 @@ fn run() -> Result<(), String> {
             continue;
         }
         let Some(wiring) = nmea0183_wiring(bus.id.as_str(), manifest.sensors.as_slice()) else {
-            continue; // e.g. seahorse's ais_udp: role "ais" only, no gnss/heading
+            continue; // e.g. example's ais_udp: role "ais" only, no gnss/heading
         };
         // D-014's invariant this driver leans on: an unpinned bus caps
         // every sensor on it at enrichment, so nothing it carries may reach
@@ -1617,7 +1617,7 @@ mod tests {
     }
 
     /// Two sensors sharing one bus each select their own PGN, independent
-    /// of the other's presence (seahorse.toml's "instruments" bus shape,
+    /// of the other's presence (example.toml's "instruments" bus shape,
     /// multiple enrichment sensors on one CAN bus).
     #[test]
     fn two_sensors_on_one_bus_each_select_their_own_pgn() {

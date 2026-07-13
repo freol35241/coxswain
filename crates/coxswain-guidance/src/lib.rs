@@ -20,10 +20,10 @@ use coxswain_contract::{
 };
 use coxswain_model::LocalFrame;
 
-// Provisional v1 constants at Seahorse scale, one block so retuning after
+// Provisional v1 constants at example-vessel scale, one block so retuning after
 // the system identification campaign touches one place.
 
-/// Output saturation, roughly what the Seahorse example vessel's thrusters
+/// Output saturation, roughly what the example vessel's thrusters
 /// can deliver.
 const MAX_SURGE_N: f64 = 200.0;
 const MAX_SWAY_N: f64 = 200.0;
@@ -38,7 +38,7 @@ const ZETA_PSI: f64 = 1.0;
 const TAU_U_S: f64 = 2.0;
 
 /// Fallback heading gains under ConstantVelocity: the same numbers the
-/// Fossen branch derives from the Seahorse-scale inertia
+/// Fossen branch derives from the example-scale inertia
 /// Izz - N_rdot = 175 kg m^2 (kp = 175 * 0.5^2, kd = 2 * 1 * 0.5 * 175).
 const FALLBACK_KP_PSI: f64 = 43.75;
 const FALLBACK_KD_PSI: f64 = 175.0;
@@ -74,7 +74,7 @@ const REAPPROACH_RADIUS_M: f64 = 10.0;
 const STEERAGE_MPS: f64 = 0.4;
 
 /// Near-zone position P gain and velocity damping. Sized against the
-/// Seahorse surge inertia (m - X_udot = 228 kg) for ~0.3 rad/s and roughly
+/// Example-vessel surge inertia (m - X_udot = 228 kg) for ~0.3 rad/s and roughly
 /// critical damping; sway leans on the plant's own strong damping.
 const KP_POS_N_PER_M: f64 = 20.0;
 const KD_SURGE_N_PER_MPS: f64 = 100.0;
@@ -367,8 +367,8 @@ mod tests {
         GeofenceAction, GeofenceConfig, Pose, SupervisorConfig, Timestamp,
     };
 
-    /// Seahorse example params from docs/manifest-schema.md.
-    fn seahorse() -> Fossen3DofParams {
+    /// Example vessel params from docs/manifest-schema.md.
+    fn example() -> Fossen3DofParams {
         Fossen3DofParams {
             mass_kg: 210.0,
             izz_kg_m2: 95.0,
@@ -385,7 +385,7 @@ mod tests {
         VesselConfig {
             sensors: BoundedList::new(),
             estimator: EstimatorConfig {
-                model: ModelParams::Fossen3Dof(seahorse()),
+                model: ModelParams::Fossen3Dof(example()),
                 gnss: BoundedList::new(),
                 imu: BoundedList::new(),
                 heading: BoundedList::new(),

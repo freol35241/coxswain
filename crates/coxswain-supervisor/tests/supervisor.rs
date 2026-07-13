@@ -34,7 +34,7 @@ fn geo(lat_deg: f64, lon_deg: f64) -> GeoPoint {
     }
 }
 
-// Probes relative to the Seahorse ring below.
+// Probes relative to the example ring below.
 fn inside() -> GeoPoint {
     geo(57.6747, 11.9058)
 }
@@ -48,9 +48,9 @@ fn outside_b() -> GeoPoint {
     geo(57.6950, 11.9100)
 }
 
-/// The Seahorse geofence ring from docs/manifest-schema.md, converted to
+/// The example geofence ring from docs/manifest-schema.md, converted to
 /// radians. Closed ring: the first vertex is repeated.
-fn seahorse_ring() -> BoundedList<GeoPoint, 32> {
+fn example_ring() -> BoundedList<GeoPoint, 32> {
     let deg = [
         (57.6801, 11.8912),
         (57.6801, 11.9204),
@@ -103,7 +103,7 @@ fn config(grant: ConnGrantDefault, action: GeofenceAction) -> VesselConfig {
         GeofenceConfig {
             enabled: true,
             action,
-            ring: seahorse_ring(),
+            ring: example_ring(),
         },
     )
 }
@@ -1359,7 +1359,7 @@ fn disabled_or_degenerate_geofence_never_breaches() {
         GeofenceConfig {
             enabled: false,
             action: GeofenceAction::Hold,
-            ring: seahorse_ring(),
+            ring: example_ring(),
         },
     );
     let mut sup = Supervisor::new(&cfg);
