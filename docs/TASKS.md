@@ -185,16 +185,15 @@ this before freezing far-end firmware.
       Command-then-report comparison surfaced to supervisor health. Second
       output backend, so the output backend trait crystallizes here (D-027);
       commands in physical units, node owns local calibration.
-- [ ] GNSS covariance and fix status over NMEA 0183 (the vendor-neutral path):
-      extend the 0183 parser with GST (per-axis position std, plus the error
-      ellipse for the full 2x2) and map GGA fix quality (4 fixed, 5 float) to
-      `GnssFixMode`, so the 0183 driver emits `GnssPositionCov` instead of the
-      HDOP*UERE scalar. This is the portable way to feed the covariance and
-      RTK-status intake the estimator now consumes
-      (`MeasurementKind::GnssPositionCov`, `EstimatorHealth::fix`, the 2D
-      covariance update): every compliant receiver emits GST, so it needs no
-      vendor binary decoder and no hardware. Unblocked, not started; prefer
-      this over the SBF item below.
+- [x] GNSS covariance and fix status over NMEA 0183 (the vendor-neutral path):
+      the 0183 parser gained GST and the gnss0183 driver pairs the most recent
+      GST with the next GGA within a staleness window (`GST_MAX_AGE`), emitting
+      `GnssPositionCov` (per-axis covariance from GST's lat/lon stds, RTK fix
+      mode from GGA quality) and falling back to the HDOP*UERE scalar
+      `GnssPosition` when no fresh GST is available. GST's error-ellipse cross
+      term is omitted deliberately: recovering it needs trig, not worth a libm
+      dependency in the no_std driver for a second-order refinement. Estimator
+      unchanged; it already consumes `GnssPositionCov` / `EstimatorHealth::fix`.
 - [ ] Septentrio SBF over UART (optional, receiver-specific): a binary decoder
       for the Septentrio-only extras GST does not carry, PPS-disciplined
       timestamping and dual-antenna moving-baseline heading. Deferred behind

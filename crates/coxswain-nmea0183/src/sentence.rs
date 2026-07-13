@@ -118,12 +118,34 @@ pub struct VtgSentence {
     pub mode: Option<FaaMode>,
 }
 
+/// GST: position error statistics. The wire also carries a UTC time field, an
+/// RMS field, and an altitude-error std; none are surfaced here (the driver
+/// needs the horizontal error ellipse and the per-axis lat/lon stds only),
+/// though they are still counted so a wrong field count is rejected. Every
+/// surfaced field is optional: a receiver may report the ellipse, or the
+/// axis-aligned stds, or leave them empty when it has no estimate.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct GstSentence {
+    pub talker: TalkerId,
+    /// 1-sigma of the error-ellipse semi-major axis, metres.
+    pub std_major_m: Option<f64>,
+    /// 1-sigma of the error-ellipse semi-minor axis, metres.
+    pub std_minor_m: Option<f64>,
+    /// Orientation of the semi-major axis, degrees from true north.
+    pub orientation_deg: Option<f64>,
+    /// 1-sigma latitude (north) position error, metres.
+    pub std_lat_m: Option<f64>,
+    /// 1-sigma longitude (east) position error, metres.
+    pub std_lon_m: Option<f64>,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Sentence {
     Gga(GgaSentence),
     Rmc(RmcSentence),
     Hdt(HdtSentence),
     Vtg(VtgSentence),
+    Gst(GstSentence),
 }
 
 /// Longest standard 0183 sentence, `$` through the terminating `<LF>`
@@ -159,6 +181,7 @@ pub(crate) fn parse(bytes: &[u8], quirks: &Quirks) -> Result<Sentence, ParseErro
         "RMC" => parse_rmc(talker, rest).map(Sentence::Rmc),
         "HDT" => parse_hdt(talker, rest).map(Sentence::Hdt),
         "VTG" => parse_vtg(talker, rest).map(Sentence::Vtg),
+        "GST" => parse_gst(talker, rest).map(Sentence::Gst),
         _ => Err(ParseError::UnsupportedSentence),
     }
 }
@@ -283,6 +306,20 @@ fn parse_vtg(talker: TalkerId, rest: &str) -> Result<VtgSentence, ParseError> {
         sog_knots,
         sog_kmh,
         mode,
+    })
+}
+
+fn parse_gst(talker: TalkerId, rest: &str) -> Result<GstSentence, ParseError> {
+    // time, rms, std-major, std-minor, orientation, std-lat, std-lon, std-alt.
+    // Time, RMS, and altitude std are counted but not surfaced.
+    let f = exact_fields::<8>(rest)?;
+    Ok(GstSentence {
+        talker,
+        std_major_m: opt_f64(f[2])?,
+        std_minor_m: opt_f64(f[3])?,
+        orientation_deg: opt_f64(f[4])?,
+        std_lat_m: opt_f64(f[5])?,
+        std_lon_m: opt_f64(f[6])?,
     })
 }
 

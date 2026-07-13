@@ -84,7 +84,7 @@ pps     = "pps1"                     # timing input, if wired
 lever_arm_m = [1.20, 0.00, -0.85]    # antenna offset from vessel origin, x fwd, y stbd, z down
 [sensor.nmea0183]
 talkers   = ["GP", "GN"]             # accepted talker IDs
-sentences = ["GGA", "RMC"]           # position, plus SOG/COG
+sentences = ["GGA", "RMC", "GST"]    # position, SOG/COG, and error statistics
 
 [[sensor]]
 id      = "imu_main"

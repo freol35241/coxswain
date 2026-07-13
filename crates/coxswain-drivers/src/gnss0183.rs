@@ -1,7 +1,5 @@
-//! GNSS-over-0183 driver: GGA -> position, HDT -> heading, RMC -> SOG/COG,
-//! VTG parsed and discarded. docs/TASKS.md Phase 6: covariance from HDOP and
-//! fix quality, deliberately crude; the estimator's declared noise
-//! parameters carry the weight until SBF lands.
+//! GNSS-over-0183 driver: GGA -> position, GST -> position covariance (paired
+//! with GGA), HDT -> heading, RMC -> SOG/COG, VTG parsed and discarded.
 //!
 //! Byte-fed and pure (`push`), not owning any UART or clock: the driver
 //! crate's timestamping policy (see `crate` docs) requires the caller to
@@ -15,17 +13,27 @@
 //! the declared measurement std until PPS-disciplined timestamping arrives
 //! with SBF.
 //!
-//! GGA is the only position source this driver emits: it carries HDOP, so a
-//! per-fix std is derivable, and it stays a scalar `GnssPosition`
-//! (`MeasurementKind::GnssPositionCov`'s full covariance and fix mode have
-//! no 0183 source; that variant plumbs through once a covariance-capable
-//! receiver, e.g. SBF, exists to observe it from, which is deliberate, not
-//! an oversight).
+//! GGA carries the position. Alone it yields a scalar `GnssPosition` with a
+//! crude HDOP*UERE std. When the receiver also emits GST (position error
+//! statistics), the driver pairs them: GST supplies a real 2x2 covariance and
+//! GGA's fix quality supplies the RTK fix mode, so the fix becomes a
+//! `GnssPositionCov`. GST carries no position of its own, and its order
+//! relative to GGA within an epoch is receiver-specific, so the driver holds
+//! the most recent GST covariance and pairs it with the next GGA within
+//! `GST_MAX_AGE`, falling back to the scalar path when no fresh GST is
+//! available: a receiver that emits none, or a dropped or stale one. The
+//! position is always the current GGA's; only the covariance can lag, and
+//! slowly. A covariance-capable binary receiver (e.g. SBF) is a separate,
+//! later driver.
 
-use coxswain_contract::{BoundedList, GeoPoint, Measurement, MeasurementKind, SensorId, Timestamp};
+use core::time::Duration;
+
+use coxswain_contract::{
+    BoundedList, GeoPoint, GnssFixMode, Measurement, MeasurementKind, SensorId, Timestamp,
+};
 use coxswain_nmea0183::{
-    FaaMode, GgaSentence, HdtSentence, ParseError, Quirks, RmcSentence, RmcStatus, Sentence,
-    SentenceReader, TalkerId,
+    FaaMode, GgaSentence, GstSentence, HdtSentence, ParseError, Quirks, RmcSentence, RmcStatus,
+    Sentence, SentenceReader, TalkerId,
 };
 
 use crate::Driver;
@@ -59,6 +67,17 @@ const SOG_STD_MPS: f64 = 0.2;
 /// purpose, so they are not the same constant.
 const COG_MIN_SPEED_MPS: f64 = 0.5;
 
+/// How stale a GST error estimate may be and still pair with a GGA fix. GST
+/// arrives in the same per-epoch burst as GGA, but the order between the two
+/// is receiver-specific, so a GGA is paired with the most recent GST within
+/// this window. This covers the immediately preceding epoch on a 1 Hz
+/// receiver (the GST-after-GGA ordering) while rejecting a receiver that has
+/// stopped emitting GST. The paired covariance can therefore lag the fix by
+/// up to one epoch, which is acceptable because the receiver's error estimate
+/// varies slowly; the fix mode comes from the current GGA, so an RTK
+/// fixed<->float transition is still reflected immediately.
+const GST_MAX_AGE: Duration = Duration::from_millis(1500);
+
 /// Which sentence types the accept filter can name. Mirrors
 /// `coxswain_manifest::Nmea0183Quirks::sentences` without depending on the
 /// manifest crate (design constraint: coxswain-drivers takes plain config
@@ -70,6 +89,7 @@ pub enum SentenceKind {
     Rmc,
     Hdt,
     Vtg,
+    Gst,
 }
 
 /// Talker/sentence accept filter, shaped like the manifest's
@@ -129,6 +149,46 @@ pub struct Config {
 /// here, are where that gets fixed (SBF, later).
 fn gga_fix_is_trusted(fix_quality: u8) -> bool {
     matches!(fix_quality, 1 | 2 | 4 | 5)
+}
+
+/// Map a trusted GGA fix quality onto the contract's fix mode, for the
+/// `fix` field of a `GnssPositionCov` (GST carries no mode of its own). Only
+/// the trusted qualities `gga_fix_is_trusted` admits reach here; any other
+/// value maps to `Other` rather than fabricating a specific mode.
+fn gga_fix_mode(fix_quality: u8) -> GnssFixMode {
+    match fix_quality {
+        1 => GnssFixMode::Autonomous,
+        2 => GnssFixMode::Differential,
+        4 => GnssFixMode::RtkFixed,
+        5 => GnssFixMode::RtkFloat,
+        _ => GnssFixMode::Other,
+    }
+}
+
+/// The most recent usable GST error estimate, as a 2x2 NE covariance in m^2
+/// with the acquisition time of the GST sentence it came from.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct GstStats {
+    cov_ne_m2: [[f64; 2]; 2],
+    acquired_at: Timestamp,
+}
+
+/// Build a 2x2 NE covariance (m^2) from a GST sentence, using the per-axis
+/// latitude (north) and longitude (east) 1-sigma stds as an axis-aligned
+/// diagonal. Returns `None` when the receiver reports no per-axis stds, so
+/// the fix stays on the scalar HDOP path rather than fusing a fabricated
+/// covariance.
+///
+/// The error ellipse's cross-covariance term is deliberately not used:
+/// recovering it from the semi-major/minor/orientation fields needs trig, and
+/// a libm dependency in this no_std driver is not worth a second-order
+/// refinement over the receiver's own per-axis variances (which are already
+/// anisotropic, unlike the isotropic HDOP scalar this replaces).
+fn gst_to_cov(gst: &GstSentence) -> Option<[[f64; 2]; 2]> {
+    let (Some(slat), Some(slon)) = (gst.std_lat_m, gst.std_lon_m) else {
+        return None;
+    };
+    (slat > 0.0 && slon > 0.0).then_some([[slat * slat, 0.0], [0.0, slon * slon]])
 }
 
 /// RMC FAA modes the estimator is licensed to see SOG/COG from: Autonomous,
@@ -199,12 +259,20 @@ impl MeasurementBatch {
 pub struct Gnss0183Driver {
     config: Config,
     reader: SentenceReader,
+    /// Most recent usable GST error estimate, paired with the next GGA within
+    /// `GST_MAX_AGE`. `None` before the first GST (or after `init`), which is
+    /// the scalar-fallback state.
+    last_gst: Option<GstStats>,
 }
 
 impl Gnss0183Driver {
     pub fn new(config: Config) -> Self {
         let reader = SentenceReader::new(config.quirks);
-        Self { config, reader }
+        Self {
+            config,
+            reader,
+            last_gst: None,
+        }
     }
 
     /// Feed one byte, acquired at `acquired_at` (the driver-crate
@@ -224,16 +292,18 @@ impl Gnss0183Driver {
         acquired_at: Timestamp,
     ) -> Option<Result<MeasurementBatch, GnssError>> {
         match self.reader.push(byte)? {
-            Ok(sentence) => self.to_measurement(sentence, acquired_at).map(Ok),
+            Ok(sentence) => self.on_sentence(sentence, acquired_at).map(Ok),
             Err(e) => Some(Err(GnssError::Parse(e))),
         }
     }
 
     /// Maps one parsed sentence onto a batch of 0-2 measurements, applying
     /// the accept filter and the per-sentence gating rules. `None` for
-    /// anything that is not an error but also not a Measurement.
-    fn to_measurement(
-        &self,
+    /// anything that is not an error but also not a Measurement. Takes
+    /// `&mut self`: GST produces no measurement but updates the covariance a
+    /// later GGA pairs with.
+    fn on_sentence(
+        &mut self,
         sentence: Sentence,
         acquired_at: Timestamp,
     ) -> Option<MeasurementBatch> {
@@ -242,6 +312,7 @@ impl Gnss0183Driver {
             Sentence::Rmc(s) => (s.talker, SentenceKind::Rmc),
             Sentence::Hdt(s) => (s.talker, SentenceKind::Hdt),
             Sentence::Vtg(s) => (s.talker, SentenceKind::Vtg),
+            Sentence::Gst(s) => (s.talker, SentenceKind::Gst),
         };
         if !self.config.filter.accepts(talker, kind) {
             return None;
@@ -259,7 +330,28 @@ impl Gnss0183Driver {
             // double-count the exact way a position out of RMC would
             // double-count GGA. RMC is the sole SOG/COG source.
             Sentence::Vtg(_) => None,
+            // GST carries error statistics, not a fix: it updates the
+            // covariance the next GGA pairs with and emits nothing itself.
+            Sentence::Gst(gst) => {
+                if let Some(cov_ne_m2) = gst_to_cov(&gst) {
+                    self.last_gst = Some(GstStats {
+                        cov_ne_m2,
+                        acquired_at,
+                    });
+                }
+                None
+            }
         }
+    }
+
+    /// The most recent GST covariance if it is fresh enough to describe a fix
+    /// acquired at `now` (see `GST_MAX_AGE`). `checked_duration_since` returns
+    /// `None` if the stored GST is somehow newer than `now`, which also
+    /// rejects it.
+    fn fresh_gst_cov(&self, now: Timestamp) -> Option<[[f64; 2]; 2]> {
+        let gst = self.last_gst.as_ref()?;
+        let age = now.checked_duration_since(gst.acquired_at)?;
+        (age <= GST_MAX_AGE).then_some(gst.cov_ne_m2)
     }
 
     /// RMC -> SOG always (when status/mode gate as trusted), COG only when
@@ -320,6 +412,23 @@ impl Gnss0183Driver {
         let (Some(lat_deg), Some(lon_deg)) = (gga.lat_deg, gga.lon_deg) else {
             return None;
         };
+        let position = GeoPoint {
+            lat_rad: lat_deg * DEG_TO_RAD,
+            lon_rad: lon_deg * DEG_TO_RAD,
+        };
+        // A fresh GST turns this into a real covariance-and-fix-mode fix;
+        // otherwise fall back to the crude HDOP*UERE scalar (module doc).
+        if let Some(cov_ne_m2) = self.fresh_gst_cov(acquired_at) {
+            return Some(Measurement {
+                sensor: self.config.position_sensor,
+                t: acquired_at,
+                kind: MeasurementKind::GnssPositionCov {
+                    position,
+                    cov_ne_m2,
+                    fix: gga_fix_mode(gga.fix_quality),
+                },
+            });
+        }
         let std_m = gga
             .hdop
             .map(|hdop| hdop * self.config.uere_m)
@@ -327,13 +436,7 @@ impl Gnss0183Driver {
         Some(Measurement {
             sensor: self.config.position_sensor,
             t: acquired_at,
-            kind: MeasurementKind::GnssPosition {
-                position: GeoPoint {
-                    lat_rad: lat_deg * DEG_TO_RAD,
-                    lon_rad: lon_deg * DEG_TO_RAD,
-                },
-                std_m,
-            },
+            kind: MeasurementKind::GnssPosition { position, std_m },
         })
     }
 
@@ -357,6 +460,7 @@ impl Driver for Gnss0183Driver {
     /// dropped). There is no bus to bring up: this driver owns no UART.
     fn init(&mut self) -> Result<(), Self::Error> {
         self.reader = SentenceReader::new(self.config.quirks);
+        self.last_gst = None;
         Ok(())
     }
 
@@ -461,6 +565,15 @@ mod tests {
     // Cruise speed but no COG field.
     const RMC_NO_COG: &[u8] = b"$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,,230394,003.1,W*4C";
     const VTG_COURSE_AND_SPEED: &[u8] = b"$GPVTG,054.7,T,034.4,M,005.5,N,010.2,K*48";
+    // GST error statistics; checksums computed independently (python XOR).
+    // North-aligned ellipse (orientation 0): semi-major 0.030 m along north,
+    // semi-minor 0.020 m along east, so the NE covariance is exactly the
+    // diagonal [[0.03^2, 0], [0, 0.02^2]], easy to assert.
+    const GST_NORTH_ALIGNED: &[u8] = b"$GPGST,123519,0.006,0.030,0.020,0.0,0.030,0.020,0.050*77";
+    // Axis-aligned per-axis stds only, no ellipse fields.
+    const GST_DIAGONAL_ONLY: &[u8] = b"$GPGST,123519,0.006,,,,0.030,0.040,0.050*5E";
+    // Every statistic empty: parses, but carries no usable covariance.
+    const GST_EMPTY: &[u8] = b"$GPGST,123519,,,,,,,*5A";
 
     #[test]
     fn gga_quality_1_yields_position_scaled_by_hdop() {
@@ -726,5 +839,170 @@ mod tests {
             driver.read_with_timestamp(Timestamp::from_nanos(0)),
             Err(GnssError::NoByteSource)
         );
+    }
+
+    // ------------------------------------------------- GST pairing/fallback
+
+    /// GST then GGA in one epoch: the fix becomes a GnssPositionCov carrying
+    /// the receiver's real covariance and the GGA-derived fix mode.
+    #[test]
+    fn gga_paired_with_fresh_gst_yields_position_cov() {
+        let mut driver = Gnss0183Driver::new(config());
+        let t = Timestamp::from_nanos(1_000);
+        // GST itself emits no measurement.
+        assert_eq!(feed(&mut driver, GST_NORTH_ALIGNED, t), None);
+        let m = feed(&mut driver, GGA_QUALITY_1, t).unwrap().unwrap().first;
+        let MeasurementKind::GnssPositionCov {
+            position,
+            cov_ne_m2,
+            fix,
+        } = m.kind
+        else {
+            panic!("expected GnssPositionCov, got {:?}", m.kind);
+        };
+        assert_eq!(m.sensor, SensorId(1));
+        assert_eq!(m.t, t);
+        let expected_lat = (48.0 + 7.038 / 60.0) * DEG_TO_RAD;
+        assert!((position.lat_rad - expected_lat).abs() < 1e-9);
+        assert!((cov_ne_m2[0][0] - 0.030 * 0.030).abs() < 1e-12);
+        assert!((cov_ne_m2[1][1] - 0.020 * 0.020).abs() < 1e-12);
+        assert!(cov_ne_m2[0][1].abs() < 1e-12 && cov_ne_m2[1][0].abs() < 1e-12);
+        // GGA quality 1 -> Autonomous.
+        assert_eq!(fix, GnssFixMode::Autonomous);
+    }
+
+    /// The fix mode is GGA's, not GST's: an RTK-fixed GGA reports RtkFixed
+    /// even though the covariance came from GST.
+    #[test]
+    fn rtk_fixed_gga_reports_rtk_fixed_fix_mode() {
+        let mut driver = Gnss0183Driver::new(config());
+        let t = Timestamp::from_nanos(1_000);
+        feed(&mut driver, GST_NORTH_ALIGNED, t);
+        let m = feed(&mut driver, GGA_QUALITY_4_RTK_FIXED, t)
+            .unwrap()
+            .unwrap()
+            .first;
+        let MeasurementKind::GnssPositionCov { fix, .. } = m.kind else {
+            panic!("expected GnssPositionCov, got {:?}", m.kind);
+        };
+        assert_eq!(fix, GnssFixMode::RtkFixed);
+    }
+
+    /// No GST at all: the scalar HDOP*UERE path, unchanged.
+    #[test]
+    fn gga_without_gst_falls_back_to_scalar() {
+        let mut driver = Gnss0183Driver::new(config());
+        let m = feed(&mut driver, GGA_QUALITY_1, Timestamp::from_nanos(0))
+            .unwrap()
+            .unwrap()
+            .first;
+        let MeasurementKind::GnssPosition { std_m, .. } = m.kind else {
+            panic!("expected scalar GnssPosition, got {:?}", m.kind);
+        };
+        assert!((std_m - 0.9 * DEFAULT_UERE_M).abs() < 1e-9);
+    }
+
+    /// A GST older than GST_MAX_AGE does not pair: fall back to scalar rather
+    /// than fuse a stale covariance.
+    #[test]
+    fn stale_gst_falls_back_to_scalar() {
+        let mut driver = Gnss0183Driver::new(config());
+        feed(&mut driver, GST_NORTH_ALIGNED, Timestamp::from_nanos(0));
+        // 2 s later, past the 1.5 s window.
+        let m = feed(
+            &mut driver,
+            GGA_QUALITY_1,
+            Timestamp::from_nanos(2_000_000_000),
+        )
+        .unwrap()
+        .unwrap()
+        .first;
+        assert!(matches!(m.kind, MeasurementKind::GnssPosition { .. }));
+    }
+
+    /// GST-after-GGA ordering on a 1 Hz receiver: the GGA pairs with the
+    /// previous epoch's GST, one epoch old but inside the window.
+    #[test]
+    fn gst_one_epoch_old_still_pairs() {
+        let mut driver = Gnss0183Driver::new(config());
+        feed(&mut driver, GST_NORTH_ALIGNED, Timestamp::from_nanos(0));
+        let m = feed(
+            &mut driver,
+            GGA_QUALITY_1,
+            Timestamp::from_nanos(1_000_000_000),
+        )
+        .unwrap()
+        .unwrap()
+        .first;
+        assert!(matches!(m.kind, MeasurementKind::GnssPositionCov { .. }));
+    }
+
+    /// A receiver reporting only the axis-aligned stds gives a diagonal
+    /// covariance.
+    #[test]
+    fn diagonal_only_gst_yields_diagonal_cov() {
+        let mut driver = Gnss0183Driver::new(config());
+        let t = Timestamp::from_nanos(1_000);
+        feed(&mut driver, GST_DIAGONAL_ONLY, t);
+        let m = feed(&mut driver, GGA_QUALITY_1, t).unwrap().unwrap().first;
+        let MeasurementKind::GnssPositionCov { cov_ne_m2, .. } = m.kind else {
+            panic!("expected GnssPositionCov, got {:?}", m.kind);
+        };
+        assert!((cov_ne_m2[0][0] - 0.030 * 0.030).abs() < 1e-12);
+        assert!((cov_ne_m2[1][1] - 0.040 * 0.040).abs() < 1e-12);
+        assert_eq!(cov_ne_m2[0][1], 0.0);
+    }
+
+    /// An all-empty GST carries no usable covariance and must not be paired.
+    #[test]
+    fn empty_gst_leaves_scalar_fallback() {
+        let mut driver = Gnss0183Driver::new(config());
+        let t = Timestamp::from_nanos(1_000);
+        assert_eq!(feed(&mut driver, GST_EMPTY, t), None);
+        let m = feed(&mut driver, GGA_QUALITY_1, t).unwrap().unwrap().first;
+        assert!(matches!(m.kind, MeasurementKind::GnssPosition { .. }));
+    }
+
+    /// An unusable (empty) GST must not clobber a good prior one still inside
+    /// the window.
+    #[test]
+    fn empty_gst_does_not_clobber_prior_gst() {
+        let mut driver = Gnss0183Driver::new(config());
+        feed(&mut driver, GST_NORTH_ALIGNED, Timestamp::from_nanos(0));
+        feed(&mut driver, GST_EMPTY, Timestamp::from_nanos(100_000_000)); // 0.1 s
+        let m = feed(
+            &mut driver,
+            GGA_QUALITY_1,
+            Timestamp::from_nanos(200_000_000),
+        )
+        .unwrap()
+        .unwrap()
+        .first;
+        assert!(matches!(m.kind, MeasurementKind::GnssPositionCov { .. }));
+    }
+
+    /// GST dropped by the accept filter never reaches pairing: scalar
+    /// fallback, as for a manifest that does not list GST.
+    #[test]
+    fn gst_not_in_filter_falls_back_to_scalar() {
+        let mut cfg = config();
+        cfg.filter.sentences.push(SentenceKind::Gga).unwrap(); // GST not listed
+        let mut driver = Gnss0183Driver::new(cfg);
+        let t = Timestamp::from_nanos(1_000);
+        assert_eq!(feed(&mut driver, GST_NORTH_ALIGNED, t), None);
+        let m = feed(&mut driver, GGA_QUALITY_1, t).unwrap().unwrap().first;
+        assert!(matches!(m.kind, MeasurementKind::GnssPosition { .. }));
+    }
+
+    /// init clears the paired GST: a re-init driver starts on the scalar path
+    /// until it sees GST again.
+    #[test]
+    fn init_clears_paired_gst() {
+        let mut driver = Gnss0183Driver::new(config());
+        let t = Timestamp::from_nanos(1_000);
+        feed(&mut driver, GST_NORTH_ALIGNED, t);
+        driver.init().unwrap();
+        let m = feed(&mut driver, GGA_QUALITY_1, t).unwrap().unwrap().first;
+        assert!(matches!(m.kind, MeasurementKind::GnssPosition { .. }));
     }
 }

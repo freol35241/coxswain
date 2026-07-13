@@ -383,6 +383,7 @@ fn build_filter(quirks: Option<Nmea0183Quirks>) -> gnss0183::AcceptFilter {
             "RMC" => Some(gnss0183::SentenceKind::Rmc),
             "HDT" => Some(gnss0183::SentenceKind::Hdt),
             "VTG" => Some(gnss0183::SentenceKind::Vtg),
+            "GST" => Some(gnss0183::SentenceKind::Gst),
             _ => None,
         };
         if let Some(kind) = kind {

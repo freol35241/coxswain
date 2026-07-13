@@ -158,6 +158,39 @@ fn vtg_rtk_fixed_mode() {
 }
 
 #[test]
+fn gst_error_ellipse() {
+    // Position error statistics: RMS 0.006, semi-major 0.023 m, semi-minor
+    // 0.020 m, ellipse orientation 273.6 deg, lat std 0.023 m, lon std
+    // 0.020 m, alt std 0.031 m. Checksum computed independently (python XOR).
+    let line = b"$GPGST,123519,0.006,0.023,0.020,273.6,0.023,0.020,0.031*70";
+    let s = parse_sentence(line, &strict()).unwrap();
+    let Sentence::Gst(gst) = s else {
+        panic!("expected Gst, got {s:?}")
+    };
+    assert_eq!(gst.talker, *b"GP");
+    assert_eq!(gst.std_major_m, Some(0.023));
+    assert_eq!(gst.std_minor_m, Some(0.020));
+    assert_eq!(gst.orientation_deg, Some(273.6));
+    assert_eq!(gst.std_lat_m, Some(0.023));
+    assert_eq!(gst.std_lon_m, Some(0.020));
+}
+
+#[test]
+fn gst_diagonal_only_leaves_ellipse_none() {
+    // A receiver that reports the axis-aligned stds but not the ellipse.
+    let line = b"$GPGST,123519,0.006,,,,0.030,0.040,0.050*5E";
+    let s = parse_sentence(line, &strict()).unwrap();
+    let Sentence::Gst(gst) = s else {
+        panic!("expected Gst, got {s:?}")
+    };
+    assert_eq!(gst.std_major_m, None);
+    assert_eq!(gst.std_minor_m, None);
+    assert_eq!(gst.orientation_deg, None);
+    assert_eq!(gst.std_lat_m, Some(0.030));
+    assert_eq!(gst.std_lon_m, Some(0.040));
+}
+
+#[test]
 fn southern_western_hemisphere_signs_are_negative() {
     // Same magnitudes as the reference fix, opposite hemispheres.
     let line = b"$GPGGA,123519,4807.038,S,01131.000,W,1,08,0.9,545.4,M,46.9,M,,*48";

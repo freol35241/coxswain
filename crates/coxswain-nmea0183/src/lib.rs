@@ -18,8 +18,8 @@ pub use accumulator::SentenceReader;
 pub use error::ParseError;
 pub use quirks::Quirks;
 pub use sentence::{
-    FaaMode, GgaSentence, HdtSentence, MAX_SENTENCE_LEN, RmcSentence, RmcStatus, Sentence,
-    TalkerId, UtcDate, UtcTime, VtgSentence,
+    FaaMode, GgaSentence, GstSentence, HdtSentence, MAX_SENTENCE_LEN, RmcSentence, RmcStatus,
+    Sentence, TalkerId, UtcDate, UtcTime, VtgSentence,
 };
 
 /// One-shot parse of a complete sentence slice: `$...*hh`, no line
