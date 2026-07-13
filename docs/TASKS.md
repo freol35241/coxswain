@@ -185,11 +185,22 @@ this before freezing far-end firmware.
       Command-then-report comparison surfaced to supervisor health. Second
       output backend, so the output backend trait crystallizes here (D-027);
       commands in physical units, node owns local calibration.
-- [ ] GNSS driver: Septentrio SBF over UART (Mosaic), PPS hook stubbed for the
-      host profile. Earns its place when the estimator consumes covariance and
-      RTK status, and not before -- that precondition is now met
+- [ ] GNSS covariance and fix status over NMEA 0183 (the vendor-neutral path):
+      extend the 0183 parser with GST (per-axis position std, plus the error
+      ellipse for the full 2x2) and map GGA fix quality (4 fixed, 5 float) to
+      `GnssFixMode`, so the 0183 driver emits `GnssPositionCov` instead of the
+      HDOP*UERE scalar. This is the portable way to feed the covariance and
+      RTK-status intake the estimator now consumes
       (`MeasurementKind::GnssPositionCov`, `EstimatorHealth::fix`, the 2D
-      covariance update), so this task is unblocked, not yet started.
+      covariance update): every compliant receiver emits GST, so it needs no
+      vendor binary decoder and no hardware. Unblocked, not started; prefer
+      this over the SBF item below.
+- [ ] Septentrio SBF over UART (optional, receiver-specific): a binary decoder
+      for the Septentrio-only extras GST does not carry, PPS-disciplined
+      timestamping and dual-antenna moving-baseline heading. Deferred behind
+      the GST path above; earns its place only for a vessel running a
+      Septentrio receiver that needs those extras. PPS hook stubbed on the host
+      profile. See scoping in this session's history if revived.
 - [x] NMEA 2000 listen-only decode for the initial PGN set; enrichment path
       only. (Fast-packet reassembly and PGN 129029 landed after this line was
       checked, plus hosted SocketCAN wiring end to end, vcan-tested in CI.)
