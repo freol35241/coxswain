@@ -11,6 +11,7 @@ members = [
     "crates/coxswain-nmea0183",
     "crates/coxswain-crsf",
     "crates/coxswain-n2k",
+    "crates/coxswain-cyphal",
     "crates/coxswain-drivers",
     "crates/coxswain-sim",
     "crates/coxswain-keelson",

@@ -294,6 +294,48 @@ The output backend trait is deliberately not built with the first backend:
 one implementation is a single-use abstraction. It crystallizes when the
 Cyphal backend lands in Phase 7, one phase away.
 
+## D-028: Cyphal backend, and the output backend trait it crystallizes
+
+Status: proposed. The transport layer has landed (coxswain-cyphal); the trait
+and backend design below is proposed for discussion before the backend code,
+per the working style (D-027 deferred the trait as an explicit architectural
+act).
+
+Settled and built: a hand-rolled coxswain-cyphal crate, zero dependencies,
+no_std, no alloc, same discipline as coxswain-n2k and coxswain-crsf. Not
+canadensis: pulling a large Cyphal stack into the control path contradicts the
+established zero-dependency parser pattern and the no_std-with-injected-IO
+invariant, and our actuator nodes are our own firmware, so we need the
+transport, not a general-purpose Cyphal node. Scope is the classic Cyphal/CAN
+v1.0 message layout (13-bit subject-ids, the format the stable spec, the
+OpenCyphal Wireshark plugin, and v1.0 libcanard use, so a standard analyzer
+can still inspect the bus) and single-frame transfers only: the actuator
+command, feedback, and power messages each fit one CAN frame, so multi-frame
+reassembly (transfer CRC, toggle) is deliberately unbuilt and a received
+multi-frame transfer is reported, not mis-decoded.
+
+Proposed: the output backend trait sits at the physical-units boundary, the
+allocator's per-effector `ActuatorOutputs` (newtons, radians), not at the
+rendered-microseconds boundary the $CXOUT serial backend currently consumes.
+This is the load-bearing consequence of D-027: the serial bridge renders
+manifest PWM calibration into microseconds at the conn node (dumb far end),
+while a Cyphal node is commanded in physical units and owns its local
+calibration. So crystallizing the trait moves the microsecond rendering from
+the hosted wiring down into the serial backend, and the Cyphal backend sends
+the physical values straight through. Both backends take `ActuatorOutputs`;
+each decides how the far end is addressed and calibrated.
+
+Proposed message set (our nodes, our firmware, minimal): a per-effector
+setpoint command (one f32 physical value, conn to node), a per-node feedback
+(achieved f32, node to conn) for the command-then-report comparison surfaced
+to supervisor health (D-010), and a power status (bus voltage f32) from the
+power-monitoring node into the failsafe matrix, reusing the existing
+`PowerStatus` intake the $CXPWR path already feeds. Command-then-report
+compares commanded against reported per effector and flags a divergence to
+health; the exact tolerance and the health surface are open until the backend
+lands. SocketCAN wiring on the hosted profile mirrors the N2K path and is
+vcan-tested in CI; the physical actuator node firmware is Phase 9.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest

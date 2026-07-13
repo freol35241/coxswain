@@ -357,6 +357,10 @@ name = "coxswain-crsf"
 version = "0.1.0"
 
 [[package]]
+name = "coxswain-cyphal"
+version = "0.1.0"
+
+[[package]]
 name = "coxswain-drivers"
 version = "0.1.0"
 dependencies = [

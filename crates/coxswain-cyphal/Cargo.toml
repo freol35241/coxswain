@@ -1,0 +1,14 @@
+[package]
+name = "coxswain-cyphal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Intentionally empty: no_std, no allocation, zero dependencies (design
+# constraint, same as coxswain-n2k / coxswain-crsf). This crate is the
+# Cyphal/CAN v1.0 single-frame transport codec: 29-bit CAN id and tail byte
+# in and out, payload-agnostic. It does not touch sockets or SocketCAN (the
+# hosted transport's job, D-011) and it does not map onto coxswain-contract
+# (that is the actuator backend's job in coxswain-drivers).
+[dependencies]
