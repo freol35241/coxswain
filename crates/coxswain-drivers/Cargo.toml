@@ -11,3 +11,5 @@ coxswain-contract = { path = "../coxswain-contract" }
 # path dep, zero transitive cost (CLAUDE.md: interfaces are adapters).
 coxswain-nmea0183 = { path = "../coxswain-nmea0183" }
 coxswain-crsf = { path = "../coxswain-crsf" }
+# The Cyphal actuator backend consumes the Cyphal/CAN transport codec.
+coxswain-cyphal = { path = "../coxswain-cyphal" }

@@ -70,8 +70,9 @@ impl Priority {
     }
 }
 
-/// A 13-bit subject-id, validated on construction.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// A 13-bit subject-id, validated on construction. `Default` is subject 0
+/// (valid), for use as dead-tail filler in bounded config lists.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubjectId(u16);
 
 impl SubjectId {
@@ -88,8 +89,8 @@ impl SubjectId {
     }
 }
 
-/// A 7-bit node-id, validated on construction.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// A 7-bit node-id, validated on construction. `Default` is node 0 (valid).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct NodeId(u8);
 
 impl NodeId {

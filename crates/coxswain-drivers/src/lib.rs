@@ -26,6 +26,7 @@
 use coxswain_contract::Timestamp;
 
 pub mod actuator_serial;
+pub mod cyphal_actuator;
 pub mod gnss0183;
 pub mod output;
 pub mod rc;
