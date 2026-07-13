@@ -9,25 +9,28 @@ It runs on the vessel's own hardware and does what its name says: keeps
 track of where the vessel is and how it is moving, steers it, and answers
 for who is allowed to command it at any moment.
 
-![Coxswain architecture: enrichment sources reach the vessel through interface adapters above the self-sufficiency line; below it the conn node runs the supervisor, estimator, guidance, allocation, and actuator backend against manifest-licensed sensors and effectors.](docs/architecture.drawio.svg)
+![Coxswain architecture: above the self-sufficiency line, command sources reach the vessel through claimant adapters; below it the conn node runs the supervisor, estimator, guidance, and allocation, taking in sensor interfaces and driving out through output backends. Solid boxes are built; dashed boxes are designed but not yet built.](docs/architecture.drawio.svg)
 
-The source file is a draw.io-editable SVG: it renders here and opens for
-editing at [diagrams.net](https://app.diagrams.net). Between guidance and the
-actuator backend, the allocation stage maps guidance's generalized force onto
-the vessel's manifest-declared effectors, so the actuator wire carries
-per-channel outputs (`$CXOUT`), not the force demand itself.
+The diagram is the target architecture, drawn once and marked for what exists.
+Everything above the line enriches the vessel: perception, mission autonomy,
+teleoperation, fleet and shore systems. Below the line is Coxswain, and it
+meets the world through three adapter families, never through a raw external
+protocol. Command sources are claimants: an onboard autonomy process, a
+remote operator, or a hand controller wired to the conn node all ask the
+supervisor for the conn and can lose it, over
+[Keelson](https://github.com/RISE-Maritime/keelson) today and a MAVLink facade
+later. Sensor buses reach the estimator as licensed or enrichment
+measurements: NMEA 0183 and 2000 today, native IMU and GNSS drivers next. And
+the allocator's per-channel outputs leave through an output backend: the
+`$CXOUT` serial bridge today, Cyphal actuator nodes and direct PWM on the
+reference hardware next. The manifest governs all three boundaries, and the
+supervisor watches the estimate's health, substituting its own setpoint when a
+failsafe condition holds.
 
-Everything above the line enriches the vessel: perception, mission
-autonomy, teleoperation, fleet and shore systems. All of it reaches the
-vessel through interface adapters at the process boundary;
-[Keelson](https://github.com/RISE-Maritime/keelson) is the native
-interface today, and a MAVLink facade for GCS compatibility is next in
-line. Everything below the line is Coxswain. Command sources, whether an
-onboard autonomy process, a remote operator, or a hand controller wired
-to the conn node, are claimants: they ask the supervisor for the conn and
-can lose it. The supervisor also watches the estimate's health, and when
-a failsafe condition holds it substitutes its own setpoint for the
-holder's.
+Solid boxes in the diagram are working today; dashed boxes are designed but
+not yet built, so one picture carries both the finished stack and the road
+left. The file is a draw.io-editable SVG: it renders here and opens for
+editing at [diagrams.net](https://app.diagrams.net).
 
 ## Why it exists
 
