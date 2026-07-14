@@ -390,6 +390,69 @@ power to the existing `PowerStatus` intake, per-effector divergence to an
 `actuation` source in the published health telemetry, mirroring the estimator
 source (D-010's command-then-report reaching the observable surface).
 
+## D-030: Manifest authoring reshape, uniform nesting and one position notation (schema_version 5 -> 6)
+
+Status: accepted. Two consistency questions raised against the v0.6 schema
+(schema doc open questions 5 and 6, sketched in the 2026-07-14 diary) are
+settled together, since both change the authored shape and ride one bump.
+
+Uniform nesting. The schema resolves four discriminated unions (`bus.kind`,
+`sensor.role`, `effector.kind`, and the effector's referenced bus kind), each
+gating a different set of sibling fields. v0.6 carried them inconsistently:
+`[sensor.nmea0183]` and `[effector.pwm]` nested, while bus-kind fields, effector
+geometry, and Cyphal wiring sat flat in a bag of optionals that the compiler
+sorted by hand. Every "field X is valid only for kind Y" rule was a hand-written
+check. From v0.7 the rule is uniform: identity and cross-reference fields (`id`,
+`kind`, `role`, `bus`, `port`, `license`) stay flat; every discriminant-gated
+field lives in a named sub-table (`[bus.<kind>]`, `[effector.<kind>]` for
+geometry, `[effector.output]` and its `[effector.output.pwm]` for wiring). With
+`deny_unknown_fields` a misplaced field is then a parse error, not a silent
+default or a compiler special-case. This is chosen deliberately after the
+2026-07-14 session found two settled invariants the compiler was not enforcing:
+converting hand-written placement checks into parse-time structural guarantees
+removes that class of gap. The cost is a taller file and churning every fixture,
+paid once, pre-release.
+
+One position notation. Body-frame mounting position was spelled two ways,
+`lever_arm_m = [x, y, z]` on sensors and `pos_x_m`/`pos_y_m` on effectors. From
+v0.7 both use a single `pos` array. The sensor's stays flat and three-element
+(`pos = [x, y, z]`), kind-independent since every sensor has a 3-D mounting
+offset. The effector's moves into its `[effector.<kind>]` geometry table at the
+arity the Fossen 3-DOF model uses: `pos = [x, y]` for a thruster, `pos = [x]`
+for a rudder (the model takes only its longitudinal lever). A fixed-size array
+per kind keeps the arity parse-time-checked rather than validated by hand, which
+is why the effector position nests with the rest of its kind-gated geometry
+instead of sitting flat. This is an authoring change only: per invariant 3 the
+compiled contract types are the internal truth and do not move, so `pos` maps to
+the same compiled `lever_arm_m`, `pos_x_m`, and `pos_y_m` the estimator and
+allocator already consume. The blob layout is therefore unchanged; only the
+`schema_version` integer bumps.
+
+Enforcement, not just relocation. Nesting plus `deny_unknown_fields` rejects a
+misplaced field within a correctly-selected sub-table at parse time, but not a
+whole sub-table authored for the wrong discriminant (`[sensor.compass]` on a
+wind sensor, `[effector.rudder]` on a thruster), since those remain structurally
+optional. v0.7 adds one narrow "unexpected sub-table for this role/kind" check
+per union to close that, replacing the former field-by-field presence checks.
+This turns previously-legal-but-meaningless field combinations into compile
+errors, which is the intent: the same class of silent slip the 2026-07-14
+session found unenforced.
+
+Deferred. `[estimator].origin` names the frame the positions are measured
+against but is still parsed and discarded (the contract does not carry it, and
+per D-022 the schema does not guess what the estimator needs from the frame
+ahead of the estimator). Relocating it into a dedicated `[geometry]` (or
+`[conn_node]`) section is left until the estimator answers that, rather than
+reshuffling a discarded field now and risking a second move.
+
+The bump. schema_version 5 -> 6 (D-018): a v5 reader rejects a v6 blob outright,
+no migration, the same doctrine as every prior bump. The bump is forced by the
+authored shape changing, even though the compiled layout does not, so the host
+tool rejects a v5 manifest against the v6 model and vice versa cleanly rather
+than mis-parsing. Blast radius: `toml_model.rs` and `compile.rs`, every golden
+and rejection fixture, the two example manifests, and the schema doc; the
+contract crate and the blob reader are untouched.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest

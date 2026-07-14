@@ -306,7 +306,7 @@ impl Drop for FrameSender {
 
 const MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 5
+schema_version = 6
 vessel_id      = "cx-cyphal-rig-01"
 name           = "Cyphal CAN Rig"
 revision       = 1
@@ -321,6 +321,7 @@ watchdog_ms = 250
 id       = "ctrl"
 kind     = "cyphal_can"
 port     = "can0"
+[bus.cyphal_can]
 bitrate  = 1000000
 node_id  = 5
 
@@ -330,6 +331,7 @@ role    = "power"
 driver  = "cyphal_power"
 bus     = "ctrl"
 license = "inner_loop"
+[sensor.cyphal]
 node_id = 21
 subject = 300
 
@@ -337,11 +339,12 @@ subject = 300
 id      = "thruster"
 kind    = "fixed_thruster"
 bus     = "ctrl"
-pos_x_m          = -1.0
-pos_y_m          = 0.0
+[effector.fixed_thruster]
+pos              = [-1.0, 0.0]
 azimuth_rad      = 0.0
 max_thrust_fwd_n = 200.0
 max_thrust_rev_n = 120.0
+[effector.output]
 node_id          = 11
 command_subject  = 100
 feedback_subject = 200

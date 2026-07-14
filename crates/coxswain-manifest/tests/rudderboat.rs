@@ -35,7 +35,7 @@ fn expect_invalid(source: &str) -> ValidateError {
 fn rudderboat_compiles_and_roundtrips() {
     let manifest = coxswain_manifest::compile(RUDDERBOAT).expect("rudderboat compiles");
     assert_eq!(manifest.vessel_id.as_str(), "se-rise-rudderboat-01");
-    assert_eq!(manifest.schema_version, 5);
+    assert_eq!(manifest.schema_version, 6);
     assert_eq!(manifest.buses.len(), 3);
     assert_eq!(manifest.sensors.len(), 2);
     assert_eq!(manifest.actuator_nodes.len(), 0);
@@ -161,8 +161,8 @@ fn rejects_unknown_kind() {
 #[test]
 fn rejects_effector_bus_missing() {
     let src = patched(
-        "bus     = \"actuator_bridge\"\nchannel = 1",
-        "bus     = \"nope\"\nchannel = 1",
+        "kind    = \"rudder\"\nbus     = \"actuator_bridge\"",
+        "kind    = \"rudder\"\nbus     = \"nope\"",
     );
     assert_eq!(
         expect_invalid(&src),
@@ -173,16 +173,19 @@ fn rejects_effector_bus_missing() {
     );
 }
 
-// A bus node_id is only meaningful on a cyphal_can bus (D-029).
+// D-030: only the [bus.<kind>] sub-table matching `kind` may be authored. A
+// [bus.cyphal_can] (carrying node_id) on the actuator_uart bridge is a
+// placement error, replacing the former flat-node_id-on-wrong-kind check.
 #[test]
-fn rejects_bus_node_id_on_non_cyphal() {
+fn rejects_cyphal_subtable_on_non_cyphal_bus() {
     let src = patched(
-        "kind     = \"actuator_uart\"\nport     = \"uart4\"",
-        "kind     = \"actuator_uart\"\nport     = \"uart4\"\nnode_id  = 5",
+        "[bus.actuator_uart]\nbaud     = 115200",
+        "[bus.actuator_uart]\nbaud     = 115200\n[bus.cyphal_can]\nnode_id  = 5",
     );
     assert!(matches!(
         expect_invalid(&src),
-        ValidateError::BusNodeIdWrongKind { bus } if bus == "actuator_bridge"
+        ValidateError::BusSubtableUnexpected { bus, sub }
+            if bus == "actuator_bridge" && sub == "cyphal_can"
     ));
 }
 
@@ -191,8 +194,8 @@ fn rejects_bus_node_id_on_non_cyphal() {
 #[test]
 fn rejects_effector_bus_of_non_output_kind() {
     let src = patched(
-        "bus     = \"actuator_bridge\"\nchannel = 1",
-        "bus     = \"gnss_serial\"\nchannel = 1",
+        "kind    = \"rudder\"\nbus     = \"actuator_bridge\"",
+        "kind    = \"rudder\"\nbus     = \"gnss_serial\"",
     );
     assert_eq!(
         expect_invalid(&src),
@@ -201,6 +204,24 @@ fn rejects_effector_bus_of_non_output_kind() {
             bus: "gnss_serial".to_string(),
         }
     );
+}
+
+// D-030: only the [effector.<kind>] geometry sub-table matching `kind` may be
+// authored. A complete (so it parses) [effector.rudder] block on the
+// fixed_thruster esc is a placement error the compiler rejects.
+#[test]
+fn rejects_wrong_geometry_subtable() {
+    let src = patched(
+        "max_thrust_rev_n  = 180.0\n[effector.output]",
+        "max_thrust_rev_n  = 180.0\n[effector.rudder]\npos = [-1.0]\n\
+         side_force_n_per_rad_mps2 = 1.0\nmax_angle_rad = 0.1\n\
+         min_effective_speed_mps = 0.1\n[effector.output]",
+    );
+    assert!(matches!(
+        expect_invalid(&src),
+        ValidateError::EffectorSubtableUnexpected { effector, sub }
+            if effector == "esc_main" && sub == "rudder"
+    ));
 }
 
 // Channel must be unique per bus.

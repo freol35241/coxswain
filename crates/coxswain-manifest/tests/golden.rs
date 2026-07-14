@@ -46,7 +46,7 @@ fn example_compiles_and_roundtrips() {
     assert_eq!(manifest.vessel_id.as_str(), "example-vessel-01");
     assert_eq!(manifest.name.as_str(), "Example");
     assert_eq!(manifest.revision, 7);
-    assert_eq!(manifest.schema_version, 5);
+    assert_eq!(manifest.schema_version, 6);
     assert_eq!(manifest.buses.len(), 6);
     assert_eq!(manifest.sensors.len(), 7);
     assert_eq!(manifest.actuator_nodes.len(), 3);
@@ -238,8 +238,8 @@ fn rejects_duplicate_claimant_id() {
 fn rejects_estimator_reference_to_enrichment_sensor() {
     // Demote gnss_main; the estimator.gnss list still names it.
     let src = patched(
-        "license = \"inner_loop\"\npps",
-        "license = \"enrichment\"\npps",
+        "license = \"inner_loop\"\npos     = [1.20, 0.00, -0.85]",
+        "license = \"enrichment\"\npos     = [1.20, 0.00, -0.85]",
     );
     assert!(matches!(
         expect_invalid(&src),
@@ -280,6 +280,21 @@ fn rejects_inner_loop_ais() {
     assert!(matches!(
         expect_invalid(&src),
         ValidateError::AisMustBeEnrichment { sensor } if sensor == "ais_main"
+    ));
+}
+
+// D-030: a sensor authors only the role-physics sub-table matching its `role`.
+// A [sensor.imu] block on the gnss sensor is a placement error.
+#[test]
+fn rejects_wrong_role_subtable() {
+    let src = patched(
+        "[sensor.gnss]\npps     = \"pps1\"                     # timing input, if wired",
+        "[sensor.gnss]\npps     = \"pps1\"\n[sensor.imu]\norientation = \"x_fwd_z_down\"",
+    );
+    assert!(matches!(
+        expect_invalid(&src),
+        ValidateError::SensorSubtableUnexpected { sensor, sub }
+            if sensor == "gnss_main" && sub == "imu"
     ));
 }
 
@@ -418,14 +433,14 @@ fn rejects_inner_loop_on_udp_bus_outside_conn_segment() {
     ));
 }
 
-// Rule 10: schema_version must be 5. A prior-version manifest (schema_version
-// 4) is rejected outright now, same doctrine as every prior bump.
+// Rule 10: schema_version must be 6. A prior-version manifest (schema_version
+// 5) is rejected outright now, same doctrine as every prior bump.
 #[test]
 fn rejects_unknown_schema_version() {
-    let src = patched("schema_version = 5", "schema_version = 4");
+    let src = patched("schema_version = 6", "schema_version = 5");
     assert_eq!(
         expect_invalid(&src),
-        ValidateError::UnsupportedSchemaVersion(4)
+        ValidateError::UnsupportedSchemaVersion(5)
     );
 }
 

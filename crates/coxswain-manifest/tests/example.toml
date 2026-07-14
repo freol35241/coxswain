@@ -3,7 +3,7 @@
 # ============================================================
 
 [manifest]
-schema_version = 5          # firmware refuses unknown major versions
+schema_version = 6          # firmware refuses unknown major versions
 vessel_id      = "example-vessel-01"
 name           = "Example"
 revision       = 7          # monotonically increasing per vessel
@@ -22,19 +22,23 @@ watchdog_ms    = 250                 # hardware watchdog kick interval
 # ------------------------------------------------------------
 # Buses: every sensor/actuator references one of these by id.
 # Kinds: cyphal_can | nmea2000_can | nmea0183_uart | nmea0183_udp | spi | i2c | uart
-#      | actuator_uart | pwm
+#      | actuator_uart | pwm | crsf_uart
+# Identity (id/kind/port) is flat; every kind-gated field lives in the
+# [bus.<kind>] sub-table (D-030). spi/i2c/pwm gate no fields, so no sub-table.
 # ------------------------------------------------------------
 
 [[bus]]
 id       = "ctrl"
 kind     = "cyphal_can"
 port     = "can1"
+[bus.cyphal_can]
 bitrate  = 1000000
 
 [[bus]]
 id       = "instruments"
 kind     = "nmea2000_can"
 port     = "can2"
+[bus.nmea2000_can]
 bitrate  = 250000
 mode     = "listen_only"      # transmit is a scoped later feature
 
@@ -42,6 +46,7 @@ mode     = "listen_only"      # transmit is a scoped later feature
 id       = "gnss_serial"
 kind     = "nmea0183_uart"
 port     = "uart4"
+[bus.nmea0183_uart]
 baud     = 115200
 checksum = "required"         # strict by default; "optional" is a per-bus quirk
 
@@ -49,6 +54,7 @@ checksum = "required"         # strict by default; "optional" is a per-bus quirk
 id       = "legacy_gyro"
 kind     = "nmea0183_uart"
 port     = "uart7"            # RS-422 input
+[bus.nmea0183_uart]
 baud     = 4800
 checksum = "required"         # strict by default; "optional" is a per-bus quirk
 
@@ -56,6 +62,7 @@ checksum = "required"         # strict by default; "optional" is a per-bus quirk
 id       = "ais_udp"
 kind     = "nmea0183_udp"
 port     = "eth0"
+[bus.nmea0183_udp]
 listen_port = 10110
 source_ip   = "192.168.10.40"  # guards against a second sender; promotion is moot here, AIS never promotes (D-014)
 segment     = "conn"           # declares the L2 path stays below the companion computer
@@ -80,8 +87,9 @@ role    = "gnss"
 driver  = "nmea0183"
 bus     = "gnss_serial"
 license = "inner_loop"
+pos     = [1.20, 0.00, -0.85]        # antenna offset from vessel origin, x fwd, y stbd, z down
+[sensor.gnss]
 pps     = "pps1"                     # timing input, if wired
-lever_arm_m = [1.20, 0.00, -0.85]    # antenna offset from vessel origin, x fwd, y stbd, z down
 [sensor.nmea0183]
 talkers   = ["GP", "GN"]             # accepted talker IDs
 sentences = ["GGA", "RMC", "GST"]    # position, SOG/COG, and error statistics
@@ -92,8 +100,9 @@ role    = "imu"
 driver  = "scha63t"
 bus     = "imu_spi"
 license = "inner_loop"
+pos     = [0.00, 0.00, 0.00]
+[sensor.imu]
 orientation = "x_fwd_z_down"         # mounting rotation, enum of standard mountings
-lever_arm_m = [0.00, 0.00, 0.00]
 
 [[sensor]]
 id      = "mag_main"
@@ -101,6 +110,7 @@ role    = "compass"
 driver  = "rm3100"
 bus     = "imu_spi"
 license = "inner_loop"
+[sensor.compass]
 declination_source = "wmm"           # wmm | fixed
 # declination_deg  = 4.2             # only if source = "fixed"
 
@@ -141,6 +151,7 @@ role    = "power"
 driver  = "cyphal_power"
 bus     = "ctrl"
 license = "inner_loop"               # failsafe matrix input
+[sensor.cyphal]
 node_id = 21
 
 # ------------------------------------------------------------

@@ -16,10 +16,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bumped 4 -> 5 for the per-bus-kind effector output (`EffectorOutput`) the
 /// Cyphal actuation path needs, plus the `cyphal_can` bus `node_id` and the
-/// role=power sensor `subject` (D-029). Deliberate: pre-release, so old readers
-/// simply reject new blobs and new readers reject old ones, no migration
-/// path needed.
-pub const SCHEMA_VERSION: u16 = 5;
+/// role=power sensor `subject` (D-029). Bumped 5 -> 6 for the authoring reshape
+/// (D-030): discriminant-gated fields nest in named sub-tables and both
+/// position notations become a single `pos`. The blob layout is unchanged; the
+/// bump is forced by the authored shape so a v5 reader rejects a v6 manifest
+/// and vice versa. Deliberate: pre-release, so old readers simply reject new
+/// blobs and new readers reject old ones, no migration path needed.
+pub const SCHEMA_VERSION: u16 = 6;
 
 /// Fixed-capacity UTF-8 string, zero-padded. Exists so the blob needs no
 /// allocator; 32 bytes fits every identifier the schema doc uses.

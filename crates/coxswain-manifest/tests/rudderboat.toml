@@ -6,7 +6,7 @@
 # ============================================================
 
 [manifest]
-schema_version = 5
+schema_version = 6
 vessel_id      = "se-rise-rudderboat-01"
 name           = "Rudderboat"
 revision       = 1
@@ -25,12 +25,14 @@ watchdog_ms    = 250
 id       = "actuator_bridge"
 kind     = "actuator_uart"
 port     = "uart4"
+[bus.actuator_uart]
 baud     = 115200
 
 [[bus]]
 id       = "gnss_serial"
 kind     = "nmea0183_uart"
 port     = "uart7"
+[bus.nmea0183_uart]
 baud     = 4800
 checksum = "required"
 
@@ -75,13 +77,14 @@ sentences = ["HDT"]
 id      = "esc_main"
 kind    = "fixed_thruster"
 bus     = "actuator_bridge"
-channel = 0
-pos_x_m           = -1.20
-pos_y_m           = 0.00
+[effector.fixed_thruster]
+pos               = [-1.20, 0.00]    # x fwd, y stbd
 azimuth_rad       = 0.0
 max_thrust_fwd_n  = 300.0
 max_thrust_rev_n  = 180.0
-[effector.pwm]
+[effector.output]
+channel = 0
+[effector.output.pwm]
 us_min    = 1100
 us_center = 1500
 us_max    = 1900
@@ -90,12 +93,14 @@ us_max    = 1900
 id      = "rudder_main"
 kind    = "rudder"
 bus     = "actuator_bridge"
-channel = 1
-pos_x_m                    = -1.80
+[effector.rudder]
+pos                        = [-1.80]  # longitudinal lever only
 side_force_n_per_rad_mps2  = 400.0
 max_angle_rad              = 0.6
 min_effective_speed_mps    = 0.5
-[effector.pwm]
+[effector.output]
+channel = 1
+[effector.output.pwm]
 us_min    = 1100
 us_center = 1500
 us_max    = 1900

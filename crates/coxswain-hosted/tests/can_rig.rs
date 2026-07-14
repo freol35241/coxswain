@@ -427,7 +427,7 @@ impl Drop for FrameSender {
 
 const MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 5
+schema_version = 6
 vessel_id      = "cx-can-rig-01"
 name           = "CAN Desk Rig"
 revision       = 1
@@ -442,6 +442,7 @@ watchdog_ms = 250
 id      = "instruments"
 kind    = "nmea2000_can"
 port    = "can0"
+[bus.nmea2000_can]
 bitrate = 250000
 mode    = "listen_only"
 

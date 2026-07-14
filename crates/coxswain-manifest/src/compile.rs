@@ -15,9 +15,9 @@ use coxswain_contract::{
 use coxswain_cyphal::{NODE_ID_MAX, SUBJECT_ID_MAX};
 
 use crate::toml_model::{
-    BusKindToml, BusToml, ChecksumToml, ClaimantToml, ConnGrantToml, EffectorToml, EstimatorToml,
-    FailsafeToml, FunctionToml, GeofenceActionToml, GeofenceToml, LicenseToml, ManifestToml,
-    PwmCalibrationToml, RcToml, RoleToml, SensorToml,
+    BusKindToml, BusToml, ChecksumToml, ClaimantToml, ConnGrantToml, EffectorOutputToml,
+    EffectorToml, EstimatorToml, FailsafeToml, FunctionToml, GeofenceActionToml, GeofenceToml,
+    LicenseToml, ManifestToml, PwmCalibrationToml, RcToml, RoleToml, SensorToml,
 };
 use crate::types::{
     ActuatorFailsafe, ActuatorFunction, ActuatorNodeEntry, BusEntry, BusKind, ChecksumMode,
@@ -259,9 +259,25 @@ pub enum ValidateError {
     BusNodeIdMissing {
         bus: String,
     },
-    /// `[[bus]].node_id` is set on a bus that is not `cyphal_can` (D-029).
-    BusNodeIdWrongKind {
+    /// A `[bus.<kind>]` sub-table is authored for a kind other than the bus's
+    /// own `kind` (D-030): the discriminant-gated fields live only under the
+    /// matching kind's sub-table.
+    BusSubtableUnexpected {
         bus: String,
+        sub: &'static str,
+    },
+    /// A `[sensor.<role>]` or `[sensor.<transport>]` sub-table is authored for
+    /// a role other than the sensor's own, or a transport other than the one
+    /// its bus kind selects (D-030).
+    SensorSubtableUnexpected {
+        sensor: String,
+        sub: &'static str,
+    },
+    /// A `[effector.<kind>]` geometry sub-table is authored for a kind other
+    /// than the effector's own `kind` (D-030).
+    EffectorSubtableUnexpected {
+        effector: String,
+        sub: &'static str,
     },
     /// A `cyphal_can` effector's `report_tolerance` is not strictly positive
     /// and finite (D-029).
@@ -276,7 +292,7 @@ impl std::fmt::Display for ValidateError {
             Self::UnsupportedSchemaVersion(v) => {
                 write!(
                     f,
-                    "schema_version {v} unsupported, this tool compiles version 5"
+                    "schema_version {v} unsupported, this tool compiles version {SCHEMA_VERSION}"
                 )
             }
             Self::UnknownBoard(b) => write!(f, "unknown conn_node.board profile {b:?}"),
@@ -492,8 +508,24 @@ impl std::fmt::Display for ValidateError {
                      node's own id it transmits from)"
                 )
             }
-            Self::BusNodeIdWrongKind { bus } => {
-                write!(f, "bus {bus:?}: node_id is only valid on a cyphal_can bus")
+            Self::BusSubtableUnexpected { bus, sub } => {
+                write!(
+                    f,
+                    "bus {bus:?} authors [bus.{sub}], which its kind does not use"
+                )
+            }
+            Self::SensorSubtableUnexpected { sensor, sub } => {
+                write!(
+                    f,
+                    "sensor {sensor:?} authors [sensor.{sub}], which its role or bus kind does \
+                     not use"
+                )
+            }
+            Self::EffectorSubtableUnexpected { effector, sub } => {
+                write!(
+                    f,
+                    "effector {effector:?} authors [effector.{sub}], which its kind does not use"
+                )
             }
             Self::EffectorToleranceNotPositive { effector } => {
                 write!(
@@ -579,6 +611,10 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         if !bus_ids.insert(&bus.id) {
             return Err(ValidateError::DuplicateBusId(bus.id.clone()));
         }
+        // D-030: only the [bus.<kind>] sub-table matching `kind` may be
+        // authored. Checked before node-id collection so a stray Cyphal
+        // sub-table cannot masquerade as a claim.
+        bus_subtable_guard(bus)?;
         if !port_allowed(&bus.port) {
             return Err(ValidateError::PortNotOnProfile {
                 owner: bus.id.clone(),
@@ -621,15 +657,17 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         }
     }
 
-    // Every bus reference names a declared bus; pps inputs sit on the profile.
+    // Every bus reference names a declared bus; the sub-tables match the role
+    // and bus kind (D-030); pps inputs sit on the profile.
     for sensor in &m.sensors {
-        if !bus_by_id.contains_key(sensor.bus.as_str()) {
+        let Some(bus) = bus_by_id.get(sensor.bus.as_str()) else {
             return Err(ValidateError::UnknownBus {
                 owner: sensor.id.clone(),
                 bus: sensor.bus.clone(),
             });
-        }
-        if let Some(pps) = &sensor.pps
+        };
+        sensor_subtable_guard(sensor, bus.kind)?;
+        if let Some(pps) = sensor.gnss.as_ref().map(|g| &g.pps)
             && !port_allowed(pps)
         {
             return Err(ValidateError::PortNotOnProfile {
@@ -668,13 +706,14 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         if bus.kind != BusKindToml::Nmea0183Udp {
             continue;
         }
-        if bus.source_ip.is_none() {
+        let udp = bus.nmea0183_udp.as_ref();
+        if udp.and_then(|u| u.source_ip.as_ref()).is_none() {
             return Err(ValidateError::InnerLoopUdpUnpinned {
                 sensor: sensor.id.clone(),
                 bus: bus.id.clone(),
             });
         }
-        if bus.segment.as_deref() != Some("conn") {
+        if udp.and_then(|u| u.segment.as_deref()) != Some("conn") {
             return Err(ValidateError::InnerLoopUdpBadSegment {
                 sensor: sensor.id.clone(),
                 bus: bus.id.clone(),
@@ -684,23 +723,25 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
 
     // Cyphal node ids unique per bus: sensors, actuator nodes, the conn node's
     // own id on each cyphal_can bus, and Cyphal effector nodes, all together
-    // (D-029). A node id on a non-cyphal bus is rejected in `bus_entry`; here
-    // only cyphal_can conn/effector ids join the set.
+    // (D-029). A Cyphal sub-table on a non-cyphal bus is rejected by the
+    // sub-table guards above; here only cyphal_can conn/effector ids join the
+    // set.
     let mut node_ids: HashSet<(&str, u16)> = HashSet::new();
     let sensor_claims = m
         .sensors
         .iter()
-        .filter_map(|s| s.node_id.map(|node_id| (s.bus.as_str(), node_id)));
+        .filter_map(|s| s.cyphal.as_ref().map(|c| (s.bus.as_str(), c.node_id)));
     let actuator_claims = m.actuator_nodes.iter().map(|n| (n.bus.as_str(), n.node_id));
     let conn_claims = m.buses.iter().filter_map(|b| {
-        (b.kind == BusKindToml::CyphalCan)
-            .then_some(b.node_id.map(|id| (b.id.as_str(), id)))
-            .flatten()
+        b.cyphal_can
+            .as_ref()
+            .and_then(|c| c.node_id)
+            .map(|id| (b.id.as_str(), id))
     });
     let effector_claims = m.effectors.iter().filter_map(|e| {
         let bus = bus_by_id.get(e.bus.as_str())?;
         (bus.kind == BusKindToml::CyphalCan)
-            .then_some(e.node_id.map(|id| (e.bus.as_str(), id)))
+            .then_some(e.output.node_id.map(|id| (e.bus.as_str(), id)))
             .flatten()
     });
     for (bus, node_id) in sensor_claims
@@ -834,7 +875,7 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
 
         let kind = effector_kind(&e.id, e)?;
         effector_finite_and_positive(&e.id, &kind)?;
-        let output = effector_output(&e.id, e, bus.kind)?;
+        let output = effector_output(&e.id, &e.output, bus.kind)?;
 
         // Channel uniqueness applies to serial outputs only; a Cyphal effector
         // is addressed by subject, not channel (D-029).
@@ -872,7 +913,7 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
     // covered it when present.
     for bus in &m.buses {
         if bus.kind == BusKindToml::CyphalCan
-            && bus.node_id.is_none()
+            && bus.cyphal_can.as_ref().and_then(|c| c.node_id).is_none()
             && m.effectors.iter().any(|e| e.bus == bus.id)
         {
             return Err(ValidateError::BusNodeIdMissing {
@@ -891,7 +932,7 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         let is_serial = bus_by_id
             .get(e.bus.as_str())
             .is_some_and(|b| matches!(b.kind, BusKindToml::ActuatorUart | BusKindToml::Pwm));
-        if is_serial && let Some(channel) = e.channel {
+        if is_serial && let Some(channel) = e.output.channel {
             channels_by_bus
                 .entry(e.bus.as_str())
                 .or_default()
@@ -1170,20 +1211,53 @@ fn segments_intersect(p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], p4: [f64; 2]) ->
         || (d4 == 0.0 && on_segment(p1, p2, p4))
 }
 
+/// The `[bus.<kind>]` sub-table a bus kind uses (D-030), `None` for kinds that
+/// gate no fields (`spi`, `i2c`, `pwm`).
+fn bus_subtable(kind: BusKindToml) -> Option<&'static str> {
+    match kind {
+        BusKindToml::CyphalCan => Some("cyphal_can"),
+        BusKindToml::Nmea2000Can => Some("nmea2000_can"),
+        BusKindToml::Nmea0183Uart => Some("nmea0183_uart"),
+        BusKindToml::Nmea0183Udp => Some("nmea0183_udp"),
+        BusKindToml::Uart => Some("uart"),
+        BusKindToml::ActuatorUart => Some("actuator_uart"),
+        BusKindToml::CrsfUart => Some("crsf_uart"),
+        BusKindToml::Spi | BusKindToml::I2c | BusKindToml::Pwm => None,
+    }
+}
+
+/// D-030: a bus authors only the `[bus.<kind>]` sub-table matching its `kind`.
+/// Any other populated sub-table is a placement error.
+fn bus_subtable_guard(bus: &BusToml) -> Result<(), ValidateError> {
+    let expected = bus_subtable(bus.kind);
+    for (sub, present) in [
+        ("cyphal_can", bus.cyphal_can.is_some()),
+        ("nmea2000_can", bus.nmea2000_can.is_some()),
+        ("nmea0183_uart", bus.nmea0183_uart.is_some()),
+        ("nmea0183_udp", bus.nmea0183_udp.is_some()),
+        ("uart", bus.uart.is_some()),
+        ("actuator_uart", bus.actuator_uart.is_some()),
+        ("crsf_uart", bus.crsf_uart.is_some()),
+    ] {
+        if present && expected != Some(sub) {
+            return Err(ValidateError::BusSubtableUnexpected {
+                bus: bus.id.clone(),
+                sub,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn bus_entry(bus: &BusToml) -> Result<BusEntry, ValidateError> {
-    let node_id = match bus.node_id {
+    let node_id = match bus.cyphal_can.as_ref().and_then(|c| c.node_id) {
         None => None,
         Some(id) => {
-            if bus.kind != BusKindToml::CyphalCan {
-                return Err(ValidateError::BusNodeIdWrongKind {
-                    bus: bus.id.clone(),
-                });
-            }
             cyphal_id(&bus.id, "node_id", id, NODE_ID_MAX as u16)?;
             Some(id)
         }
     };
-    let source_ip = match &bus.source_ip {
+    let source_ip = match bus.nmea0183_udp.as_ref().and_then(|u| u.source_ip.as_ref()) {
         None => None,
         Some(ip) => Some(
             ip.parse::<std::net::Ipv4Addr>()
@@ -1194,6 +1268,28 @@ fn bus_entry(bus: &BusToml) -> Result<BusEntry, ValidateError> {
                 .octets(),
         ),
     };
+    // Only the sub-table matching `kind` is populated (bus_subtable_guard), so
+    // at most one of these arms yields a value.
+    let bitrate = bus
+        .cyphal_can
+        .as_ref()
+        .and_then(|c| c.bitrate)
+        .or_else(|| bus.nmea2000_can.as_ref().and_then(|c| c.bitrate));
+    let baud = bus
+        .nmea0183_uart
+        .as_ref()
+        .and_then(|u| u.baud)
+        .or_else(|| bus.uart.as_ref().and_then(|u| u.baud))
+        .or_else(|| bus.actuator_uart.as_ref().and_then(|u| u.baud))
+        .or_else(|| bus.crsf_uart.as_ref().and_then(|u| u.baud));
+    let checksum = bus
+        .nmea0183_uart
+        .as_ref()
+        .and_then(|u| u.checksum)
+        .or_else(|| bus.nmea0183_udp.as_ref().and_then(|u| u.checksum));
+    let listen_port = bus.nmea0183_udp.as_ref().and_then(|u| u.listen_port);
+    let segment = bus.nmea0183_udp.as_ref().and_then(|u| u.segment.as_ref());
+    let listen_only = bus.nmea2000_can.as_ref().is_some_and(|c| c.mode.is_some());
     Ok(BusEntry {
         id: fx("bus.id", &bus.id)?,
         kind: match bus.kind {
@@ -1209,26 +1305,25 @@ fn bus_entry(bus: &BusToml) -> Result<BusEntry, ValidateError> {
             BusKindToml::CrsfUart => BusKind::CrsfUart,
         },
         port: fx("bus.port", &bus.port)?,
-        rate: bus
-            .bitrate
-            .or(bus.baud)
+        rate: bitrate
+            .or(baud)
             .unwrap_or(if bus.kind == BusKindToml::CrsfUart {
                 CRSF_BAUD_DEFAULT
             } else {
                 0
             }),
-        listen_port: bus.listen_port.unwrap_or(0),
+        listen_port: listen_port.unwrap_or(0),
         source_ip,
-        segment: match &bus.segment {
+        segment: match segment {
             Some(s) => fx("bus.segment", s)?,
             None => FixedStr32::empty(),
         },
-        checksum: match bus.checksum {
+        checksum: match checksum {
             Some(ChecksumToml::Optional) => ChecksumMode::Optional,
             // Strict by default; permissiveness is a declared quirk.
             Some(ChecksumToml::Required) | None => ChecksumMode::Required,
         },
-        listen_only: bus.mode.is_some(),
+        listen_only,
         node_id,
     })
 }
@@ -1260,6 +1355,59 @@ fn role(r: RoleToml) -> SensorRole {
         RoleToml::Power => SensorRole::Power,
         RoleToml::ActuatorFeedback => SensorRole::ActuatorFeedback,
     }
+}
+
+/// The `[sensor.<role>]` role-physics sub-table a role uses (D-030), `None`
+/// for roles that gate no physics fields.
+fn sensor_role_subtable(role: RoleToml) -> Option<&'static str> {
+    match role {
+        RoleToml::Gnss => Some("gnss"),
+        RoleToml::Imu => Some("imu"),
+        RoleToml::Compass => Some("compass"),
+        _ => None,
+    }
+}
+
+/// The `[sensor.<transport>]` quirk sub-table a bus kind selects (D-030),
+/// `None` for bus kinds that carry no transport quirks.
+fn sensor_transport_subtable(kind: BusKindToml) -> Option<&'static str> {
+    match kind {
+        BusKindToml::Nmea0183Uart | BusKindToml::Nmea0183Udp => Some("nmea0183"),
+        BusKindToml::Nmea2000Can => Some("nmea2000"),
+        BusKindToml::CyphalCan => Some("cyphal"),
+        _ => None,
+    }
+}
+
+/// D-030: a sensor authors only the role-physics sub-table matching its `role`
+/// and the transport sub-table its bus kind selects. Any other populated
+/// sub-table is a placement error.
+fn sensor_subtable_guard(s: &SensorToml, bus_kind: BusKindToml) -> Result<(), ValidateError> {
+    let unexpected = |sub: &'static str| ValidateError::SensorSubtableUnexpected {
+        sensor: s.id.clone(),
+        sub,
+    };
+    let role_expected = sensor_role_subtable(s.role);
+    for (sub, present) in [
+        ("gnss", s.gnss.is_some()),
+        ("imu", s.imu.is_some()),
+        ("compass", s.compass.is_some()),
+    ] {
+        if present && role_expected != Some(sub) {
+            return Err(unexpected(sub));
+        }
+    }
+    let transport_expected = sensor_transport_subtable(bus_kind);
+    for (sub, present) in [
+        ("cyphal", s.cyphal.is_some()),
+        ("nmea0183", s.nmea0183.is_some()),
+        ("nmea2000", s.nmea2000.is_some()),
+    ] {
+        if present && transport_expected != Some(sub) {
+            return Err(unexpected(sub));
+        }
+    }
+    Ok(())
 }
 
 fn sensor_entry(
@@ -1329,7 +1477,7 @@ fn sensor_entry(
         LicenseToml::Enrichment => License::Enrichment,
     };
 
-    let subject = match s.subject {
+    let subject = match s.cyphal.as_ref().and_then(|c| c.subject) {
         None => None,
         Some(id) => {
             cyphal_id(&s.id, "subject", id, SUBJECT_ID_MAX)?;
@@ -1343,22 +1491,26 @@ fn sensor_entry(
         driver: fx("sensor.driver", &s.driver)?,
         bus: fx("sensor.bus", &s.bus)?,
         license,
-        node_id: s.node_id,
+        node_id: s.cyphal.as_ref().map(|c| c.node_id),
         subject,
-        pps: match &s.pps {
-            Some(pps) => fx("sensor.pps", pps)?,
+        pps: match s.gnss.as_ref() {
+            Some(g) => fx("sensor.gnss.pps", &g.pps)?,
             None => FixedStr32::empty(),
         },
-        lever_arm_m: s.lever_arm_m.unwrap_or([0.0; 3]),
-        orientation: match &s.orientation {
-            Some(o) => fx("sensor.orientation", o)?,
+        lever_arm_m: s.pos.unwrap_or([0.0; 3]),
+        orientation: match s.imu.as_ref() {
+            Some(i) => fx("sensor.imu.orientation", &i.orientation)?,
             None => FixedStr32::empty(),
         },
-        declination_source: match &s.declination_source {
-            Some(d) => fx("sensor.declination_source", d)?,
+        declination_source: match s.compass.as_ref() {
+            Some(c) => fx("sensor.compass.declination_source", &c.declination_source)?,
             None => FixedStr32::empty(),
         },
-        declination_deg: s.declination_deg.unwrap_or(0.0),
+        declination_deg: s
+            .compass
+            .as_ref()
+            .and_then(|c| c.declination_deg)
+            .unwrap_or(0.0),
         nmea0183,
         nmea2000,
     };
@@ -1371,34 +1523,51 @@ fn sensor_entry(
     Ok((entry, config))
 }
 
-/// Resolves `effector.kind`. "azimuth" and "sail" are schema-visible but
-/// rejected until implemented (D-026); any other unrecognized string is the
-/// ordinary unknown-kind error, the same pattern as `model_params`'s
-/// `UnknownModel`.
+/// Resolves `effector.kind` and its `[effector.<kind>]` geometry sub-table
+/// (D-030). "azimuth" and "sail" are schema-visible but rejected until
+/// implemented (D-026); any other unrecognized string is the ordinary
+/// unknown-kind error, the same pattern as `model_params`'s `UnknownModel`.
+/// The kind's own geometry sub-table is required and the other kind's must be
+/// absent; the sub-table's fields are non-optional, so serde has already
+/// enforced them and their `pos` arity at parse time.
 fn effector_kind(id: &str, e: &EffectorToml) -> Result<EffectorKind, ValidateError> {
-    let field = |name: &'static str, v: Option<f64>| {
-        v.ok_or_else(|| ValidateError::EffectorFieldMissing {
-            effector: id.to_string(),
-            field: name,
-        })
+    let missing = |sub: &'static str| ValidateError::EffectorFieldMissing {
+        effector: id.to_string(),
+        field: sub,
+    };
+    let unexpected = |sub: &'static str| ValidateError::EffectorSubtableUnexpected {
+        effector: id.to_string(),
+        sub,
     };
     match e.kind.as_str() {
-        "fixed_thruster" => Ok(EffectorKind::FixedThruster {
-            pos_x_m: field("pos_x_m", e.pos_x_m)?,
-            pos_y_m: field("pos_y_m", e.pos_y_m)?,
-            azimuth_rad: field("azimuth_rad", e.azimuth_rad)?,
-            max_thrust_fwd_n: field("max_thrust_fwd_n", e.max_thrust_fwd_n)?,
-            max_thrust_rev_n: field("max_thrust_rev_n", e.max_thrust_rev_n)?,
-        }),
-        "rudder" => Ok(EffectorKind::Rudder {
-            pos_x_m: field("pos_x_m", e.pos_x_m)?,
-            side_force_n_per_rad_mps2: field(
-                "side_force_n_per_rad_mps2",
-                e.side_force_n_per_rad_mps2,
-            )?,
-            max_angle_rad: field("max_angle_rad", e.max_angle_rad)?,
-            min_effective_speed_mps: field("min_effective_speed_mps", e.min_effective_speed_mps)?,
-        }),
+        "fixed_thruster" => {
+            if e.rudder.is_some() {
+                return Err(unexpected("rudder"));
+            }
+            let g = e
+                .fixed_thruster
+                .as_ref()
+                .ok_or_else(|| missing("fixed_thruster"))?;
+            Ok(EffectorKind::FixedThruster {
+                pos_x_m: g.pos[0],
+                pos_y_m: g.pos[1],
+                azimuth_rad: g.azimuth_rad,
+                max_thrust_fwd_n: g.max_thrust_fwd_n,
+                max_thrust_rev_n: g.max_thrust_rev_n,
+            })
+        }
+        "rudder" => {
+            if e.fixed_thruster.is_some() {
+                return Err(unexpected("fixed_thruster"));
+            }
+            let g = e.rudder.as_ref().ok_or_else(|| missing("rudder"))?;
+            Ok(EffectorKind::Rudder {
+                pos_x_m: g.pos[0],
+                side_force_n_per_rad_mps2: g.side_force_n_per_rad_mps2,
+                max_angle_rad: g.max_angle_rad,
+                min_effective_speed_mps: g.min_effective_speed_mps,
+            })
+        }
         "azimuth" => Err(ValidateError::EffectorKindNotImplemented {
             effector: id.to_string(),
             kind: "azimuth",
@@ -1411,15 +1580,16 @@ fn effector_kind(id: &str, e: &EffectorToml) -> Result<EffectorKind, ValidateErr
     }
 }
 
-/// Resolves an effector's output wiring by its bus kind (D-029): the serial
-/// arm (`actuator_uart`/`pwm`) takes `channel` + `[effector.pwm]`, the Cyphal
-/// arm (`cyphal_can`) takes `node_id` + the two subjects + `report_tolerance`.
-/// Each arm requires its own fields and rejects the other arm's, the same
-/// missing/unexpected discipline the geometry fields get. Called only for the
-/// output bus kinds; a non-output bus is rejected before this.
+/// Resolves an effector's output wiring by its bus kind (D-029), reading the
+/// `[effector.output]` sub-table (D-030): the serial arm
+/// (`actuator_uart`/`pwm`) takes `channel` + `[effector.output.pwm]`, the
+/// Cyphal arm (`cyphal_can`) takes `node_id` + the two subjects +
+/// `report_tolerance`. Each arm requires its own fields and rejects the other
+/// arm's. Called only for the output bus kinds; a non-output bus is rejected
+/// before this.
 fn effector_output(
     id: &str,
-    e: &EffectorToml,
+    o: &EffectorOutputToml,
     bus_kind: BusKindToml,
 ) -> Result<EffectorOutput, ValidateError> {
     let missing = |field: &'static str| ValidateError::EffectorFieldMissing {
@@ -1433,33 +1603,33 @@ fn effector_output(
     match bus_kind {
         BusKindToml::ActuatorUart | BusKindToml::Pwm => {
             for (field, present) in [
-                ("node_id", e.node_id.is_some()),
-                ("command_subject", e.command_subject.is_some()),
-                ("feedback_subject", e.feedback_subject.is_some()),
-                ("report_tolerance", e.report_tolerance.is_some()),
+                ("node_id", o.node_id.is_some()),
+                ("command_subject", o.command_subject.is_some()),
+                ("feedback_subject", o.feedback_subject.is_some()),
+                ("report_tolerance", o.report_tolerance.is_some()),
             ] {
                 if present {
                     return Err(unexpected(field));
                 }
             }
-            let channel = e.channel.ok_or_else(|| missing("channel"))?;
-            let pwm = pwm_calibration(id, e.pwm.as_ref().ok_or_else(|| missing("pwm"))?)?;
+            let channel = o.channel.ok_or_else(|| missing("channel"))?;
+            let pwm = pwm_calibration(id, o.pwm.as_ref().ok_or_else(|| missing("pwm"))?)?;
             Ok(EffectorOutput::Serial { channel, pwm })
         }
         BusKindToml::CyphalCan => {
-            for (field, present) in [("channel", e.channel.is_some()), ("pwm", e.pwm.is_some())] {
+            for (field, present) in [("channel", o.channel.is_some()), ("pwm", o.pwm.is_some())] {
                 if present {
                     return Err(unexpected(field));
                 }
             }
-            let node_id = e.node_id.ok_or_else(|| missing("node_id"))?;
-            let command_subject = e
+            let node_id = o.node_id.ok_or_else(|| missing("node_id"))?;
+            let command_subject = o
                 .command_subject
                 .ok_or_else(|| missing("command_subject"))?;
-            let feedback_subject = e
+            let feedback_subject = o
                 .feedback_subject
                 .ok_or_else(|| missing("feedback_subject"))?;
-            let report_tolerance = e
+            let report_tolerance = o
                 .report_tolerance
                 .ok_or_else(|| missing("report_tolerance"))?;
             cyphal_id(id, "node_id", node_id, NODE_ID_MAX as u16)?;

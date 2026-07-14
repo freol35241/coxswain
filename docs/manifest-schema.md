@@ -1,15 +1,16 @@
-# Coxswain Vessel Manifest: Schema Draft v0.6
+# Coxswain Vessel Manifest: Schema Draft v0.7
 
 The manifest is the per-vessel statement of what exists, where it terminates, and what
 the estimator is licensed to trust. It is authored as TOML, validated and compiled
 host-side to a signed, CRC-protected binary blob (postcard), and written to an A/B flash
 region on the conn node during commissioning. The firmware treats it as pure data.
 
-Doc revision is v0.6. The wire-facing `manifest.schema_version` bumps 4 -> 5 for the
-per-bus-kind effector output, the `cyphal_can` bus `node_id`, and the role=power sensor
-`subject` (D-029); the bump is deliberate and pre-release, same doctrine as every prior
-bump, so a schema_version 4 reader rejects a schema_version 5 blob outright rather than
-attempting to interpret it.
+Doc revision is v0.7. The wire-facing `manifest.schema_version` bumps 5 -> 6 for the
+authoring reshape (D-030): every discriminant-gated field moves into a named sub-table
+and both position notations collapse to a single `pos`. The compiled blob layout does
+not change, only the version integer; the bump is forced by the authored shape so a
+schema_version 5 reader rejects a schema_version 6 blob outright rather than
+mis-parsing it, same doctrine as every prior bump.
 
 Design rules encoded in this schema:
 
@@ -24,6 +25,14 @@ Design rules encoded in this schema:
 4. **The manifest is auditable.** The blob is signed; its hash is published in health
    telemetry; a logged mission is verifiable against the trust configuration it ran under.
    Everything the manifest governs is inside the blob, or a digest of it is (D-018).
+5. **One nesting rule (D-030).** Identity and cross-reference fields (`id`, `kind`,
+   `role`, `bus`, `port`, `license`) stay flat. Every field gated by a discriminant lives
+   in a named sub-table: `[bus.<kind>]`, `[sensor.<role>]` for role physics and
+   `[sensor.<transport>]` for transport quirks, `[effector.<kind>]` for geometry, and
+   `[effector.output]` (with `[effector.output.pwm]`) for wiring. With
+   `deny_unknown_fields` a misplaced field is a parse error, and the compiler rejects a
+   whole sub-table authored for the wrong discriminant. Body-frame position is one
+   notation, `pos`: three elements on a sensor, two on a planar thruster, one on a rudder.
 
 ---
 
@@ -33,7 +42,7 @@ Design rules encoded in this schema:
 # ============================================================
 
 [manifest]
-schema_version = 5          # firmware refuses unknown major versions
+schema_version = 6          # firmware refuses unknown major versions
 vessel_id      = "example-vessel-01"
 name           = "Example"
 revision       = 7          # monotonically increasing per vessel
@@ -53,18 +62,22 @@ watchdog_ms    = 250                 # hardware watchdog kick interval
 # Buses: every sensor/actuator references one of these by id.
 # Kinds: cyphal_can | nmea2000_can | nmea0183_uart | nmea0183_udp | spi | i2c | uart
 #      | actuator_uart | pwm | crsf_uart
+# Identity (id/kind/port) is flat; kind-gated fields nest in [bus.<kind>]
+# (D-030). spi/i2c/pwm gate no fields, so no sub-table.
 # ------------------------------------------------------------
 
 [[bus]]
 id       = "ctrl"
 kind     = "cyphal_can"
 port     = "can1"
+[bus.cyphal_can]
 bitrate  = 1000000
 
 [[bus]]
 id       = "instruments"
 kind     = "nmea2000_can"
 port     = "can2"
+[bus.nmea2000_can]
 bitrate  = 250000
 mode     = "listen_only"      # transmit is a scoped later feature
 
@@ -72,6 +85,7 @@ mode     = "listen_only"      # transmit is a scoped later feature
 id       = "gnss_serial"
 kind     = "nmea0183_uart"
 port     = "uart4"
+[bus.nmea0183_uart]
 baud     = 115200
 checksum = "required"         # strict by default; "optional" is a per-bus quirk
 
@@ -79,6 +93,7 @@ checksum = "required"         # strict by default; "optional" is a per-bus quirk
 id       = "legacy_gyro"
 kind     = "nmea0183_uart"
 port     = "uart7"            # RS-422 input
+[bus.nmea0183_uart]
 baud     = 4800
 checksum = "required"         # strict by default; "optional" is a per-bus quirk
 
@@ -86,6 +101,7 @@ checksum = "required"         # strict by default; "optional" is a per-bus quirk
 id       = "ais_udp"
 kind     = "nmea0183_udp"
 port     = "eth0"
+[bus.nmea0183_udp]
 listen_port = 10110
 source_ip   = "192.168.10.40"  # guards against a second sender; promotion is moot here, AIS never promotes (D-014)
 segment     = "conn"           # declares the L2 path stays below the companion computer
@@ -110,8 +126,9 @@ role    = "gnss"
 driver  = "nmea0183"
 bus     = "gnss_serial"
 license = "inner_loop"
+pos     = [1.20, 0.00, -0.85]        # antenna offset from vessel origin, x fwd, y stbd, z down
+[sensor.gnss]
 pps     = "pps1"                     # timing input, if wired
-lever_arm_m = [1.20, 0.00, -0.85]    # antenna offset from vessel origin, x fwd, y stbd, z down
 [sensor.nmea0183]
 talkers   = ["GP", "GN"]             # accepted talker IDs
 sentences = ["GGA", "RMC", "GST"]    # position, SOG/COG, and error statistics
@@ -122,8 +139,9 @@ role    = "imu"
 driver  = "scha63t"
 bus     = "imu_spi"
 license = "inner_loop"
+pos     = [0.00, 0.00, 0.00]
+[sensor.imu]
 orientation = "x_fwd_z_down"         # mounting rotation, enum of standard mountings
-lever_arm_m = [0.00, 0.00, 0.00]
 
 [[sensor]]
 id      = "mag_main"
@@ -131,6 +149,7 @@ role    = "compass"
 driver  = "rm3100"
 bus     = "imu_spi"
 license = "inner_loop"
+[sensor.compass]
 declination_source = "wmm"           # wmm | fixed
 # declination_deg  = 4.2             # only if source = "fixed"
 
@@ -171,6 +190,7 @@ role    = "power"
 driver  = "cyphal_power"
 bus     = "ctrl"
 license = "inner_loop"               # failsafe matrix input
+[sensor.cyphal]
 node_id = 21
 
 # ------------------------------------------------------------
@@ -291,10 +311,11 @@ the effector table declares actuation capability: guidance's tau is only as real
 the effectors the allocator can drive it through (D-026). Each entry names a `kind`
 (`fixed_thruster` | `rudder`; `azimuth` and `sail` are schema-visible but rejected at
 compile until implemented, D-026), the kind-specific geometry and limits the contract's
-`EffectorKind` carries, and its output wiring, which depends on the bus kind (D-029).
-A serial output bus (`actuator_uart`, `pwm`) takes `channel` + `[effector.pwm]`
-calibration, PWM-terminated and rendered to microseconds at the conn node (D-027). A
-`cyphal_can` output bus takes `node_id` + `command_subject` + `feedback_subject` +
+`EffectorKind` carries under `[effector.<kind>]` (D-030), and its output wiring under
+`[effector.output]`, which depends on the bus kind (D-029). A serial output bus
+(`actuator_uart`, `pwm`) takes `channel` + `[effector.output.pwm]` calibration,
+PWM-terminated and rendered to microseconds at the conn node (D-027). A `cyphal_can`
+output bus takes `node_id` + `command_subject` + `feedback_subject` +
 `report_tolerance` instead: the node is commanded in physical units and owns its own
 calibration, so no PWM data is authored, and the divergence tolerance is per effector
 in that effector's units (newtons for a thruster, radians for a rudder). The compiler
@@ -313,13 +334,14 @@ and `[[actuator_node]]` are mutually exclusive ways to declare actuation (D-029)
 id      = "esc_main"
 kind    = "fixed_thruster"
 bus     = "actuator_bridge"       # references an actuator_uart or pwm bus
-channel = 0
-pos_x_m           = -1.20
-pos_y_m           = 0.00
+[effector.fixed_thruster]
+pos               = [-1.20, 0.00]  # x fwd, y stbd
 azimuth_rad       = 0.0
 max_thrust_fwd_n  = 300.0
 max_thrust_rev_n  = 180.0
-[effector.pwm]
+[effector.output]
+channel = 0
+[effector.output.pwm]
 us_min    = 1100
 us_center = 1500
 us_max    = 1900
@@ -329,11 +351,12 @@ us_max    = 1900
 id      = "esc_stbd"
 kind    = "fixed_thruster"
 bus     = "ctrl"                  # references a cyphal_can bus (which carries node_id)
-pos_x_m           = -1.20
-pos_y_m           = 0.30
+[effector.fixed_thruster]
+pos               = [-1.20, 0.30]
 azimuth_rad       = 0.0
 max_thrust_fwd_n  = 300.0
 max_thrust_rev_n  = 180.0
+[effector.output]
 node_id           = 12            # the actuator node's Cyphal id on the bus
 command_subject   = 100           # conn node publishes the setpoint here
 feedback_subject  = 200           # node reports achieved here
@@ -374,6 +397,14 @@ max_yaw_nm         = 60.0
 ```
 
 **Compile-time checks (host tool, not firmware):**
+- Sub-table placement (D-030): each `[[bus]]`/`[[sensor]]`/`[[effector]]` may
+  author only the sub-table its discriminant selects. A `[bus.<kind>]` for a
+  kind other than the bus's `kind`, a `[sensor.<role>]` for a role other than
+  the sensor's, a `[sensor.<transport>]` other than the one the bus kind
+  selects (`nmea0183` for either 0183 bus, `nmea2000`, `cyphal`), or an
+  `[effector.<kind>]` geometry block for a kind other than the effector's `kind`
+  is rejected. `deny_unknown_fields` additionally rejects a stray field within a
+  correctly-selected sub-table at parse time
 - Every referenced bus/port exists on the declared `conn_node.board` profile
   (a profile per D-016: the hosted profile and dev boards are legitimate values)
 - `estimator.*` references only `inner_loop` sensors
@@ -392,14 +423,15 @@ max_yaw_nm         = 60.0
   firmware lacks, and that surfaces at boot self-test, not at compile
 - Every `[[effector]]` references a declared bus of an output kind
   (`actuator_uart`, `pwm`, or `cyphal_can`); at most 8 effectors (see
-  `[[effector]]` below). A serial effector carries `channel` + `[effector.pwm]`
-  and no Cyphal fields; a `cyphal_can` effector carries `node_id` +
-  `command_subject` + `feedback_subject` + `report_tolerance` and no channel/pwm;
-  the compiler rejects the wrong set for the bus kind (D-029)
+  `[[effector]]` below). In `[effector.output]` a serial effector carries
+  `channel` + `[effector.output.pwm]` and no Cyphal fields; a `cyphal_can`
+  effector carries `node_id` + `command_subject` + `feedback_subject` +
+  `report_tolerance` and no channel/pwm; the compiler rejects the wrong set for
+  the bus kind (D-029)
 - On a serial output bus, `channel` is unique per bus; a `cyphal_can` effector's
   `report_tolerance` is finite and strictly positive (D-029)
-- `[effector.pwm]` satisfies `us_min < us_center < us_max`, all three within the
-  500-2500 us plausibility window (standard RC PWM is 1000-2000 us; the window
+- `[effector.output.pwm]` satisfies `us_min < us_center < us_max`, all three within
+  the 500-2500 us plausibility window (standard RC PWM is 1000-2000 us; the window
   leaves headroom for nonstandard servos while catching swapped or garbage values)
 - Effector geometry/limits are finite, and thrust/angle/effectiveness/min-speed
   limits are strictly positive where `EffectorKind` requires it, mirroring
@@ -484,7 +516,19 @@ and owns its calibration. The `cyphal_can` `[[bus]]` gains the conn node's own
 `node_id`, and the role=power `[[sensor]]` gains a `subject` for its bus voltage.
 Effectors and `[[actuator_node]]` are mutually exclusive actuation declarations.
 
-## Open questions for v0.7
+**Settled since v0.6:** the authoring reshape (D-030), closing former open
+questions 5 and 6. Every discriminant-gated field moves into a named sub-table
+(`[bus.<kind>]`, `[sensor.<role>]`, `[sensor.<transport>]`, `[effector.<kind>]`,
+`[effector.output]` with `[effector.output.pwm]`), so `deny_unknown_fields`
+rejects a misplaced field at parse time and a narrow compiler check rejects a
+sub-table authored for the wrong discriminant. Body-frame position becomes one
+notation, `pos`, at model arity (three elements on a sensor, two on a planar
+thruster, one on a rudder), mapping to the unchanged compiled `lever_arm_m` and
+`pos_x_m`/`pos_y_m`. The blob layout does not move; only `schema_version` bumps
+5 -> 6. Relocating `[estimator].origin` into a dedicated frame section stays
+deferred (below), waiting on the estimator per D-022.
+
+## Open questions for v0.8
 
 1. **Fusion priority vs weights.** `heading = [a, b]` as priority order is simple but
    crude; explicit per-sensor noise parameters may belong in the manifest once the
@@ -496,34 +540,14 @@ Effectors and `[[actuator_node]]` are mutually exclusive actuation declarations.
    carries the public key. It does not settle who holds the private key, how it rotates,
    or whether a vessel accepts more than one signer. Key management is the cost here,
    not the code.
-4. **Nonlinear thrust curve.** `[effector.pwm]` calibration is piecewise linear
+4. **Nonlinear thrust curve.** `[effector.output.pwm]` calibration is piecewise linear
    through center (two segments, three points). A real ESC/prop pair is rarely
    linear across its full range; a proper curve (more points, or a fitted
    function) is a recorded later refinement, not guessed now.
-5. **Variant fields: nested tables vs flat.** The schema resolves four
-   discriminated unions (`bus.kind`, `sensor.role`, `effector.kind`, and the
-   effector's referenced bus kind), each gating a different set of sibling
-   fields. How those variant fields are carried is inconsistent today:
-   `[sensor.nmea0183]` and `[effector.pwm]` nest them in a sub-table, while
-   effector geometry, the Cyphal sensor's `node_id`/`subject`, and the bus-kind
-   fields (`baud`, `bitrate`, `segment`, ...) sit flat alongside the
-   kind-independent fields. A reader cannot learn one rule for where a variant's
-   fields live, and serde cannot enforce the grouping: every "field X is valid
-   only for kind Y" rule is a hand-written compiler check. Options: (a) leave it,
-   and treat the validator as the source of truth; (b) push every variant's
-   fields into a `[thing.<variant>]` sub-table uniformly, so the shape documents
-   itself and `deny_unknown_fields` catches a misplaced field at parse time. The
-   cost of (b) is a `schema_version` bump and churning every fixture, so it wants
-   to ride a bump that is happening anyway. A worked sketch of (b) is in the
-   2026-07-14 diary entry.
-6. **Geometry: one frame, one notation.** Body-frame mounting position is
-   spelled two ways: sensors use `lever_arm_m = [x, y, z]`, effectors use
-   `pos_x_m`/`pos_y_m` scalars, and the frame origin the two are measured against
-   is declared as `[estimator].origin`, a field the compiler currently parses and
-   discards (the contract does not carry it yet, D-022). A consolidation would use
-   one position notation for both and a single section that defines the origin (a
-   `[geometry]` block, or `[conn_node]`), with the estimator referencing it rather
-   than owning it. Coupled to open question 1's fusion work only through `origin`,
-   which is waiting on the estimator per D-022; the notation change is independent
-   and could ride the same bump as question 5. Sketch in the 2026-07-14 diary
-   entry.
+5. **A frame section for `[estimator].origin`.** D-030 unified the position
+   notation to `pos` but left the frame origin the positions are measured against
+   as `[estimator].origin`, a field the compiler parses and discards (the contract
+   does not carry it yet, D-022). Relocating it into a dedicated `[geometry]` (or
+   `[conn_node]`) section, with the estimator referencing it rather than owning it,
+   waits until the estimator answers what it needs from the frame, rather than
+   moving a discarded field now and risking a second move.

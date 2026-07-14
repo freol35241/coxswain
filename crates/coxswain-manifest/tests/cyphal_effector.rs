@@ -7,7 +7,7 @@ use coxswain_manifest::{CompileError, EffectorOutput, ValidateError};
 
 const CYPHAL: &str = r#"
 [manifest]
-schema_version = 5
+schema_version = 6
 vessel_id      = "cx-cyphal-01"
 name           = "Cyphal Effector Test"
 revision       = 1
@@ -20,6 +20,7 @@ watchdog_ms = 250
 id       = "ctrl"
 kind     = "cyphal_can"
 port     = "can0"
+[bus.cyphal_can]
 bitrate  = 1000000
 node_id  = 5
 
@@ -29,6 +30,7 @@ role    = "power"
 driver  = "cyphal_power"
 bus     = "ctrl"
 license = "inner_loop"
+[sensor.cyphal]
 node_id = 21
 subject = 300
 
@@ -36,11 +38,12 @@ subject = 300
 id      = "thruster_port"
 kind    = "fixed_thruster"
 bus     = "ctrl"
-pos_x_m          = -1.0
-pos_y_m          = -0.3
+[effector.fixed_thruster]
+pos              = [-1.0, -0.3]
 azimuth_rad      = 0.0
 max_thrust_fwd_n = 200.0
 max_thrust_rev_n = 120.0
+[effector.output]
 node_id          = 11
 command_subject  = 100
 feedback_subject = 200
@@ -50,10 +53,12 @@ report_tolerance = 5.0
 id      = "steering"
 kind    = "rudder"
 bus     = "ctrl"
-pos_x_m                   = -1.2
+[effector.rudder]
+pos                       = [-1.2]
 side_force_n_per_rad_mps2 = 400.0
 max_angle_rad             = 0.6
 min_effective_speed_mps   = 0.5
+[effector.output]
 node_id          = 13
 command_subject  = 101
 feedback_subject = 201
@@ -206,8 +211,8 @@ fn rejects_nonpositive_tolerance() {
 #[test]
 fn rejects_missing_bus_node_id() {
     let src = patched(
-        "port     = \"can0\"\nbitrate  = 1000000\nnode_id  = 5",
-        "port     = \"can0\"\nbitrate  = 1000000",
+        "[bus.cyphal_can]\nbitrate  = 1000000\nnode_id  = 5",
+        "[bus.cyphal_can]\nbitrate  = 1000000",
     );
     assert!(matches!(
         expect_invalid(&src),

@@ -169,7 +169,7 @@ fn origin() -> GeoPoint {
 /// self-documenting without inventing a second indirection just for tests.
 const MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 5
+schema_version = 6
 vessel_id      = "cx-desk-rig-01"
 name           = "Desk Rig"
 revision       = 1
@@ -184,6 +184,7 @@ watchdog_ms = 250
 id       = "gnss0183"
 kind     = "nmea0183_uart"
 port     = "gnss0"
+[bus.nmea0183_uart]
 baud     = 115200
 checksum = "required"
 
@@ -191,6 +192,7 @@ checksum = "required"
 id       = "actuator"
 kind     = "actuator_uart"
 port     = "actuator0"
+[bus.actuator_uart]
 baud     = 115200
 
 [[bus]]
@@ -203,13 +205,14 @@ port     = "rc0"
 id      = "thruster_port"
 kind    = "fixed_thruster"
 bus     = "actuator"
-channel = 0
-pos_x_m           = 0.0
-pos_y_m           = 1.0
+[effector.fixed_thruster]
+pos               = [0.0, 1.0]
 azimuth_rad       = 0.0
 max_thrust_fwd_n  = 150.0
 max_thrust_rev_n  = 150.0
-[effector.pwm]
+[effector.output]
+channel = 0
+[effector.output.pwm]
 us_min    = 1100
 us_center = 1500
 us_max    = 1900
@@ -218,13 +221,14 @@ us_max    = 1900
 id      = "thruster_stbd"
 kind    = "fixed_thruster"
 bus     = "actuator"
-channel = 1
-pos_x_m           = 0.0
-pos_y_m           = -1.0
+[effector.fixed_thruster]
+pos               = [0.0, -1.0]
 azimuth_rad       = 0.0
 max_thrust_fwd_n  = 150.0
 max_thrust_rev_n  = 150.0
-[effector.pwm]
+[effector.output]
+channel = 1
+[effector.output.pwm]
 us_min    = 1100
 us_center = 1500
 us_max    = 1900
@@ -313,7 +317,7 @@ fn build_blob() -> (Vec<u8>, String) {
 /// (this scenario only needs teleop's DirectEffort path).
 const RUDDERBOAT_MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 5
+schema_version = 6
 vessel_id      = "cx-desk-rig-rudderboat-01"
 name           = "Desk Rig Rudderboat"
 revision       = 1
@@ -328,6 +332,7 @@ watchdog_ms = 250
 id       = "gnss0183"
 kind     = "nmea0183_uart"
 port     = "gnss0"
+[bus.nmea0183_uart]
 baud     = 115200
 checksum = "required"
 
@@ -335,19 +340,21 @@ checksum = "required"
 id       = "actuator"
 kind     = "actuator_uart"
 port     = "actuator0"
+[bus.actuator_uart]
 baud     = 115200
 
 [[effector]]
 id      = "esc_main"
 kind    = "fixed_thruster"
 bus     = "actuator"
-channel = 0
-pos_x_m           = -1.20
-pos_y_m           = 0.00
+[effector.fixed_thruster]
+pos               = [-1.20, 0.00]
 azimuth_rad       = 0.0
 max_thrust_fwd_n  = 300.0
 max_thrust_rev_n  = 180.0
-[effector.pwm]
+[effector.output]
+channel = 0
+[effector.output.pwm]
 us_min    = 1100
 us_center = 1500
 us_max    = 1900
@@ -356,12 +363,14 @@ us_max    = 1900
 id      = "rudder_main"
 kind    = "rudder"
 bus     = "actuator"
-channel = 1
-pos_x_m                    = -1.80
+[effector.rudder]
+pos                        = [-1.80]
 side_force_n_per_rad_mps2  = 400.0
 max_angle_rad              = 0.6
 min_effective_speed_mps    = 0.5
-[effector.pwm]
+[effector.output]
+channel = 1
+[effector.output.pwm]
 us_min    = 1100
 us_center = 1500
 us_max    = 1900
