@@ -95,6 +95,10 @@ pub enum ValidateError {
     /// D-025: two `[[claimant]]` entries declare the same runtime
     /// `ClaimantId`.
     DuplicateClaimantId(u16),
+    /// D-029: a manifest declares actuation with both `[[effector]]` and
+    /// `[[actuator_node]]`. They are mutually exclusive: an allocator vessel
+    /// declares effectors, a direct-drive vessel declares actuator nodes.
+    ActuationDoublyDeclared,
     UnknownBus {
         owner: String,
         bus: String,
@@ -222,6 +226,12 @@ pub enum ValidateError {
     RcMaximumNotPositive {
         field: &'static str,
     },
+    /// `[rc].claimant` names a `ClaimantId` with no matching `[[claimant]]`
+    /// entry, so the RC would silently fall to the default priority 0 instead
+    /// of its intended preemption priority (D-025).
+    RcClaimantUnknown {
+        claimant: u16,
+    },
     /// Per output bus, `[[effector]]` channels must be exactly `0..n` with
     /// no gaps: they are positional on the wire (compile-time graduation of
     /// the hosted profile's boot check).
@@ -283,6 +293,13 @@ impl std::fmt::Display for ValidateError {
             Self::DuplicateSensorId(id) => write!(f, "duplicate sensor id {id:?}"),
             Self::DuplicateActuatorId(id) => write!(f, "duplicate actuator_node id {id:?}"),
             Self::DuplicateClaimantId(id) => write!(f, "duplicate claimant id {id}"),
+            Self::ActuationDoublyDeclared => {
+                write!(
+                    f,
+                    "a manifest declares actuation with [[effector]] or [[actuator_node]], not \
+                     both; they are mutually exclusive (D-029)"
+                )
+            }
             Self::UnknownBus { owner, bus } => {
                 write!(f, "{owner:?} references undeclared bus {bus:?}")
             }
@@ -433,6 +450,13 @@ impl std::fmt::Display for ValidateError {
             Self::RcMaximumNotPositive { field } => {
                 write!(f, "rc.{field} must be strictly positive and finite")
             }
+            Self::RcClaimantUnknown { claimant } => {
+                write!(
+                    f,
+                    "rc: claimant {claimant} has no matching [[claimant]] entry, so it would run \
+                     at default priority 0 (D-025)"
+                )
+            }
             Self::EffectorChannelGap {
                 bus,
                 expected,
@@ -535,6 +559,13 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         return Err(ValidateError::UnsupportedSchemaVersion(
             m.manifest.schema_version,
         ));
+    }
+
+    // D-029: effectors (the allocator path) and actuator_nodes (direct drive)
+    // are mutually exclusive ways to declare actuation. A whole-manifest
+    // structural rule, so it is checked before the per-table validation.
+    if !m.effectors.is_empty() && !m.actuator_nodes.is_empty() {
+        return Err(ValidateError::ActuationDoublyDeclared);
     }
 
     let board = m.conn_node.board.as_str();
@@ -880,7 +911,7 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         }
     }
 
-    let rc = build_rc(m.rc.as_ref(), &bus_by_id)?;
+    let rc = build_rc(m.rc.as_ref(), &bus_by_id, &claimant_ids)?;
 
     Ok(CompiledManifest {
         schema_version: m.manifest.schema_version,
@@ -1546,13 +1577,15 @@ fn pwm_calibration(id: &str, p: &PwmCalibrationToml) -> Result<PwmCalibration, V
 /// Compiles `[rc]` (D-025): the vessel's RC hand controller, absent when the
 /// manifest declares none (`[rc]` is optional and, being a single TOML
 /// table rather than an array-of-tables, at most one by construction).
-/// `bus` must reference a declared `crsf_uart` bus; the four channel
-/// fields must be distinct and each below CRSF's channel count;
-/// `switch_low_us` must be strictly below `switch_high_us`; both force/
-/// moment maxima must be strictly positive and finite.
+/// `bus` must reference a declared `crsf_uart` bus; `claimant` must name a
+/// declared `[[claimant]]` id; the four channel fields must be distinct and
+/// each below CRSF's channel count; `switch_low_us` must be strictly below
+/// `switch_high_us`; both force/moment maxima must be strictly positive and
+/// finite.
 fn build_rc(
     rc: Option<&RcToml>,
     bus_by_id: &HashMap<&str, &BusToml>,
+    claimant_ids: &HashSet<u16>,
 ) -> Result<Option<RcEntry>, ValidateError> {
     let Some(rc) = rc else {
         return Ok(None);
@@ -1566,6 +1599,15 @@ fn build_rc(
     if bus.kind != BusKindToml::CrsfUart {
         return Err(ValidateError::RcBusWrongKind {
             bus: rc.bus.clone(),
+        });
+    }
+
+    // The RC's priority lives in [[claimant]], keyed by this id (D-025). An id
+    // with no entry there is not priority 0 by intent, it is an authoring slip:
+    // the RC would silently lose preemption to whatever outranks 0.
+    if !claimant_ids.contains(&rc.claimant) {
+        return Err(ValidateError::RcClaimantUnknown {
+            claimant: rc.claimant,
         });
     }
 

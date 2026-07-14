@@ -370,3 +370,28 @@ fn rejects_rc_nonpositive_maximum() {
         }
     );
 }
+
+// [rc].claimant must name a declared [[claimant]] entry (D-025). Rudderboat's
+// [rc] uses claimant = 1, declared as [[claimant]] id = 1; point it at an id no
+// claimant declares and the RC would silently drop to priority 0.
+#[test]
+fn rejects_rc_claimant_without_entry() {
+    let src = patched("claimant           = 1", "claimant           = 7");
+    assert_eq!(
+        expect_invalid(&src),
+        ValidateError::RcClaimantUnknown { claimant: 7 }
+    );
+}
+
+// D-029: effectors and [[actuator_node]] are mutually exclusive. Rudderboat
+// declares effectors, so adding an actuator_node must be rejected.
+#[test]
+fn rejects_effectors_and_actuator_nodes_together() {
+    let src = patched(
+        "[[claimant]]\nname     = \"autonomy\"",
+        "[[actuator_node]]\nid = \"thruster\"\nnode_id = 11\nbus = \"actuator_bridge\"\n\
+         function = \"thruster\"\nfailsafe = \"zero_thrust\"\nheartbeat_timeout_ms = 500\n\n\
+         [[claimant]]\nname     = \"autonomy\"",
+    );
+    assert_eq!(expect_invalid(&src), ValidateError::ActuationDoublyDeclared);
+}

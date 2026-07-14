@@ -385,6 +385,8 @@ max_yaw_nm         = 60.0
   bus `node_id`, and Cyphal effector nodes together (D-029); Cyphal node ids and
   subject ids are within the wire ranges (`node_id` <= 127, `subject` <= 8191)
 - No duplicate claimant ids in `[[claimant]]` (D-025)
+- Effectors and `[[actuator_node]]` are not both present: they are mutually
+  exclusive actuation declarations (D-029)
 - Schema version compatible with target firmware version
 - `driver` strings are not resolved here; a manifest may name drivers the target
   firmware lacks, and that surfaces at boot self-test, not at compile
@@ -407,7 +409,9 @@ max_yaw_nm         = 60.0
 - Per serial output bus, `[[effector]]` channels are exactly `0..n`, no gaps:
   they are positional on the wire (Cyphal effectors are addressed by subject,
   not channel, so they do not participate)
-- `[rc].bus` references a declared `crsf_uart` bus; `kill_channel`,
+- `[rc].bus` references a declared `crsf_uart` bus; `[rc].claimant` names a
+  declared `[[claimant]]` id (else the RC would silently run at the default
+  priority 0, not its intended preemption priority); `kill_channel`,
   `takeover_channel`, `surge_channel`, and `yaw_channel` are distinct and each
   below 16 (CRSF's channel count); `switch_low_us < switch_high_us`;
   `max_surge_n` and `max_yaw_nm` are finite and strictly positive (D-025)
@@ -496,3 +500,30 @@ Effectors and `[[actuator_node]]` are mutually exclusive actuation declarations.
    through center (two segments, three points). A real ESC/prop pair is rarely
    linear across its full range; a proper curve (more points, or a fitted
    function) is a recorded later refinement, not guessed now.
+5. **Variant fields: nested tables vs flat.** The schema resolves four
+   discriminated unions (`bus.kind`, `sensor.role`, `effector.kind`, and the
+   effector's referenced bus kind), each gating a different set of sibling
+   fields. How those variant fields are carried is inconsistent today:
+   `[sensor.nmea0183]` and `[effector.pwm]` nest them in a sub-table, while
+   effector geometry, the Cyphal sensor's `node_id`/`subject`, and the bus-kind
+   fields (`baud`, `bitrate`, `segment`, ...) sit flat alongside the
+   kind-independent fields. A reader cannot learn one rule for where a variant's
+   fields live, and serde cannot enforce the grouping: every "field X is valid
+   only for kind Y" rule is a hand-written compiler check. Options: (a) leave it,
+   and treat the validator as the source of truth; (b) push every variant's
+   fields into a `[thing.<variant>]` sub-table uniformly, so the shape documents
+   itself and `deny_unknown_fields` catches a misplaced field at parse time. The
+   cost of (b) is a `schema_version` bump and churning every fixture, so it wants
+   to ride a bump that is happening anyway. A worked sketch of (b) is in the
+   2026-07-14 diary entry.
+6. **Geometry: one frame, one notation.** Body-frame mounting position is
+   spelled two ways: sensors use `lever_arm_m = [x, y, z]`, effectors use
+   `pos_x_m`/`pos_y_m` scalars, and the frame origin the two are measured against
+   is declared as `[estimator].origin`, a field the compiler currently parses and
+   discards (the contract does not carry it yet, D-022). A consolidation would use
+   one position notation for both and a single section that defines the origin (a
+   `[geometry]` block, or `[conn_node]`), with the estimator referencing it rather
+   than owning it. Coupled to open question 1's fusion work only through `origin`,
+   which is waiting on the estimator per D-022; the notation change is independent
+   and could ride the same bump as question 5. Sketch in the 2026-07-14 diary
+   entry.
