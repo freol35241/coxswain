@@ -181,10 +181,17 @@ this before freezing far-end firmware.
 
 ## Phase 7: Production transports
 
-- [ ] Cyphal: actuator command out, feedback and power monitoring in.
+- [x] Cyphal: actuator command out, feedback and power monitoring in.
       Command-then-report comparison surfaced to supervisor health. Second
       output backend, so the output backend trait crystallizes here (D-027);
-      commands in physical units, node owns local calibration.
+      commands in physical units, node owns local calibration. (Landed as
+      D-028 + D-029: the coxswain-cyphal transport, the OutputBackend trait,
+      the CyphalActuatorBackend, and the hosted integration. Schema v4->5 gave
+      effectors a per-bus-kind output; hosted `can.rs` gained a write path
+      (D-011's transmit exception); divergence and bus voltage reach the
+      published health, observed via `ClaimantClient::subscribe_health`;
+      vcan-tested in CI (`cyphal_can_rig.rs`). Node-local failsafe/heartbeat
+      for a Cyphal effector waits for the actuator firmware, Phase 9.)
 - [x] GNSS covariance and fix status over NMEA 0183 (the vendor-neutral path):
       the 0183 parser gained GST and the gnss0183 driver pairs the most recent
       GST with the next GGA within a staleness window (`GST_MAX_AGE`), emitting

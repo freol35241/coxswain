@@ -89,6 +89,8 @@ pub struct BusToml {
     pub listen_port: Option<u16>,
     pub source_ip: Option<String>,
     pub segment: Option<String>,
+    /// The conn node's own Cyphal node id on a `cyphal_can` bus (D-029).
+    pub node_id: Option<u16>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Deserialize)]
@@ -144,6 +146,9 @@ pub struct SensorToml {
     pub declination_source: Option<String>,
     pub declination_deg: Option<f64>,
     pub node_id: Option<u16>,
+    /// Cyphal subject the sensor publishes on (the role=power node's voltage
+    /// subject, D-029).
+    pub subject: Option<u16>,
     pub nmea0183: Option<Nmea0183Toml>,
     pub nmea2000: Option<Nmea2000Toml>,
 }
@@ -193,14 +198,17 @@ pub struct PwmCalibrationToml {
 /// error instead of an opaque parse failure (mirrors how `estimator.model`
 /// is handled). The kind-specific geometry/limit fields are optional here;
 /// the compiler picks the set that matches `kind` and errors if one is
-/// missing.
+/// missing. The output-wiring fields are likewise optional and selected by
+/// the effector's bus kind (D-029): `channel`/`[effector.pwm]` for a serial
+/// (`actuator_uart`/`pwm`) bus, `node_id`/`command_subject`/`feedback_subject`/
+/// `report_tolerance` for a `cyphal_can` bus; the compiler requires the set
+/// the bus kind selects and rejects the other.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectorToml {
     pub id: String,
     pub kind: String,
     pub bus: String,
-    pub channel: u16,
     // fixed_thruster
     pub pos_x_m: Option<f64>,
     pub pos_y_m: Option<f64>,
@@ -211,7 +219,14 @@ pub struct EffectorToml {
     pub side_force_n_per_rad_mps2: Option<f64>,
     pub max_angle_rad: Option<f64>,
     pub min_effective_speed_mps: Option<f64>,
-    pub pwm: PwmCalibrationToml,
+    // serial output (actuator_uart / pwm)
+    pub channel: Option<u16>,
+    pub pwm: Option<PwmCalibrationToml>,
+    // cyphal output (cyphal_can)
+    pub node_id: Option<u16>,
+    pub command_subject: Option<u16>,
+    pub feedback_subject: Option<u16>,
+    pub report_tolerance: Option<f64>,
 }
 
 /// Per-claimant conn preemption priority (D-025). Unlike sensor/bus/

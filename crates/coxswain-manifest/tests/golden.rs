@@ -46,7 +46,7 @@ fn example_compiles_and_roundtrips() {
     assert_eq!(manifest.vessel_id.as_str(), "example-vessel-01");
     assert_eq!(manifest.name.as_str(), "Example");
     assert_eq!(manifest.revision, 7);
-    assert_eq!(manifest.schema_version, 4);
+    assert_eq!(manifest.schema_version, 5);
     assert_eq!(manifest.buses.len(), 6);
     assert_eq!(manifest.sensors.len(), 7);
     assert_eq!(manifest.actuator_nodes.len(), 3);
@@ -418,14 +418,14 @@ fn rejects_inner_loop_on_udp_bus_outside_conn_segment() {
     ));
 }
 
-// Rule 10: schema_version must be 4. A v0.4 manifest (schema_version 3) is
-// rejected outright now, same doctrine as every prior bump.
+// Rule 10: schema_version must be 5. A prior-version manifest (schema_version
+// 4) is rejected outright now, same doctrine as every prior bump.
 #[test]
 fn rejects_unknown_schema_version() {
-    let src = patched("schema_version = 4", "schema_version = 3");
+    let src = patched("schema_version = 5", "schema_version = 4");
     assert_eq!(
         expect_invalid(&src),
-        ValidateError::UnsupportedSchemaVersion(3)
+        ValidateError::UnsupportedSchemaVersion(4)
     );
 }
 
@@ -492,16 +492,16 @@ fn wrong_header_version_is_rejected() {
     );
 }
 
-// The pre-bump v0.4 wire version (3) is not just "some other version": it
-// used to be valid, so it gets its own case rather than riding on the
-// generic wrong-version test above.
+// The pre-bump wire version (4) is not just "some other version": it used to
+// be valid, so it gets its own case rather than riding on the generic
+// wrong-version test above.
 #[test]
 fn old_schema_version_blob_is_rejected() {
     let mut blob = example_blob();
-    blob[4] = 3;
+    blob[4] = 4;
     assert_eq!(
         coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed())),
-        Err(ReadError::BadVersion(3))
+        Err(ReadError::BadVersion(4))
     );
 }
 

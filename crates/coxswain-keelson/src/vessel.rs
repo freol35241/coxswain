@@ -47,6 +47,15 @@ pub struct ReplyHandle {
 /// One claimant event and, for RPCs, the handle to answer it with.
 pub type Event = (ConnEvent, Option<ReplyHandle>);
 
+/// The supervisor's report-only power flags for the health telemetry (D-024):
+/// bus voltage below the low-voltage bound, and the power report gone stale.
+/// Bundled so `publish_health` stays within a sane argument count.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PowerHealth {
+    pub low_voltage: bool,
+    pub power_stale: bool,
+}
+
 pub struct VesselEndpoint {
     session: zenoh::Session,
     base_path: String,
@@ -382,13 +391,26 @@ impl VesselEndpoint {
 
     /// `entity_health`: estimator level and staleness, plus conn and arming
     /// as supervisor checks.
+    /// `actuation` is one `(effector name, diverged)` pair per Cyphal effector
+    /// (D-029/D-010): a non-empty slice adds an `actuation` source to the
+    /// published health, degraded when any effector's last command-then-report
+    /// comparison diverged. Empty for a vessel with no Cyphal actuation.
+    /// `power` carries the supervisor's report-only power flags (D-024): they
+    /// surface as a `power` subject under the supervisor source so a claimant
+    /// can observe bus voltage health without arming.
     pub fn publish_health(
         &self,
         t_wall: SystemTime,
         h: &EstimatorHealth,
         conn: &ConnState,
         arming: ArmingState,
+        power: PowerHealth,
+        actuation: &[(&str, bool)],
     ) -> Result<(), Error> {
+        let PowerHealth {
+            low_voltage,
+            power_stale,
+        } = power;
         let estimator = keelson::SourceHealth {
             name: "estimator".to_string(),
             level: health_level(h.level) as i32,
@@ -415,32 +437,82 @@ impl VesselEndpoint {
             ArmingState::Disarmed => "disarmed",
         };
         let nominal = keelson::HealthLevel::HealthNominal as i32;
+        let degraded = keelson::HealthLevel::HealthDegraded as i32;
+        let power_subject = keelson::SubjectHealth {
+            name: "power".to_string(),
+            level: if low_voltage { degraded } else { nominal },
+            measured_publication_rate_hz: 0.0,
+            checks: vec![
+                keelson::CheckResult {
+                    name: "low_voltage".to_string(),
+                    level: if low_voltage { degraded } else { nominal },
+                    detail: if low_voltage { "low" } else { "nominal" }.to_string(),
+                },
+                keelson::CheckResult {
+                    name: "power_stale".to_string(),
+                    level: if power_stale { degraded } else { nominal },
+                    detail: if power_stale { "stale" } else { "fresh" }.to_string(),
+                },
+            ],
+        };
         let supervisor = keelson::SourceHealth {
             name: "supervisor".to_string(),
             level: nominal,
-            subjects: vec![keelson::SubjectHealth {
-                name: "conn".to_string(),
-                level: nominal,
-                measured_publication_rate_hz: 0.0,
-                checks: vec![
-                    keelson::CheckResult {
-                        name: "conn".to_string(),
-                        level: nominal,
-                        detail: conn_detail,
-                    },
-                    keelson::CheckResult {
-                        name: "arming".to_string(),
-                        level: nominal,
-                        detail: arming_detail.to_string(),
-                    },
-                ],
-            }],
+            subjects: vec![
+                keelson::SubjectHealth {
+                    name: "conn".to_string(),
+                    level: nominal,
+                    measured_publication_rate_hz: 0.0,
+                    checks: vec![
+                        keelson::CheckResult {
+                            name: "conn".to_string(),
+                            level: nominal,
+                            detail: conn_detail,
+                        },
+                        keelson::CheckResult {
+                            name: "arming".to_string(),
+                            level: nominal,
+                            detail: arming_detail.to_string(),
+                        },
+                    ],
+                },
+                power_subject,
+            ],
         };
+        let mut sources = vec![estimator, supervisor];
+        if !actuation.is_empty() {
+            let level_of = |diverged: bool| {
+                let level = if diverged {
+                    keelson::HealthLevel::HealthDegraded
+                } else {
+                    keelson::HealthLevel::HealthNominal
+                };
+                level as i32
+            };
+            let subjects = actuation
+                .iter()
+                .map(|(name, diverged)| keelson::SubjectHealth {
+                    name: name.to_string(),
+                    level: level_of(*diverged),
+                    measured_publication_rate_hz: 0.0,
+                    checks: vec![keelson::CheckResult {
+                        name: "command_then_report".to_string(),
+                        level: level_of(*diverged),
+                        detail: if *diverged { "diverged" } else { "nominal" }.to_string(),
+                    }],
+                })
+                .collect();
+            sources.push(keelson::SourceHealth {
+                name: "actuation".to_string(),
+                level: level_of(actuation.iter().any(|(_, d)| *d)),
+                subjects,
+            });
+        }
         let msg = keelson::EntityHealth {
             timestamp: Some(wall_to_proto(t_wall)),
             level: health_level(h.level) as i32,
             rate_hz: 0.0,
-            sources: vec![estimator, supervisor],
+            sources,
         };
         self.put(subject::ENTITY_HEALTH, COXSWAIN, seal(t_wall, &msg))
     }

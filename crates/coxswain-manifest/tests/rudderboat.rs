@@ -6,7 +6,7 @@
 use core::time::Duration;
 
 use coxswain_contract::{EffectorConfig, EffectorId, EffectorKind};
-use coxswain_manifest::{CompileError, RcEntry, ValidateError};
+use coxswain_manifest::{CompileError, EffectorOutput, RcEntry, ValidateError};
 
 const RUDDERBOAT: &str = include_str!("rudderboat.toml");
 
@@ -35,7 +35,7 @@ fn expect_invalid(source: &str) -> ValidateError {
 fn rudderboat_compiles_and_roundtrips() {
     let manifest = coxswain_manifest::compile(RUDDERBOAT).expect("rudderboat compiles");
     assert_eq!(manifest.vessel_id.as_str(), "se-rise-rudderboat-01");
-    assert_eq!(manifest.schema_version, 4);
+    assert_eq!(manifest.schema_version, 5);
     assert_eq!(manifest.buses.len(), 3);
     assert_eq!(manifest.sensors.len(), 2);
     assert_eq!(manifest.actuator_nodes.len(), 0);
@@ -91,18 +91,24 @@ fn rudderboat_compiles_and_roundtrips() {
     ];
     assert_eq!(manifest.config.effectors.as_slice(), &expected);
 
-    // Bus reference, channel, and calibration land in the render table
+    // Bus reference and the serial output wiring land in the render table
     // (types.rs's EffectorEntry), separate from the allocator's geometry.
     let entries = manifest.effectors.as_slice();
     assert_eq!(entries[0].name.as_str(), "esc_main");
     assert_eq!(entries[0].bus.as_str(), "actuator_bridge");
-    assert_eq!(entries[0].channel, 0);
-    assert_eq!(entries[0].pwm.us_min, 1100);
-    assert_eq!(entries[0].pwm.us_center, 1500);
-    assert_eq!(entries[0].pwm.us_max, 1900);
-    assert!(!entries[0].pwm.reversed);
+    let EffectorOutput::Serial { channel, pwm } = entries[0].output else {
+        panic!("esc_main is on an actuator_uart bus, so its output is Serial");
+    };
+    assert_eq!(channel, 0);
+    assert_eq!(pwm.us_min, 1100);
+    assert_eq!(pwm.us_center, 1500);
+    assert_eq!(pwm.us_max, 1900);
+    assert!(!pwm.reversed);
     assert_eq!(entries[1].name.as_str(), "rudder_main");
-    assert_eq!(entries[1].channel, 1);
+    let EffectorOutput::Serial { channel, .. } = entries[1].output else {
+        panic!("rudder_main is on an actuator_uart bus, so its output is Serial");
+    };
+    assert_eq!(channel, 1);
 
     let seed = [11u8; 32];
     let blob = coxswain_manifest::write(&manifest, &seed);
@@ -165,6 +171,19 @@ fn rejects_effector_bus_missing() {
             bus: "nope".to_string(),
         }
     );
+}
+
+// A bus node_id is only meaningful on a cyphal_can bus (D-029).
+#[test]
+fn rejects_bus_node_id_on_non_cyphal() {
+    let src = patched(
+        "kind     = \"actuator_uart\"\nport     = \"uart4\"",
+        "kind     = \"actuator_uart\"\nport     = \"uart4\"\nnode_id  = 5",
+    );
+    assert!(matches!(
+        expect_invalid(&src),
+        ValidateError::BusNodeIdWrongKind { bus } if bus == "actuator_bridge"
+    ));
 }
 
 // Effector bus must be an output kind (actuator_uart or pwm), not e.g. the

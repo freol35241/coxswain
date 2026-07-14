@@ -3,7 +3,7 @@
 # ============================================================
 
 [manifest]
-schema_version = 4          # firmware refuses unknown major versions
+schema_version = 5          # firmware refuses unknown major versions
 vessel_id      = "example-vessel-01"
 name           = "Example"
 revision       = 7          # monotonically increasing per vessel

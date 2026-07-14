@@ -14,11 +14,12 @@ use serde::{Deserialize, Serialize};
 /// Wire-facing manifest schema version. The blob header and the payload both
 /// carry it; the reader refuses anything else.
 ///
-/// Bumped 3 -> 4 for `supervisor.power_stale_after_ms` and the `[rc]`
-/// section (D-025, schema v0.5). Deliberate: pre-release, so old readers
+/// Bumped 4 -> 5 for the per-bus-kind effector output (`EffectorOutput`) the
+/// Cyphal actuation path needs, plus the `cyphal_can` bus `node_id` and the
+/// role=power sensor `subject` (D-029). Deliberate: pre-release, so old readers
 /// simply reject new blobs and new readers reject old ones, no migration
 /// path needed.
-pub const SCHEMA_VERSION: u16 = 4;
+pub const SCHEMA_VERSION: u16 = 5;
 
 /// Fixed-capacity UTF-8 string, zero-padded. Exists so the blob needs no
 /// allocator; 32 bytes fits every identifier the schema doc uses.
@@ -100,6 +101,9 @@ pub struct BusEntry {
     pub segment: FixedStr32,
     pub checksum: ChecksumMode,
     pub listen_only: bool,
+    /// The conn node's own Cyphal node id on this bus, for a `cyphal_can` bus
+    /// the conn node transmits on (D-029). `None` for every other bus kind.
+    pub node_id: Option<u16>,
 }
 
 // Dead-tail filler for BoundedList only; the values carry no meaning. Manual
@@ -116,6 +120,7 @@ impl Default for BusEntry {
             segment: FixedStr32::empty(),
             checksum: ChecksumMode::Required,
             listen_only: false,
+            node_id: None,
         }
     }
 }
@@ -150,6 +155,10 @@ pub struct SensorEntry {
     pub license: License,
     /// Cyphal node id where the sensor is a bus node.
     pub node_id: Option<u16>,
+    /// Cyphal subject the sensor publishes on, for a bus node whose payload the
+    /// conn node consumes by subject (the role=power node's bus voltage, D-029).
+    /// `None` when the sensor is not addressed by subject.
+    pub subject: Option<u16>,
     /// PPS timing input port, empty when not wired.
     pub pps: FixedStr32,
     /// Offset from vessel origin, x fwd, y stbd, z down; zeros when unstated.
@@ -175,6 +184,7 @@ impl Default for SensorEntry {
             bus: FixedStr32::empty(),
             license: License::Enrichment,
             node_id: None,
+            subject: None,
             pps: FixedStr32::empty(),
             lever_arm_m: [0.0; 3],
             orientation: FixedStr32::empty(),
@@ -241,8 +251,29 @@ pub struct PwmCalibration {
     pub reversed: bool,
 }
 
-/// What the hosted profile needs to render one effector's output: which bus
-/// and channel, and the calibration. Geometry and limits live in
+/// How one effector's output reaches its far end, selected by its bus kind
+/// (D-029). Geometry and limits live in `VesselConfig::effectors` (the
+/// allocator's input) indexed by the same `EffectorId`; this carries only the
+/// wiring the hosted output backend needs.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum EffectorOutput {
+    /// A `$CXOUT` serial line or direct PWM (D-027): a positional wire channel
+    /// and the PWM calibration the conn node renders to microseconds.
+    Serial { channel: u16, pwm: PwmCalibration },
+    /// A Cyphal/CAN command (D-028): the actuator node's id, the subject the
+    /// conn node commands it on and the subject it reports achieved on, and the
+    /// command-then-report divergence tolerance in this effector's physical
+    /// units (newtons for a thruster, radians for a rudder).
+    Cyphal {
+        node_id: u16,
+        command_subject: u16,
+        feedback_subject: u16,
+        report_tolerance: f64,
+    },
+}
+
+/// What the hosted profile needs to drive one effector's output: which bus,
+/// and the per-bus-kind wiring (D-029). Geometry and limits live in
 /// `VesselConfig::effectors` (the allocator's input), indexed by the same
 /// `EffectorId`; this table does not repeat them.
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -253,8 +284,7 @@ pub struct EffectorEntry {
     pub name: FixedStr32,
     /// References a `BusEntry::id`.
     pub bus: FixedStr32,
-    pub channel: u16,
-    pub pwm: PwmCalibration,
+    pub output: EffectorOutput,
 }
 
 // Dead-tail filler only, as for BusEntry.
@@ -264,8 +294,10 @@ impl Default for EffectorEntry {
             id: EffectorId(0),
             name: FixedStr32::empty(),
             bus: FixedStr32::empty(),
-            channel: 0,
-            pwm: PwmCalibration::default(),
+            output: EffectorOutput::Serial {
+                channel: 0,
+                pwm: PwmCalibration::default(),
+            },
         }
     }
 }

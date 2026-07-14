@@ -23,13 +23,15 @@ use coxswain_contract::{
     SensorRole, Setpoint, Timestamp, VesselState,
 };
 use coxswain_crsf::{FrameReader, ParseOutcome};
+use coxswain_cyphal::{NodeId, Priority, SubjectId};
 use coxswain_drivers::actuator_serial::{ActuatorSerialDriver, PowerReportReader, PwmChannel};
+use coxswain_drivers::cyphal_actuator::{CyphalActuatorBackend, CyphalEffector, CyphalReport};
 use coxswain_drivers::gnss0183::{self, Gnss0183Driver};
 use coxswain_drivers::output::{ActuatorSink, OutputBackend, OutputFrame};
 use coxswain_drivers::rc::{self, RcAdapter};
 use coxswain_hosted::{ArmError, ClaimError, Core, TickOutput};
 use coxswain_keelson::{ConnEvent, ConnReplyResult, VesselEndpoint};
-use coxswain_manifest::{BusKind, ChecksumMode, Nmea0183Quirks, SensorEntry};
+use coxswain_manifest::{BusKind, ChecksumMode, EffectorOutput, Nmea0183Quirks, SensorEntry};
 use coxswain_n2k::{DecodeError, FastPacketAssembler, Outcome};
 use coxswain_nmea0183::Quirks as Nmea0183ParserQuirks;
 use coxswain_sim::{GnssModel, HeadingModel, Simulator, YawRateModel};
@@ -564,10 +566,14 @@ fn actuator_bus_channels(
 ) -> Vec<(String, Vec<PwmChannel>)> {
     let mut by_bus: HashMap<&str, Vec<(u16, PwmChannel)>> = HashMap::new();
     for (i, entry) in manifest.effectors.as_slice().iter().enumerate() {
+        // Serial outputs only; Cyphal effectors are driven by the Cyphal
+        // actuator path (D-029), not rendered to $CXOUT microseconds here.
+        let EffectorOutput::Serial { channel, pwm } = entry.output else {
+            continue;
+        };
         let (max_pos, max_neg) = effector_limits(&manifest.config.effectors.as_slice()[i].kind);
-        let pwm = entry.pwm;
         by_bus.entry(entry.bus.as_str()).or_default().push((
-            entry.channel,
+            channel,
             PwmChannel {
                 effector_index: i,
                 us_min: pwm.us_min,
@@ -624,6 +630,124 @@ impl ActuatorSink for SerialSink<'_> {
             }
         }
     }
+}
+
+// ------------------------------------------------------ cyphal actuator link
+//
+// The Cyphal control bus (D-011's transmit-allowed exception, D-029): the
+// allocator's per-effector physical outputs go out as one Cyphal command per
+// effector per tick, and the nodes' feedback and the power node's voltage come
+// back on the same bus, read frame-granular like the N2K path (can.rs). Unlike
+// the $CXOUT bridge (a dumb far end, calibrated at the conn node), a Cyphal
+// node is commanded in physical units and owns its calibration (D-027), so the
+// backend sends the allocator's values straight through.
+
+/// One mapped cyphal_can bus carrying effectors: the read-write socket command
+/// frames are written to, the backend that encodes them and decodes the
+/// reverse-direction feedback and power reports, and the reader thread draining
+/// received frames off the wire (its clone of the same socket, per can.rs).
+struct CyphalActuatorLink {
+    write_port: std::fs::File,
+    backend: CyphalActuatorBackend,
+    rx: Receiver<(can::RawFrame, Timestamp)>,
+    bus_id: String,
+}
+
+/// Writes a Cyphal backend's emitted CAN frames to its control-bus socket. A
+/// cyphal_can backend only ever yields CAN frames, so a serial line here is a
+/// wiring bug (the serial backend pairs with a `SerialSink` instead).
+struct CanSink<'a>(&'a std::fs::File);
+
+impl ActuatorSink for CanSink<'_> {
+    fn emit(&mut self, frame: OutputFrame) {
+        match frame {
+            OutputFrame::Can { can_id, data } => {
+                let _ = can::write_frame(self.0, can_id, data);
+            }
+            OutputFrame::Serial(_) => {
+                unreachable!("cyphal_can backend emits CAN frames, not serial lines")
+            }
+        }
+    }
+}
+
+/// The cyphal_can bus ids that carry at least one effector (D-029). Each gets a
+/// `CyphalActuatorLink`, and on the real profile each needs a --port mapping
+/// (self-sufficiency, D-009), the same treatment an actuator_uart bus gets.
+fn cyphal_effector_buses(manifest: &coxswain_manifest::CompiledManifest) -> Vec<String> {
+    manifest
+        .buses
+        .iter()
+        .filter(|b| b.kind == BusKind::CyphalCan)
+        .filter(|b| {
+            manifest
+                .effectors
+                .as_slice()
+                .iter()
+                .any(|e| e.bus.as_str() == b.id.as_str())
+        })
+        .map(|b| b.id.as_str().to_string())
+        .collect()
+}
+
+/// Builds the `CyphalActuatorBackend` for one cyphal_can bus from the manifest:
+/// the conn node's own id, the priority every actuator command rides at, the
+/// power node's voltage subject if the bus has one, and a `CyphalEffector` per
+/// effector on the bus. Every id came through the compiler's Cyphal range
+/// checks (D-029), so the wire-type constructors cannot fail on a compiled
+/// blob; the `expect`s document that invariant.
+fn build_cyphal_backend(
+    manifest: &coxswain_manifest::CompiledManifest,
+    bus_id: &str,
+) -> CyphalActuatorBackend {
+    let bus = manifest
+        .buses
+        .iter()
+        .find(|b| b.id.as_str() == bus_id)
+        .expect("bus id sourced from manifest.buses");
+    let conn_node_id = NodeId::new(
+        bus.node_id
+            .expect("a cyphal_can bus carrying effectors has node_id (compile)") as u8,
+    )
+    .expect("compile validates the conn node id range");
+    let power_subject = manifest
+        .sensors
+        .as_slice()
+        .iter()
+        .find(|s| s.bus.as_str() == bus_id && s.role == SensorRole::Power && s.subject.is_some())
+        .and_then(|s| s.subject)
+        .map(|subject| SubjectId::new(subject).expect("compile validates the subject range"));
+
+    let mut effectors: Vec<CyphalEffector> = Vec::new();
+    for (i, e) in manifest.effectors.as_slice().iter().enumerate() {
+        if e.bus.as_str() != bus_id {
+            continue;
+        }
+        let EffectorOutput::Cyphal {
+            command_subject,
+            feedback_subject,
+            report_tolerance,
+            ..
+        } = e.output
+        else {
+            continue;
+        };
+        effectors.push(CyphalEffector {
+            effector_index: i,
+            command_subject: SubjectId::new(command_subject)
+                .expect("compile validates the subject range"),
+            feedback_subject: SubjectId::new(feedback_subject)
+                .expect("compile validates the subject range"),
+            report_tolerance,
+        });
+    }
+    CyphalActuatorBackend::new(
+        conn_node_id,
+        Priority::High,
+        power_subject,
+        coxswain_contract::BoundedList::from_slice(&effectors)
+            .expect("effector count is bounded by MAX_EFFECTORS"),
+    )
 }
 
 /// Applies one parsed CRSF frame's events to the core (D-025). Kill maps to
@@ -754,6 +878,10 @@ fn run() -> Result<(), String> {
     // channel-validated regardless of sim vs. real-serial mode (see the
     // function doc comment).
     let actuator_groups = actuator_bus_channels(&manifest);
+    // The cyphal_can buses carrying effectors (D-029): they get a Cyphal
+    // actuator link below and, on the real profile, need a --port like an
+    // actuator_uart bus does.
+    let cyphal_groups = cyphal_effector_buses(&manifest);
 
     // Bus port map: logical manifest bus id -> real device path (not a
     // Linux path the manifest itself carries: buses name conn-node
@@ -774,10 +902,20 @@ fn run() -> Result<(), String> {
                 | BusKind::ActuatorUart
                 | BusKind::CrsfUart
                 | BusKind::Nmea2000Can
+                | BusKind::CyphalCan
         ) {
             return Err(format!(
                 "--port {bus_id}=...: bus kind {:?} has no driver in this hosted profile yet",
                 bus.kind
+            ));
+        }
+        // A mapped cyphal_can bus that carries no effectors has nothing for the
+        // Cyphal actuator path to drive; it is inert, so mapping it is a
+        // commissioning mistake (the power/sensor-only Cyphal read path is not
+        // built yet, D-029).
+        if bus.kind == BusKind::CyphalCan && !cyphal_groups.iter().any(|id| id == bus_id) {
+            return Err(format!(
+                "--port {bus_id}=...: bus is cyphal_can but carries no effectors to drive"
             ));
         }
         // A mapped crsf_uart bus that no `[rc]` section names is a stray
@@ -822,6 +960,20 @@ fn run() -> Result<(), String> {
                 // No effectors on this bus: nothing to actuate, so an
                 // unmapped actuator_uart bus here is inert, not a gap.
                 continue;
+            }
+            // A cyphal_can bus carrying effectors needs a --port. One without
+            // effectors falls through to the inner_loop check below (the
+            // Cyphal read path is not built for a sensor-only bus yet, D-029),
+            // which fails loudly if it carries an inner_loop sensor.
+            if bus.kind == BusKind::CyphalCan
+                && cyphal_groups.iter().any(|id| id == bus.id.as_str())
+            {
+                return Err(format!(
+                    "bus {:?} carries effectors but has no --port mapping \
+                     (self-sufficiency, D-009): pass --port {}=<can-iface>",
+                    bus.id.as_str(),
+                    bus.id.as_str()
+                ));
             }
             if bus.kind == BusKind::CrsfUart {
                 if manifest.rc.as_ref().map(|rc| rc.bus.as_str()) == Some(bus.id.as_str()) {
@@ -1089,10 +1241,46 @@ fn run() -> Result<(), String> {
             power_reader: PowerReportReader::new(),
         });
     }
+    // Each mapped cyphal_can bus carrying effectors is bidirectional (D-029):
+    // `write_port` stays open for the command frames, and a `try_clone`
+    // duplicates the socket for a reader thread (can::spawn_reader), draining
+    // the nodes' feedback and the power node's voltage. RECV_OWN_MSGS is off
+    // (can.rs), so the reader never sees the conn node's own commands.
+    let mut cyphal_links: Vec<CyphalActuatorLink> = Vec::new();
+    for bus_id in &cyphal_groups {
+        let Some(&iface) = port_map.get(bus_id.as_str()) else {
+            continue;
+        };
+        let write_port = can::open_can(iface).map_err(|e| format!("{iface}: {e}"))?;
+        let reader_handle = write_port
+            .try_clone()
+            .map_err(|e| format!("{iface}: clone for the Cyphal feedback reader: {e}"))?;
+        cyphal_links.push(CyphalActuatorLink {
+            write_port,
+            backend: build_cyphal_backend(&manifest, bus_id),
+            rx: can::spawn_reader(reader_handle, boot),
+            bus_id: bus_id.clone(),
+        });
+    }
     // Flips true on the first $CXPWR report so the boot-default-to-measured
     // transition logs exactly once (see the ingestion block below); the
     // default itself lives in `Core::new` and needs no change here.
     let mut power_report_received = false;
+
+    // Command-then-report divergence surface (D-029/D-010): the Cyphal
+    // effectors and their latest divergence, published as the actuation health
+    // source each status tick. `actuation_diverged` is indexed by
+    // effector_index (parallel to the effector table); serial effectors, which
+    // report no achieved value, stay `false`.
+    let actuation_effectors: Vec<(usize, String)> = manifest
+        .effectors
+        .as_slice()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e.output, EffectorOutput::Cyphal { .. }))
+        .map(|(i, e)| (i, e.name.as_str().to_string()))
+        .collect();
+    let mut actuation_diverged = vec![false; manifest.effectors.as_slice().len()];
 
     let mut core = Core::new(&manifest.config);
     // Register the RC claimant at boot with its manifest-authored id
@@ -1302,6 +1490,50 @@ fn run() -> Result<(), String> {
             }
         }
 
+        // Real Cyphal reports: each control bus's reverse direction (D-029),
+        // drained frame-granular like N2K. A node's feedback updates the
+        // command-then-report divergence surface; the power node's voltage
+        // feeds `core.power` exactly where the sim and $CXPWR paths do. A
+        // well-formed message on some other subject is ignored (a shared bus
+        // carries more than our subjects, `handle_frame`'s own contract).
+        for link in &mut cyphal_links {
+            while let Ok((frame, acquired_at)) = link.rx.try_recv() {
+                match link
+                    .backend
+                    .handle_frame(frame.can_id, &frame.data[..frame.len], acquired_at)
+                {
+                    Ok(Some(CyphalReport::Power(status))) => {
+                        if !power_report_received {
+                            eprintln!(
+                                "coxswain-hosted: first power report received ({:.1} V)",
+                                status.voltage_v
+                            );
+                            power_report_received = true;
+                        }
+                        core.power(status);
+                    }
+                    Ok(Some(CyphalReport::Feedback {
+                        effector_index,
+                        diverged,
+                        ..
+                    })) => {
+                        if let Some(slot) = actuation_diverged.get_mut(effector_index) {
+                            *slot = diverged;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) if !driver_error_logged => {
+                        eprintln!(
+                            "coxswain-hosted: cyphal frame on bus {:?} rejected (continuing): {e:?}",
+                            link.bus_id
+                        );
+                        driver_error_logged = true;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
         // Real N2K: drain each mapped bus's raw CAN frames into its
         // fast-packet assembler (frames pushed in arrival order, per
         // `FastPacketAssembler::push`'s own contract), and dispatch a
@@ -1361,6 +1593,21 @@ fn run() -> Result<(), String> {
                 backend.write_outputs(outputs.values.as_slice(), &mut sink);
             }
         }
+        // Each mapped cyphal_can link commands its effectors in physical units,
+        // one single-frame Cyphal message per effector per tick (D-029),
+        // including the zero-demand values while disarmed, same dead-man
+        // doctrine as the serial path above.
+        if !cyphal_links.is_empty() {
+            let outputs = out.outputs.as_ref().expect(
+                "a cyphal link exists only when the manifest declares effectors, which is \
+                 exactly when Core builds an allocator (Core::new)",
+            );
+            for link in &mut cyphal_links {
+                let mut sink = CanSink(&link.write_port);
+                link.backend
+                    .write_outputs(outputs.values.as_slice(), &mut sink);
+            }
+        }
 
         if let Some(state) = &out.state {
             publish(
@@ -1372,12 +1619,21 @@ fn run() -> Result<(), String> {
         let elapsed = boot.elapsed();
         tick_max = tick_max.max(tick_start.elapsed());
         if elapsed >= next_status {
+            let actuation: Vec<(&str, bool)> = actuation_effectors
+                .iter()
+                .map(|(i, name)| (name.as_str(), actuation_diverged[*i]))
+                .collect();
             publish(
                 endpoint.publish_health(
                     wall,
                     &out.health,
                     &out.directive.conn,
                     out.directive.arming,
+                    coxswain_keelson::PowerHealth {
+                        low_voltage: out.directive.low_voltage,
+                        power_stale: out.directive.power_stale,
+                    },
+                    &actuation,
                 ),
                 &mut publish_error_logged,
             );

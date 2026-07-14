@@ -296,8 +296,10 @@ Cyphal backend lands in Phase 7, one phase away.
 
 ## D-028: Cyphal backend, and the output backend trait it crystallizes
 
-Status: proposed. The transport layer has landed (coxswain-cyphal); the trait
-and backend design below is proposed for discussion before the backend code,
+Status: accepted. The transport layer (coxswain-cyphal), the output backend
+trait, and the `CyphalActuatorBackend` (command out, feedback/power in) have
+landed; the hosted integration and the schema it needs are D-029. The trait
+and backend design below was proposed for discussion before the backend code,
 per the working style (D-027 deferred the trait as an explicit architectural
 act).
 
@@ -335,6 +337,58 @@ compares commanded against reported per effector and flags a divergence to
 health; the exact tolerance and the health surface are open until the backend
 lands. SocketCAN wiring on the hosted profile mirrors the N2K path and is
 vcan-tested in CI; the physical actuator node firmware is Phase 9.
+
+## D-029: Effector output is per-bus-kind; the Cyphal integration (schema_version 4 -> 5)
+
+Status: accepted. Wiring the hosted profile to actuate over Cyphal (D-028's
+backend, TASKS Phase 7) needs the manifest to carry per-effector Cyphal
+addressing, which a `pwm`/`actuator_uart` effector does not have. An effector's
+output wiring is therefore not a flat pair of fields but a sum type over its
+bus kind: `EffectorOutput::Serial { channel, pwm }` for `actuator_uart`/`pwm`
+(D-027's dumb far end, rendered to microseconds at the conn node), and
+`EffectorOutput::Cyphal { node_id, command_subject, feedback_subject,
+report_tolerance }` for `cyphal_can` (physical units straight through, the node
+owns its calibration). The compiler picks the arm from the effector's bus kind
+and rejects the other arm's fields, the same pattern as the kind-specific
+geometry fields (D-026). This changes the signed blob layout, so the schema
+version bumps 4 -> 5 (D-018): old readers reject new blobs and new readers
+reject old ones, no migration, the same doctrine as every prior bump.
+
+Three placement decisions settle the rest of the Cyphal wiring:
+
+- The conn node's own id on a control bus is a `node_id` on the `cyphal_can`
+  `[[bus]]` entry: the conn node is a participant on its own bus. Required
+  when that bus carries effectors; it joins the per-bus node-id uniqueness
+  check alongside sensor and effector node ids.
+- The power node's voltage subject is a `subject` on the role=power `[[sensor]]`
+  that already sits on the bus, next to the `node_id` it publishes from, not a
+  bus-level field divorced from the sensor it describes. Optional: a Cyphal
+  actuator bus need not have a power node, and the failsafe matrix already
+  tolerates an absent power link (Core's NaN boot voltage). So the backend's
+  `power_subject` is an `Option`.
+- The command-then-report divergence tolerance is per effector, in that
+  effector's physical units (newtons for a thruster, radians for a rudder): a
+  single bus-wide scalar cannot be dimensionally right for both. This moves the
+  tolerance out of `CyphalActuatorBackend::new` and onto each `CyphalEffector`.
+
+Effectors and `[[actuator_node]]` stay mutually exclusive, as on the serial
+path (the rudderboat vessel has effectors and no actuator_nodes). A
+Cyphal-actuated allocator vessel declares `[[effector]]` on the `cyphal_can`
+bus with node_id plus subjects, and no `[[actuator_node]]`. `[[actuator_node]]`
+has no runtime consumer today (it is descriptive far-end failsafe metadata for
+Phase 9 firmware that does not exist yet); folding node-local failsafe and
+heartbeat back into the effector, or re-linking the two tables, waits until
+that firmware needs it.
+
+Hosted integration: the `cyphal_can` control bus is D-011's transmit-allowed
+exception, so `hosted/src/can.rs` gains a `write_frame` and the module's
+listen-only invariant is carved to that one exception (N2K stays listen-only).
+For a `cyphal_can` bus carrying effectors, the profile builds a
+`CyphalActuatorBackend` from the manifest, drives it through the output backend
+trait with a CAN sink, and feeds received frames through `handle_frame`:
+power to the existing `PowerStatus` intake, per-effector divergence to an
+`actuation` source in the published health telemetry, mirroring the estimator
+source (D-010's command-then-report reaching the observable surface).
 
 ## Open questions (not yet decided)
 

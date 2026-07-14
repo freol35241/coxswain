@@ -1,14 +1,15 @@
-# Coxswain Vessel Manifest: Schema Draft v0.5
+# Coxswain Vessel Manifest: Schema Draft v0.6
 
 The manifest is the per-vessel statement of what exists, where it terminates, and what
 the estimator is licensed to trust. It is authored as TOML, validated and compiled
 host-side to a signed, CRC-protected binary blob (postcard), and written to an A/B flash
 region on the conn node during commissioning. The firmware treats it as pure data.
 
-Doc revision is v0.5. The wire-facing `manifest.schema_version` bumps 3 -> 4 for
-`supervisor.power_stale_after_ms` and the `[rc]` section (D-025); the bump is deliberate
-and pre-release, same doctrine as every prior bump, so a v0.4 reader rejects a v0.5 blob
-outright rather than attempting to interpret it.
+Doc revision is v0.6. The wire-facing `manifest.schema_version` bumps 4 -> 5 for the
+per-bus-kind effector output, the `cyphal_can` bus `node_id`, and the role=power sensor
+`subject` (D-029); the bump is deliberate and pre-release, same doctrine as every prior
+bump, so a schema_version 4 reader rejects a schema_version 5 blob outright rather than
+attempting to interpret it.
 
 Design rules encoded in this schema:
 
@@ -32,7 +33,7 @@ Design rules encoded in this schema:
 # ============================================================
 
 [manifest]
-schema_version = 4          # firmware refuses unknown major versions
+schema_version = 5          # firmware refuses unknown major versions
 vessel_id      = "example-vessel-01"
 name           = "Example"
 revision       = 7          # monotonically increasing per vessel
@@ -285,21 +286,29 @@ per D-022; today `max_age_ms` exists only in the 0183 quirk table and is
 provisional. `enrichment` sensors are pass-through: decoded, timestamped,
 published to Keelson, invisible to control.
 
-**`[[effector]]` is what D-026/D-027 govern.** Where `license` declares sensor trust,
+**`[[effector]]` is what D-026/D-027/D-029 govern.** Where `license` declares sensor trust,
 the effector table declares actuation capability: guidance's tau is only as real as
 the effectors the allocator can drive it through (D-026). Each entry names a `kind`
 (`fixed_thruster` | `rudder`; `azimuth` and `sail` are schema-visible but rejected at
 compile until implemented, D-026), the kind-specific geometry and limits the contract's
-`EffectorKind` carries, and an output `bus` + `channel`. `[effector.pwm]` calibration is
-required for every effector: both output bus kinds (`actuator_uart`, `pwm`) are
-PWM-terminated, and per D-018 calibration is manifest data because it shapes control,
-not a runtime setting. The mapping is piecewise linear through center: physical zero
-(no thrust, amidships) maps to `us_center`, the negative limit to `us_min`, the positive
-limit to `us_max`; `reversed` swaps the endpoints. An empty `[[effector]]` table is
-valid and means tau-direct legacy behavior: no allocation stage, guidance's demand goes
-to the backend directly (today's Cyphal `[[actuator_node]]` story, e.g. the example vessel).
+`EffectorKind` carries, and its output wiring, which depends on the bus kind (D-029).
+A serial output bus (`actuator_uart`, `pwm`) takes `channel` + `[effector.pwm]`
+calibration, PWM-terminated and rendered to microseconds at the conn node (D-027). A
+`cyphal_can` output bus takes `node_id` + `command_subject` + `feedback_subject` +
+`report_tolerance` instead: the node is commanded in physical units and owns its own
+calibration, so no PWM data is authored, and the divergence tolerance is per effector
+in that effector's units (newtons for a thruster, radians for a rudder). The compiler
+requires the set the bus kind selects and rejects the other. Per D-018 all of this is
+manifest data because it shapes control, not a runtime setting. The PWM mapping is
+piecewise linear through center: physical zero (no thrust, amidships) maps to
+`us_center`, the negative limit to `us_min`, the positive limit to `us_max`; `reversed`
+swaps the endpoints. An empty `[[effector]]` table is valid and means tau-direct legacy
+behavior: no allocation stage, guidance's demand goes to the backend directly. Effectors
+and `[[actuator_node]]` are mutually exclusive ways to declare actuation (D-029); a
+`cyphal_can` allocator vessel declares effectors, not actuator nodes.
 
 ```toml
+# Serial output (actuator_uart / pwm): channel + PWM calibration.
 [[effector]]
 id      = "esc_main"
 kind    = "fixed_thruster"
@@ -315,20 +324,25 @@ us_min    = 1100
 us_center = 1500
 us_max    = 1900
 
+# Cyphal output (cyphal_can): node id, subjects, per-effector tolerance.
 [[effector]]
-id      = "rudder_main"
-kind    = "rudder"
-bus     = "actuator_bridge"
-channel = 1
-pos_x_m                    = -1.80
-side_force_n_per_rad_mps2  = 400.0
-max_angle_rad              = 0.6
-min_effective_speed_mps    = 0.5
-[effector.pwm]
-us_min    = 1100
-us_center = 1500
-us_max    = 1900
+id      = "esc_stbd"
+kind    = "fixed_thruster"
+bus     = "ctrl"                  # references a cyphal_can bus (which carries node_id)
+pos_x_m           = -1.20
+pos_y_m           = 0.30
+azimuth_rad       = 0.0
+max_thrust_fwd_n  = 300.0
+max_thrust_rev_n  = 180.0
+node_id           = 12            # the actuator node's Cyphal id on the bus
+command_subject   = 100           # conn node publishes the setpoint here
+feedback_subject  = 200           # node reports achieved here
+report_tolerance  = 5.0           # newtons; command-then-report divergence bound
 ```
+
+On a `cyphal_can` output bus, the `[[bus]]` entry carries the conn node's own
+`node_id`, and the power node's voltage subject rides on the role=power `[[sensor]]`
+as a `subject` field (D-029).
 
 **`[rc]` is the vessel's RC hand controller (D-025).** Optional, and at most one:
 a single table, not an array-of-tables. `bus` references a declared `crsf_uart`
@@ -367,14 +381,21 @@ max_yaw_nm         = 60.0
 - `estimator.params` matches the shape selected by `estimator.model`
 - Geofence polygon is a closed, simple, non-degenerate ring
 - No duplicate physical port claims
-- Cyphal node IDs unique per bus
+- Cyphal node IDs unique per bus, sensors, actuator nodes, the conn node's own
+  bus `node_id`, and Cyphal effector nodes together (D-029); Cyphal node ids and
+  subject ids are within the wire ranges (`node_id` <= 127, `subject` <= 8191)
 - No duplicate claimant ids in `[[claimant]]` (D-025)
 - Schema version compatible with target firmware version
 - `driver` strings are not resolved here; a manifest may name drivers the target
   firmware lacks, and that surfaces at boot self-test, not at compile
 - Every `[[effector]]` references a declared bus of an output kind
-  (`actuator_uart` or `pwm`); `channel` is unique per bus; at most 8 effectors
-  (see `[[effector]]` below)
+  (`actuator_uart`, `pwm`, or `cyphal_can`); at most 8 effectors (see
+  `[[effector]]` below). A serial effector carries `channel` + `[effector.pwm]`
+  and no Cyphal fields; a `cyphal_can` effector carries `node_id` +
+  `command_subject` + `feedback_subject` + `report_tolerance` and no channel/pwm;
+  the compiler rejects the wrong set for the bus kind (D-029)
+- On a serial output bus, `channel` is unique per bus; a `cyphal_can` effector's
+  `report_tolerance` is finite and strictly positive (D-029)
 - `[effector.pwm]` satisfies `us_min < us_center < us_max`, all three within the
   500-2500 us plausibility window (standard RC PWM is 1000-2000 us; the window
   leaves headroom for nonstandard servos while catching swapped or garbage values)
@@ -383,8 +404,9 @@ max_yaw_nm         = 60.0
   `coxswain-allocation`'s own config checks so a bad table fails at compile
   rather than at the allocator's boot self-test
 - A `pwm` bus is refused when `conn_node.board = "hosted"` (D-027)
-- Per output bus, `[[effector]]` channels are exactly `0..n`, no gaps: they are
-  positional on the wire
+- Per serial output bus, `[[effector]]` channels are exactly `0..n`, no gaps:
+  they are positional on the wire (Cyphal effectors are addressed by subject,
+  not channel, so they do not participate)
 - `[rc].bus` references a declared `crsf_uart` bus; `kill_channel`,
   `takeover_channel`, `surge_channel`, and `yaw_channel` are distinct and each
   below 16 (CRSF's channel count); `switch_low_us < switch_high_us`;
@@ -449,7 +471,16 @@ supervisor never knows RC from any other claimant. Effector channel
 contiguity (per output bus, `[[effector]]` channels are exactly `0..n`)
 graduates from a hosted-profile boot check to a compile-time rule.
 
-## Open questions for v0.6
+**Settled since v0.5:** the per-bus-kind effector output (D-029). An effector's
+output wiring is a sum type over its bus kind: a serial bus (`actuator_uart`,
+`pwm`) keeps `channel` + `[effector.pwm]`; a `cyphal_can` bus takes `node_id` +
+`command_subject` + `feedback_subject` + `report_tolerance` (per effector, in
+its physical units) instead, since a Cyphal node is commanded in physical units
+and owns its calibration. The `cyphal_can` `[[bus]]` gains the conn node's own
+`node_id`, and the role=power `[[sensor]]` gains a `subject` for its bus voltage.
+Effectors and `[[actuator_node]]` are mutually exclusive actuation declarations.
+
+## Open questions for v0.7
 
 1. **Fusion priority vs weights.** `heading = [a, b]` as priority order is simple but
    crude; explicit per-sensor noise parameters may belong in the manifest once the

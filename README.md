@@ -21,9 +21,10 @@ supervisor for the conn and can lose it, over
 [Keelson](https://github.com/RISE-Maritime/keelson) today and a MAVLink facade
 later. Sensor buses reach the estimator as licensed or enrichment
 measurements: NMEA 0183 and 2000 today, native IMU and GNSS drivers next. And
-the allocator's per-channel outputs leave through an output backend: the
-`$CXOUT` serial bridge today, Cyphal actuator nodes and direct PWM on the
-reference hardware next. The manifest governs all three boundaries, and the
+the allocator's per-effector outputs leave through an output backend: the
+`$CXOUT` serial bridge and a Cyphal/CAN actuator backend today, the physical
+actuator nodes and direct PWM on the reference hardware next. The manifest
+governs all three boundaries, and the
 supervisor watches the estimate's health, substituting its own setpoint when a
 failsafe condition holds.
 
@@ -105,11 +106,17 @@ replay-harness measurement log. Phase 6b added control allocation
 force onto a manifest-declared effector table (thrusters, rudder), the
 actuator wire carries per-channel outputs (`$CXOUT`, replacing the
 tau-carrying `$CXACT`), and a hull without sway authority gets a
-drift-and-reapproach hold in place of a point hold.
+drift-and-reapproach hold in place of a point hold. Phase 7 added the
+Cyphal/CAN actuator backend (D-028/D-029): a hand-rolled single-frame
+Cyphal transport, a second output backend that commands each effector in
+physical units and reads its feedback and the bus voltage back, with the
+command-then-report divergence and the voltage surfaced in health
+telemetry. The hosted SocketCAN transmit path is wired end to end and
+vcan-tested in CI.
 
-What remains needs hardware: IMU/mag drivers, Cyphal CAN wiring and
-actuator nodes, Septentrio SBF, the H7 conn-node firmware, and the
-water itself. Sequenced in [docs/TASKS.md](docs/TASKS.md).
+What remains needs hardware: IMU/mag drivers, the Cyphal actuator node
+firmware, Septentrio SBF, the H7 conn-node firmware, and the water
+itself. Sequenced in [docs/TASKS.md](docs/TASKS.md).
 
 ## Layout
 
@@ -124,8 +131,9 @@ water itself. Sequenced in [docs/TASKS.md](docs/TASKS.md).
 | `coxswain-manifest` | Manifest validation, compilation, signing; no_std blob reader; host tool. |
 | `coxswain-sim` | Plant simulator and sensor models with fault injection. Host-only. |
 | `coxswain-keelson` | [Keelson](https://github.com/RISE-Maritime/keelson) adapter and claimant client at the process boundary. |
-| `coxswain-hosted` | The Linux profile binary: manifest in, simulator or real serial ports as I/O backend, zenoh session up. |
-| `coxswain-drivers` | The driver trait and timestamping policy, plus the drivers built on it: NMEA 0183 GNSS/heading, CRSF RC, and the `$CXOUT` actuator serial backend. |
+| `coxswain-hosted` | The Linux profile binary: manifest in, simulator or real serial and CAN ports as I/O backend, zenoh session up. |
+| `coxswain-drivers` | The driver trait and timestamping policy, plus the drivers built on it: NMEA 0183 GNSS/heading, CRSF RC, the `$CXOUT` actuator serial backend, and the Cyphal actuator backend. |
+| `coxswain-cyphal` | Strict no_std Cyphal/CAN v1.0 single-frame transport codec (13-bit subject ids, tail byte). Zero dependencies. |
 | `coxswain-nmea0183` | Strict no_std NMEA 0183 parser (GGA, RMC, HDT, VTG). Zero dependencies. |
 | `coxswain-crsf` | Strict no_std CRSF parser (RC channels, link statistics) for the hand controller link. Zero dependencies. |
 | `coxswain-n2k` | Strict no_std NMEA 2000 decoder: single-frame PGNs plus fast-packet reassembly (129029). Listen-only enrichment, zero dependencies. |

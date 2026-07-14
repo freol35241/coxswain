@@ -399,6 +399,7 @@ dependencies = [
  "coxswain-allocation",
  "coxswain-contract",
  "coxswain-crsf",
+ "coxswain-cyphal",
  "coxswain-drivers",
  "coxswain-estimator",
  "coxswain-guidance",
@@ -432,6 +433,7 @@ name = "coxswain-manifest"
 version = "0.1.0"
 dependencies = [
  "coxswain-contract",
+ "coxswain-cyphal",
  "coxswain-manifest",
  "crc",
  "ed25519-dalek",

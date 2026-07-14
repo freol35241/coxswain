@@ -35,6 +35,20 @@ pub enum StateUpdate {
     },
 }
 
+/// A distilled view of the vessel's `entity_health` for a test or display: the
+/// arming state (from the supervisor source's arming check) and, for a
+/// Cyphal-actuated vessel, each effector's command-then-report divergence
+/// (from the actuation source, D-029).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HealthUpdate {
+    pub enclosed_at: SystemTime,
+    pub armed: bool,
+    /// The supervisor's report-only low-voltage flag (D-024), from the power
+    /// subject: a Cyphal power node's voltage reaching the observable surface.
+    pub low_voltage: bool,
+    pub actuation_diverged: Vec<(String, bool)>,
+}
+
 pub struct ClaimantClient {
     session: zenoh::Session,
     base_path: String,
@@ -177,6 +191,68 @@ impl ClaimantClient {
         self.subscribers.push(fix_sub);
         self.subscribers.push(heading_sub);
         Ok(rx)
+    }
+
+    /// Subscribe to the vessel's `entity_health` stream, distilled to arming
+    /// and Cyphal actuation divergence (`HealthUpdate`). Updates arrive for as
+    /// long as the client lives; malformed samples are dropped.
+    pub fn subscribe_health(&mut self) -> Result<Receiver<HealthUpdate>, Error> {
+        let (tx, rx) = mpsc::channel();
+        let key = keys::pubsub_key(
+            &self.base_path,
+            &self.entity_id,
+            subject::ENTITY_HEALTH,
+            COXSWAIN,
+        );
+        let sub = self
+            .session
+            .declare_subscriber(key)
+            .callback(move |sample| {
+                if let Ok((enclosed_at, inner)) = open(&sample.payload().to_bytes())
+                    && let Ok(health) = keelson::EntityHealth::decode(inner.as_slice())
+                {
+                    let _ = tx.send(distill_health(enclosed_at, &health));
+                }
+            })
+            .wait()?;
+        self.subscribers.push(sub);
+        Ok(rx)
+    }
+}
+
+/// Reduces a published `EntityHealth` to the arming state and the per-effector
+/// actuation divergence a claimant cares about (the vessel's own source names,
+/// mirrored from `VesselEndpoint::publish_health`).
+fn distill_health(enclosed_at: SystemTime, health: &keelson::EntityHealth) -> HealthUpdate {
+    let nominal = keelson::HealthLevel::HealthNominal as i32;
+    let mut armed = false;
+    let mut low_voltage = false;
+    let mut actuation_diverged = Vec::new();
+    for source in &health.sources {
+        match source.name.as_str() {
+            "supervisor" => {
+                let checks = source.subjects.iter().flat_map(|s| &s.checks);
+                for check in checks {
+                    match check.name.as_str() {
+                        "arming" => armed = check.detail == "armed",
+                        "low_voltage" => low_voltage = check.detail == "low",
+                        _ => {}
+                    }
+                }
+            }
+            "actuation" => {
+                for subject in &source.subjects {
+                    actuation_diverged.push((subject.name.clone(), subject.level != nominal));
+                }
+            }
+            _ => {}
+        }
+    }
+    HealthUpdate {
+        enclosed_at,
+        armed,
+        low_voltage,
+        actuation_diverged,
     }
 }
 

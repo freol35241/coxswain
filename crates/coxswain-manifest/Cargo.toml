@@ -8,6 +8,8 @@
 #   DECISIONS.md. 0.10 is what ed25519-dalek v2 uses internally.
 # - toml: authoring format, std/host side only.
 # - coxswain-contract: the compile target (D-022), serde feature for the blob.
+# - coxswain-cyphal: single source of truth for the Cyphal node-id/subject-id
+#   wire ranges the effector-output validation checks against (D-029).
 
 [package]
 name = "coxswain-manifest"
@@ -18,6 +20,7 @@ publish = false
 
 [dependencies]
 coxswain-contract = { path = "../coxswain-contract", features = ["serde"] }
+coxswain-cyphal = { path = "../coxswain-cyphal" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 postcard = { version = "1", default-features = false }
 crc = "3"

@@ -31,13 +31,16 @@ use coxswain_cyphal::{
 use crate::output::{ActuatorSink, OutputBackend, OutputFrame};
 
 /// One effector's Cyphal wiring: which allocator output value its setpoint
-/// reads, the subject the conn node commands it on, and the subject its node
-/// reports achieved on.
+/// reads, the subject the conn node commands it on, the subject its node
+/// reports achieved on, and the command-then-report divergence tolerance in
+/// this effector's physical units (D-029: newtons for a thruster, radians for
+/// a rudder, so it cannot be a single bus-wide scalar).
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct CyphalEffector {
     pub effector_index: usize,
     pub command_subject: SubjectId,
     pub feedback_subject: SubjectId,
+    pub report_tolerance: f64,
 }
 
 /// Errors decoding a received Cyphal frame into a report.
@@ -77,11 +80,11 @@ pub enum CyphalReport {
 pub struct CyphalActuatorBackend {
     conn_node_id: NodeId,
     priority: Priority,
-    power_subject: SubjectId,
+    /// The power-monitoring node's voltage subject, or `None` for a bus with
+    /// no power node (D-029): the failsafe matrix tolerates an absent power
+    /// link, so this backend does not require one.
+    power_subject: Option<SubjectId>,
     effectors: BoundedList<CyphalEffector, MAX_EFFECTORS>,
-    /// Divergence threshold in physical units: `|achieved - commanded|` beyond
-    /// this flags a command-then-report mismatch. Provisional (D-028).
-    report_tolerance: f64,
     transfer_id: [u8; MAX_EFFECTORS],
     last_commanded: [f32; MAX_EFFECTORS],
 }
@@ -90,16 +93,14 @@ impl CyphalActuatorBackend {
     pub fn new(
         conn_node_id: NodeId,
         priority: Priority,
-        power_subject: SubjectId,
+        power_subject: Option<SubjectId>,
         effectors: BoundedList<CyphalEffector, MAX_EFFECTORS>,
-        report_tolerance: f64,
     ) -> Self {
         Self {
             conn_node_id,
             priority,
             power_subject,
             effectors,
-            report_tolerance,
             transfer_id: [0; MAX_EFFECTORS],
             last_commanded: [0.0; MAX_EFFECTORS],
         }
@@ -119,7 +120,7 @@ impl CyphalActuatorBackend {
         let frame = decode_single_frame(can_id, data).map_err(ReportError::Transport)?;
         let subject = frame.id.subject_id;
 
-        if subject == self.power_subject {
+        if self.power_subject == Some(subject) {
             let voltage = read_f32(frame.payload)?;
             if voltage < 0.0 {
                 return Err(ReportError::NegativeVoltage);
@@ -135,7 +136,7 @@ impl CyphalActuatorBackend {
             if subject == eff.feedback_subject {
                 let achieved = read_f32(frame.payload)?;
                 let commanded = self.last_commanded[slot];
-                let diverged = abs_f32(achieved - commanded) as f64 > self.report_tolerance;
+                let diverged = abs_f32(achieved - commanded) as f64 > eff.report_tolerance;
                 return Ok(Some(CyphalReport::Feedback {
                     effector_index: eff.effector_index,
                     commanded,
@@ -226,20 +227,21 @@ mod tests {
                 effector_index: 0,
                 command_subject: subj(CMD0),
                 feedback_subject: subj(FB0),
+                report_tolerance: TOLERANCE,
             },
             CyphalEffector {
                 effector_index: 1,
                 command_subject: subj(CMD1),
                 feedback_subject: subj(FB1),
+                report_tolerance: TOLERANCE,
             },
         ])
         .unwrap();
         CyphalActuatorBackend::new(
             NodeId::new(CONN_NODE).unwrap(),
             Priority::High,
-            subj(POWER),
+            Some(subj(POWER)),
             effectors,
-            TOLERANCE,
         )
     }
 
@@ -413,6 +415,77 @@ mod tests {
         assert_eq!(
             b.handle_frame(frame.can_id, frame.data(), Timestamp::from_nanos(1)),
             Err(ReportError::ShortPayload)
+        );
+    }
+
+    #[test]
+    fn per_effector_tolerance_is_independent() {
+        // Effector 0 tight (0.5), effector 1 loose (10.0); the same 4.0
+        // divergence crosses one tolerance but not the other.
+        let effectors = BoundedList::from_slice(&[
+            CyphalEffector {
+                effector_index: 0,
+                command_subject: subj(CMD0),
+                feedback_subject: subj(FB0),
+                report_tolerance: 0.5,
+            },
+            CyphalEffector {
+                effector_index: 1,
+                command_subject: subj(CMD1),
+                feedback_subject: subj(FB1),
+                report_tolerance: 10.0,
+            },
+        ])
+        .unwrap();
+        let mut b = CyphalActuatorBackend::new(
+            NodeId::new(CONN_NODE).unwrap(),
+            Priority::High,
+            None,
+            effectors,
+        );
+        emit(&mut b, &[0.0, 0.0]);
+
+        let (d0, l0, i0) = node_frame(FB0, NODE0, 4.0);
+        let CyphalReport::Feedback { diverged, .. } = b
+            .handle_frame(i0, &d0[..l0], Timestamp::from_nanos(1))
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected Feedback");
+        };
+        assert!(diverged, "4.0 exceeds effector 0's 0.5 tolerance");
+
+        let (d1, l1, i1) = node_frame(FB1, NODE0, 4.0);
+        let CyphalReport::Feedback { diverged, .. } = b
+            .handle_frame(i1, &d1[..l1], Timestamp::from_nanos(1))
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected Feedback");
+        };
+        assert!(!diverged, "4.0 is within effector 1's 10.0 tolerance");
+    }
+
+    #[test]
+    fn no_power_subject_treats_would_be_power_frame_as_unknown() {
+        // A bus with no power node: nothing is ever decoded as power.
+        let effectors = BoundedList::from_slice(&[CyphalEffector {
+            effector_index: 0,
+            command_subject: subj(CMD0),
+            feedback_subject: subj(FB0),
+            report_tolerance: TOLERANCE,
+        }])
+        .unwrap();
+        let b = CyphalActuatorBackend::new(
+            NodeId::new(CONN_NODE).unwrap(),
+            Priority::High,
+            None,
+            effectors,
+        );
+        let (data, len, id) = node_frame(POWER, 21, 12.6);
+        assert_eq!(
+            b.handle_frame(id, &data[..len], Timestamp::from_nanos(1)),
+            Ok(None)
         );
     }
 

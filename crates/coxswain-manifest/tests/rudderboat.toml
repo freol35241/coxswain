@@ -6,7 +6,7 @@
 # ============================================================
 
 [manifest]
-schema_version = 4
+schema_version = 5
 vessel_id      = "se-rise-rudderboat-01"
 name           = "Rudderboat"
 revision       = 1

@@ -427,7 +427,7 @@ impl Drop for FrameSender {
 
 const MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 4
+schema_version = 5
 vessel_id      = "cx-can-rig-01"
 name           = "CAN Desk Rig"
 revision       = 1

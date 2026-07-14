@@ -26,6 +26,9 @@ coxswain-sim = { path = "../coxswain-sim" }
 coxswain-drivers = { path = "../coxswain-drivers" }
 # Byte-to-CRSF-frame assembly for the real RC port.
 coxswain-crsf = { path = "../coxswain-crsf" }
+# Cyphal wire types (node id, subject id, priority) to build the Cyphal
+# actuator backend from the manifest (D-029).
+coxswain-cyphal = { path = "../coxswain-cyphal" }
 # Only for the `Quirks` type `coxswain-drivers::gnss0183::Config` takes;
 # already pulled in transitively via coxswain-drivers.
 coxswain-nmea0183 = { path = "../coxswain-nmea0183" }

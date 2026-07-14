@@ -12,6 +12,7 @@ use coxswain_contract::{
     License, MAX_EFFECTORS, ModelParams, SensorConfig, SensorId, SensorRole, SupervisorConfig,
     VesselConfig,
 };
+use coxswain_cyphal::{NODE_ID_MAX, SUBJECT_ID_MAX};
 
 use crate::toml_model::{
     BusKindToml, BusToml, ChecksumToml, ClaimantToml, ConnGrantToml, EffectorToml, EstimatorToml,
@@ -20,8 +21,8 @@ use crate::toml_model::{
 };
 use crate::types::{
     ActuatorFailsafe, ActuatorFunction, ActuatorNodeEntry, BusEntry, BusKind, ChecksumMode,
-    CompiledManifest, ConnNodeEntry, EffectorEntry, FixedStr32, Nmea0183Quirks, Nmea2000Quirks,
-    PwmCalibration, RcEntry, SCHEMA_VERSION, SensorEntry,
+    CompiledManifest, ConnNodeEntry, EffectorEntry, EffectorOutput, FixedStr32, Nmea0183Quirks,
+    Nmea2000Quirks, PwmCalibration, RcEntry, SCHEMA_VERSION, SensorEntry,
 };
 
 /// Board profiles (D-016): the ports a manifest may reference. A sensor's
@@ -229,6 +230,34 @@ pub enum ValidateError {
         expected: u16,
         found: u16,
     },
+    /// An effector sets an output-wiring field its bus kind does not use
+    /// (D-029): a serial field on a `cyphal_can` effector, or a Cyphal field
+    /// on an `actuator_uart`/`pwm` effector.
+    EffectorFieldUnexpected {
+        effector: String,
+        field: &'static str,
+    },
+    /// A Cyphal node id or subject id is outside the wire range (D-029).
+    CyphalIdRange {
+        owner: String,
+        field: &'static str,
+        value: u16,
+        max: u16,
+    },
+    /// A `cyphal_can` bus carries effectors but declares no `node_id`, the
+    /// conn node's own id it transmits from (D-029).
+    BusNodeIdMissing {
+        bus: String,
+    },
+    /// `[[bus]].node_id` is set on a bus that is not `cyphal_can` (D-029).
+    BusNodeIdWrongKind {
+        bus: String,
+    },
+    /// A `cyphal_can` effector's `report_tolerance` is not strictly positive
+    /// and finite (D-029).
+    EffectorToleranceNotPositive {
+        effector: String,
+    },
 }
 
 impl std::fmt::Display for ValidateError {
@@ -237,7 +266,7 @@ impl std::fmt::Display for ValidateError {
             Self::UnsupportedSchemaVersion(v) => {
                 write!(
                     f,
-                    "schema_version {v} unsupported, this tool compiles version 4"
+                    "schema_version {v} unsupported, this tool compiles version 5"
                 )
             }
             Self::UnknownBoard(b) => write!(f, "unknown conn_node.board profile {b:?}"),
@@ -338,7 +367,7 @@ impl std::fmt::Display for ValidateError {
                 write!(
                     f,
                     "effector {effector:?} references bus {bus:?}, which is not an output bus \
-                     (actuator_uart or pwm)"
+                     (actuator_uart, pwm, or cyphal_can)"
                 )
             }
             Self::DuplicateEffectorChannel { bus, channel } => {
@@ -413,6 +442,39 @@ impl std::fmt::Display for ValidateError {
                     f,
                     "bus {bus:?}: effector channels must be contiguous from 0 (found channel \
                      {found} at position {expected})"
+                )
+            }
+            Self::EffectorFieldUnexpected { effector, field } => {
+                write!(
+                    f,
+                    "effector {effector:?} sets field {field:?}, which its bus kind does not use"
+                )
+            }
+            Self::CyphalIdRange {
+                owner,
+                field,
+                value,
+                max,
+            } => {
+                write!(
+                    f,
+                    "{owner:?}: {field} = {value} is outside the Cyphal range 0..={max}"
+                )
+            }
+            Self::BusNodeIdMissing { bus } => {
+                write!(
+                    f,
+                    "cyphal_can bus {bus:?} carries effectors but declares no node_id (the conn \
+                     node's own id it transmits from)"
+                )
+            }
+            Self::BusNodeIdWrongKind { bus } => {
+                write!(f, "bus {bus:?}: node_id is only valid on a cyphal_can bus")
+            }
+            Self::EffectorToleranceNotPositive { effector } => {
+                write!(
+                    f,
+                    "effector {effector:?}: report_tolerance must be strictly positive and finite"
                 )
             }
         }
@@ -589,14 +651,32 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         }
     }
 
-    // Cyphal node ids unique per bus, sensors and actuator nodes together.
+    // Cyphal node ids unique per bus: sensors, actuator nodes, the conn node's
+    // own id on each cyphal_can bus, and Cyphal effector nodes, all together
+    // (D-029). A node id on a non-cyphal bus is rejected in `bus_entry`; here
+    // only cyphal_can conn/effector ids join the set.
     let mut node_ids: HashSet<(&str, u16)> = HashSet::new();
     let sensor_claims = m
         .sensors
         .iter()
         .filter_map(|s| s.node_id.map(|node_id| (s.bus.as_str(), node_id)));
     let actuator_claims = m.actuator_nodes.iter().map(|n| (n.bus.as_str(), n.node_id));
-    for (bus, node_id) in sensor_claims.chain(actuator_claims) {
+    let conn_claims = m.buses.iter().filter_map(|b| {
+        (b.kind == BusKindToml::CyphalCan)
+            .then_some(b.node_id.map(|id| (b.id.as_str(), id)))
+            .flatten()
+    });
+    let effector_claims = m.effectors.iter().filter_map(|e| {
+        let bus = bus_by_id.get(e.bus.as_str())?;
+        (bus.kind == BusKindToml::CyphalCan)
+            .then_some(e.node_id.map(|id| (e.bus.as_str(), id)))
+            .flatten()
+    });
+    for (bus, node_id) in sensor_claims
+        .chain(actuator_claims)
+        .chain(conn_claims)
+        .chain(effector_claims)
+    {
         if !node_ids.insert((bus, node_id)) {
             return Err(ValidateError::DuplicateNodeId {
                 bus: bus.to_string(),
@@ -711,22 +791,30 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
                 bus: e.bus.clone(),
             });
         };
-        if !matches!(bus.kind, BusKindToml::ActuatorUart | BusKindToml::Pwm) {
+        if !matches!(
+            bus.kind,
+            BusKindToml::ActuatorUart | BusKindToml::Pwm | BusKindToml::CyphalCan
+        ) {
             return Err(ValidateError::EffectorBusWrongKind {
                 effector: e.id.clone(),
                 bus: e.bus.clone(),
             });
         }
-        if !effector_channels.insert((e.bus.as_str(), e.channel)) {
-            return Err(ValidateError::DuplicateEffectorChannel {
-                bus: e.bus.clone(),
-                channel: e.channel,
-            });
-        }
 
         let kind = effector_kind(&e.id, e)?;
         effector_finite_and_positive(&e.id, &kind)?;
-        let pwm = pwm_calibration(&e.id, &e.pwm)?;
+        let output = effector_output(&e.id, e, bus.kind)?;
+
+        // Channel uniqueness applies to serial outputs only; a Cyphal effector
+        // is addressed by subject, not channel (D-029).
+        if let EffectorOutput::Serial { channel, .. } = output
+            && !effector_channels.insert((e.bus.as_str(), channel))
+        {
+            return Err(ValidateError::DuplicateEffectorChannel {
+                bus: e.bus.clone(),
+                channel,
+            });
+        }
 
         let too_many = |_| ValidateError::TooMany {
             what: "effectors",
@@ -737,8 +825,7 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
                 id: EffectorId(i as u16),
                 name: fx("effector.id", &e.id)?,
                 bus: fx("effector.bus", &e.bus)?,
-                channel: e.channel,
-                pwm,
+                output,
             })
             .map_err(too_many)?;
         effector_configs
@@ -749,16 +836,36 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
             .map_err(too_many)?;
     }
 
-    // Channel contiguity, per output bus: channels must be exactly 0..n,
-    // no gaps. Positional on the wire ($CXOUT's fields are field i for
+    // A cyphal_can bus that carries effectors needs the conn node's own id to
+    // transmit from (D-029); the per-bus node-id uniqueness check above already
+    // covered it when present.
+    for bus in &m.buses {
+        if bus.kind == BusKindToml::CyphalCan
+            && bus.node_id.is_none()
+            && m.effectors.iter().any(|e| e.bus == bus.id)
+        {
+            return Err(ValidateError::BusNodeIdMissing {
+                bus: bus.id.clone(),
+            });
+        }
+    }
+
+    // Channel contiguity, per serial output bus: channels must be exactly
+    // 0..n, no gaps. Positional on the wire ($CXOUT's fields are field i for
     // channel i); graduates the hosted profile's boot check into a typed
-    // compile-time error.
+    // compile-time error. Cyphal effectors carry no channel, so they do not
+    // participate (D-029).
     let mut channels_by_bus: HashMap<&str, Vec<u16>> = HashMap::new();
     for e in &m.effectors {
-        channels_by_bus
-            .entry(e.bus.as_str())
-            .or_default()
-            .push(e.channel);
+        let is_serial = bus_by_id
+            .get(e.bus.as_str())
+            .is_some_and(|b| matches!(b.kind, BusKindToml::ActuatorUart | BusKindToml::Pwm));
+        if is_serial && let Some(channel) = e.channel {
+            channels_by_bus
+                .entry(e.bus.as_str())
+                .or_default()
+                .push(channel);
+        }
     }
     for (bus, mut channels) in channels_by_bus {
         channels.sort_unstable();
@@ -1033,6 +1140,18 @@ fn segments_intersect(p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], p4: [f64; 2]) ->
 }
 
 fn bus_entry(bus: &BusToml) -> Result<BusEntry, ValidateError> {
+    let node_id = match bus.node_id {
+        None => None,
+        Some(id) => {
+            if bus.kind != BusKindToml::CyphalCan {
+                return Err(ValidateError::BusNodeIdWrongKind {
+                    bus: bus.id.clone(),
+                });
+            }
+            cyphal_id(&bus.id, "node_id", id, NODE_ID_MAX as u16)?;
+            Some(id)
+        }
+    };
     let source_ip = match &bus.source_ip {
         None => None,
         Some(ip) => Some(
@@ -1079,7 +1198,23 @@ fn bus_entry(bus: &BusToml) -> Result<BusEntry, ValidateError> {
             Some(ChecksumToml::Required) | None => ChecksumMode::Required,
         },
         listen_only: bus.mode.is_some(),
+        node_id,
     })
+}
+
+/// A Cyphal node id or subject id must fit its wire range (D-029). The
+/// constants come from coxswain-cyphal, the single source of truth for the
+/// transport limits.
+fn cyphal_id(owner: &str, field: &'static str, value: u16, max: u16) -> Result<(), ValidateError> {
+    if value > max {
+        return Err(ValidateError::CyphalIdRange {
+            owner: owner.to_string(),
+            field,
+            value,
+            max,
+        });
+    }
+    Ok(())
 }
 
 fn role(r: RoleToml) -> SensorRole {
@@ -1163,6 +1298,13 @@ fn sensor_entry(
         LicenseToml::Enrichment => License::Enrichment,
     };
 
+    let subject = match s.subject {
+        None => None,
+        Some(id) => {
+            cyphal_id(&s.id, "subject", id, SUBJECT_ID_MAX)?;
+            Some(id)
+        }
+    };
     let entry = SensorEntry {
         id,
         name: fx("sensor.id", &s.id)?,
@@ -1171,6 +1313,7 @@ fn sensor_entry(
         bus: fx("sensor.bus", &s.bus)?,
         license,
         node_id: s.node_id,
+        subject,
         pps: match &s.pps {
             Some(pps) => fx("sensor.pps", pps)?,
             None => FixedStr32::empty(),
@@ -1234,6 +1377,76 @@ fn effector_kind(id: &str, e: &EffectorToml) -> Result<EffectorKind, ValidateErr
             kind: "sail",
         }),
         other => Err(ValidateError::UnknownEffectorKind(other.to_string())),
+    }
+}
+
+/// Resolves an effector's output wiring by its bus kind (D-029): the serial
+/// arm (`actuator_uart`/`pwm`) takes `channel` + `[effector.pwm]`, the Cyphal
+/// arm (`cyphal_can`) takes `node_id` + the two subjects + `report_tolerance`.
+/// Each arm requires its own fields and rejects the other arm's, the same
+/// missing/unexpected discipline the geometry fields get. Called only for the
+/// output bus kinds; a non-output bus is rejected before this.
+fn effector_output(
+    id: &str,
+    e: &EffectorToml,
+    bus_kind: BusKindToml,
+) -> Result<EffectorOutput, ValidateError> {
+    let missing = |field: &'static str| ValidateError::EffectorFieldMissing {
+        effector: id.to_string(),
+        field,
+    };
+    let unexpected = |field: &'static str| ValidateError::EffectorFieldUnexpected {
+        effector: id.to_string(),
+        field,
+    };
+    match bus_kind {
+        BusKindToml::ActuatorUart | BusKindToml::Pwm => {
+            for (field, present) in [
+                ("node_id", e.node_id.is_some()),
+                ("command_subject", e.command_subject.is_some()),
+                ("feedback_subject", e.feedback_subject.is_some()),
+                ("report_tolerance", e.report_tolerance.is_some()),
+            ] {
+                if present {
+                    return Err(unexpected(field));
+                }
+            }
+            let channel = e.channel.ok_or_else(|| missing("channel"))?;
+            let pwm = pwm_calibration(id, e.pwm.as_ref().ok_or_else(|| missing("pwm"))?)?;
+            Ok(EffectorOutput::Serial { channel, pwm })
+        }
+        BusKindToml::CyphalCan => {
+            for (field, present) in [("channel", e.channel.is_some()), ("pwm", e.pwm.is_some())] {
+                if present {
+                    return Err(unexpected(field));
+                }
+            }
+            let node_id = e.node_id.ok_or_else(|| missing("node_id"))?;
+            let command_subject = e
+                .command_subject
+                .ok_or_else(|| missing("command_subject"))?;
+            let feedback_subject = e
+                .feedback_subject
+                .ok_or_else(|| missing("feedback_subject"))?;
+            let report_tolerance = e
+                .report_tolerance
+                .ok_or_else(|| missing("report_tolerance"))?;
+            cyphal_id(id, "node_id", node_id, NODE_ID_MAX as u16)?;
+            cyphal_id(id, "command_subject", command_subject, SUBJECT_ID_MAX)?;
+            cyphal_id(id, "feedback_subject", feedback_subject, SUBJECT_ID_MAX)?;
+            if !(report_tolerance.is_finite() && report_tolerance > 0.0) {
+                return Err(ValidateError::EffectorToleranceNotPositive {
+                    effector: id.to_string(),
+                });
+            }
+            Ok(EffectorOutput::Cyphal {
+                node_id,
+                command_subject,
+                feedback_subject,
+                report_tolerance,
+            })
+        }
+        _ => unreachable!("effector_output called only for output bus kinds"),
     }
 }
 

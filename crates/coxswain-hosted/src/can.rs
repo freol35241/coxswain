@@ -12,13 +12,14 @@
 //! shape as serial.rs's raw termios calls. One syscall family is not worth
 //! a dependency (CLAUDE.md "smallest approach that works").
 //!
-//! Listen-only by construction (D-011: N2K transmit is a scoped later
-//! feature): this module has no `write`/`send` path onto the socket at
-//! all, and `CAN_RAW_RECV_OWN_MSGS` is explicitly disabled at bind time.
-//! Linux defaults that option off already (nothing is ever sent on this
-//! socket to loop back), so the call is defense in depth: a readable
-//! assertion of intent that survives even if a future change adds a write
-//! path here by mistake.
+//! Two bus roles share this transport (D-011). The N2K instrument bus is
+//! listen-only: it is opened and read, never written, N2K transmit being a
+//! scoped later feature. The Cyphal control bus is D-011's transmit-allowed
+//! exception: the conn node commands its actuator nodes over it, so it uses
+//! `write_frame` to send. `CAN_RAW_RECV_OWN_MSGS` is disabled at bind time for
+//! both, which the N2K path never needs (nothing is sent to loop back) and the
+//! Cyphal path relies on: the reader must not see the conn node's own command
+//! frames echoed back as if they were reports.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -95,9 +96,10 @@ fn if_index(fd: libc::c_int, iface: &str) -> io::Result<libc::c_int> {
     Ok(unsafe { ifr.ifr_ifru.ifru_ifindex })
 }
 
-/// Opens `iface` (e.g. "can0", "vcan0") as a listen-only raw CAN socket:
-/// resolves the interface index, disables `CAN_RAW_RECV_OWN_MSGS` (module
-/// doc comment), and binds. Never writes to the returned `File`.
+/// Opens `iface` (e.g. "can0", "vcan0") as a raw CAN socket: resolves the
+/// interface index, disables `CAN_RAW_RECV_OWN_MSGS` (module doc comment), and
+/// binds. The N2K path only reads the returned `File`; the Cyphal control bus
+/// also transmits on it via `write_frame`.
 pub fn open_can(iface: &str) -> io::Result<File> {
     // SAFETY: no preconditions; a plain syscall with no pointer arguments.
     let fd = unsafe { libc::socket(libc::AF_CAN, libc::SOCK_RAW, libc::CAN_RAW) };
@@ -182,6 +184,25 @@ pub fn spawn_reader(mut port: File, boot: Instant) -> Receiver<(RawFrame, Timest
         }
     });
     rx
+}
+
+/// Writes one wire-format `struct can_frame` to a bound CAN socket (D-011's
+/// Cyphal control bus, module doc comment). `data` is the frame payload, up to
+/// 8 bytes; shorter payloads set `can_dlc` and leave the remaining bytes zero,
+/// as every classic CAN frame does. `can_id` is the extended (29-bit)
+/// identifier with its EFF flag already set by the caller (coxswain-cyphal's
+/// encoder does this). A partial write never happens for a `SOCK_RAW` CAN
+/// socket: the kernel takes one whole frame per `write` or none.
+pub fn write_frame(mut port: &File, can_id: u32, data: &[u8]) -> io::Result<()> {
+    debug_assert!(
+        data.len() <= 8,
+        "a classic CAN frame carries at most 8 bytes"
+    );
+    let mut buf = [0u8; CAN_FRAME_LEN];
+    buf[0..4].copy_from_slice(&can_id.to_le_bytes());
+    buf[4] = data.len() as u8;
+    buf[8..8 + data.len()].copy_from_slice(data);
+    io::Write::write_all(&mut port, &buf)
 }
 
 #[cfg(test)]

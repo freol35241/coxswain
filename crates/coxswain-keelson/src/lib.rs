@@ -15,8 +15,8 @@ pub mod keys;
 pub mod proto;
 mod vessel;
 
-pub use claimant::{ClaimantClient, StateUpdate};
+pub use claimant::{ClaimantClient, HealthUpdate, StateUpdate};
 pub use convert::{ned_cov_to_enu, setpoint_from_proto, setpoint_to_proto};
 pub use error::Error;
 pub use proto::coxswain::conn_reply::Result as ConnReplyResult;
-pub use vessel::{ConnEvent, Event, ReplyHandle, VesselEndpoint};
+pub use vessel::{ConnEvent, Event, PowerHealth, ReplyHandle, VesselEndpoint};
