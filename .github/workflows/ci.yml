@@ -17,8 +17,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # Installs the pinned zenohd the integration tests spawn (idempotent;
-      # runners have passwordless sudo). Same provisioning as the devcontainer.
+      # crates/coxswain-xprofile-target (the thumbv7em QEMU harness binary)
+      # is deliberately excluded from the root workspace (see its Cargo.toml
+      # comment), so the two checks above never touch it; check it here.
+      # RUSTFLAGS="" overrides the root .cargo/config.toml's staged
+      # `linker = "flip-link"` (unavailable here; the crate's build.rs
+      # supplies the one link arg it needs directly).
+      - run: cargo fmt --check
+        working-directory: crates/coxswain-xprofile-target
+      - run: RUSTFLAGS="" cargo clippy --target thumbv7em-none-eabihf --bins -- -D warnings
+        working-directory: crates/coxswain-xprofile-target
+      # Installs the pinned zenohd the integration tests spawn, and (new)
+      # qemu-system-arm, which lets coxswain-xprofile-check's tests/
+      # xprofile.rs actually execute CLAUDE.md invariant 5 under `cargo test
+      # --workspace` below instead of skipping (idempotent; runners have
+      # passwordless sudo). Same provisioning as the devcontainer.
       - run: bash .devcontainer/postCreate.sh
       # Best-effort: enables coxswain-hosted/tests/can_rig.rs's vcan
       # end-to-end path. This runner has /lib/modules, unlike the

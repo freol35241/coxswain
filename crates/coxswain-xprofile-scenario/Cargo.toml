@@ -1,0 +1,24 @@
+# Cross-profile check harness (CLAUDE.md invariant 5): the fixed deterministic
+# scenario that both the host test and the thumbv7em target binary run,
+# linking the real estimator/guidance/supervisor crates. Not a core crate:
+# excluded from the no_std gate's `-p` list in ci.yml, but still no_std itself
+# so it builds for both profiles unmodified.
+#
+# Dependency justifications:
+# - libm: no_std scalar trig/log for the truth trajectory and RNG, same
+#   choice every other core crate makes.
+
+[package]
+name = "coxswain-xprofile-scenario"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+coxswain-contract = { path = "../coxswain-contract" }
+coxswain-model = { path = "../coxswain-model" }
+coxswain-estimator = { path = "../coxswain-estimator" }
+coxswain-guidance = { path = "../coxswain-guidance" }
+coxswain-supervisor = { path = "../coxswain-supervisor" }
+libm = "0.2"

@@ -1,0 +1,39 @@
+# Thumbv7em-none-eabihf target binaries for the cross-profile check
+# (CLAUDE.md invariant 5). Deliberately excluded from the root workspace (see
+# the root Cargo.toml comment): this crate needs cortex-m-rt's linker script
+# and a memory.x tuned for QEMU's mps2-an500 machine, neither of which make
+# sense for a host build, and its dependencies must never enter the root
+# Cargo.lock. Built and run only by coxswain-xprofile-check's host test, via
+# `cargo build --manifest-path` + `qemu-system-arm`.
+#
+# Dependency justifications (harness-only, never a core-crate dependency):
+# - cortex-m, cortex-m-rt: minimal reset/vector-table runtime so the linked
+#   ELF is a real target executable, not a link-time-only rlib.
+# - cortex-m-semihosting: stdout for the digest, the standard QEMU debug
+#   channel for Cortex-M with no UART wired up.
+# - panic-semihosting (feature "exit"): panic = a printed message plus a
+#   nonzero QEMU exit code, so a target-side panic (e.g. the blob.rs
+#   overflow check) is visible to the host test as a process exit status,
+#   not a hang.
+[package]
+name = "coxswain-xprofile-target"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+coxswain-xprofile-scenario = { path = "../coxswain-xprofile-scenario" }
+coxswain-manifest = { path = "../coxswain-manifest" }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+cortex-m-semihosting = "0.5"
+panic-semihosting = { version = "0.6", features = ["exit"] }
+
+[profile.dev]
+# Debug overflow checks are the point of the blob_overflow_check binary;
+# never let a profile default silently disable them.
+overflow-checks = true
+
+[profile.release]
+overflow-checks = true

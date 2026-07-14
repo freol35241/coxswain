@@ -3,5 +3,10 @@
 /target
 **/*.rs.bk
 
+# crates/coxswain-xprofile-target is excluded from the root workspace (its
+# own Cargo.lock, see its Cargo.toml), so `/target` above does not cover its
+# build output; it gets its own target dir at build time.
+crates/coxswain-xprofile-target/target/
+
 # Compiled manifest blobs are commissioning artifacts, not source.
 *.cxmanifest

@@ -17,7 +17,18 @@ members = [
     "crates/coxswain-keelson",
     "crates/coxswain-hosted",
     "crates/coxswain-replay",
+    "crates/coxswain-xprofile-scenario",
+    "crates/coxswain-xprofile-check",
 ]
+
+# crates/coxswain-xprofile-target is deliberately NOT a member: it is a
+# thumbv7em-only #![no_main] binary (cortex-m-rt + semihosting) built by
+# coxswain-xprofile-check's host test via an explicit `cargo build
+# --manifest-path`, never by `cargo build/test --workspace`. Excluding it (a)
+# keeps `cargo test --workspace` from ever trying to link an ARM-only binary
+# for the host target, and (b) keeps cortex-m/cortex-m-rt/panic-semihosting
+# out of the root Cargo.lock entirely.
+exclude = ["crates/coxswain-xprofile-target"]
 
 [workspace.package]
 version = "0.1.0"

@@ -73,9 +73,22 @@ pub fn read(blob: &[u8], public_key: &[u8; 32]) -> Result<CompiledManifest, Read
         return Err(ReadError::BadVersion(version));
     }
     let payload_len = u32::from_le_bytes([blob[6], blob[7], blob[8], blob[9]]) as usize;
-    let crc_at = HEADER_LEN + payload_len;
-    let sig_at = crc_at + CRC_LEN;
-    let total = sig_at + SIG_LEN;
+    // Checked, not plain `+`: payload_len is an attacker-controlled u32 off
+    // the wire. usize is 64-bit on the hosted profile (never overflows for
+    // any u32), but 32-bit on the H7/Embassy profile, where a maliciously
+    // large payload_len can push this framing arithmetic past usize::MAX.
+    // Any overflow here means the claimed length is already impossible for
+    // an actual blob to satisfy, so it folds into the same Truncated a
+    // merely-short buffer gets.
+    let Some(crc_at) = HEADER_LEN.checked_add(payload_len) else {
+        return Err(ReadError::Truncated);
+    };
+    let Some(sig_at) = crc_at.checked_add(CRC_LEN) else {
+        return Err(ReadError::Truncated);
+    };
+    let Some(total) = sig_at.checked_add(SIG_LEN) else {
+        return Err(ReadError::Truncated);
+    };
     if blob.len() < total {
         return Err(ReadError::Truncated);
     }

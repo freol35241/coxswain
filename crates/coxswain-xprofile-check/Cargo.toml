@@ -1,0 +1,15 @@
+# Host side of the cross-profile check (CLAUDE.md invariant 5): runs the
+# shared coxswain-xprofile-scenario on host, cross-builds and QEMU-runs
+# crates/coxswain-xprofile-target's thumbv7em binary, and compares. Host-only;
+# no dependency here ever needs to build for thumbv7em.
+[package]
+name = "coxswain-xprofile-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+coxswain-xprofile-scenario = { path = "../coxswain-xprofile-scenario" }

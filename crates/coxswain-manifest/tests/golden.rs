@@ -472,6 +472,25 @@ fn truncated_blob_is_rejected() {
     );
 }
 
+/// A crafted `payload_len` near `u32::MAX` must fail cleanly (`Truncated`),
+/// not panic: found via the thumbv7em cross-profile check
+/// (coxswain-xprofile-check), which runs `read` against this exact input on
+/// a real 32-bit `usize`, where the framing arithmetic (`HEADER_LEN +
+/// payload_len`, etc.) used to overflow before this file's `checked_add`
+/// fix. `usize` is 64-bit here, so this host test alone would never have
+/// caught the bug; it now guards the fix.
+#[test]
+fn huge_declared_payload_len_is_rejected_not_overflowed() {
+    let mut header = [0u8; 10];
+    header[0..4].copy_from_slice(b"CXMN");
+    header[4..6].copy_from_slice(&coxswain_manifest::SCHEMA_VERSION.to_le_bytes());
+    header[6..10].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+        coxswain_manifest::read(&header, &coxswain_manifest::public_key(&seed())),
+        Err(ReadError::Truncated)
+    );
+}
+
 #[test]
 fn wrong_magic_is_rejected() {
     let mut blob = example_blob();
