@@ -453,6 +453,52 @@ than mis-parsing. Blast radius: `toml_model.rs` and `compile.rs`, every golden
 and rejection fixture, the two example manifests, and the schema doc; the
 contract crate and the blob reader are untouched.
 
+## D-031: Sensor lever-arm compensation, GNSS-only and planar
+
+Status: accepted. The estimator has fused every sensor as if it sat at the
+model's reference point. A GNSS antenna mounted off that point does not measure
+the reference point's motion: its position leads or lags by a heading-dependent
+offset `R(psi)*r`, and its ground velocity carries a `omega x r` term that a
+yawing vessel shows even when the reference point is still. This settles that
+the estimator compensates for it, and how far.
+
+Scope, and why it is bounded. The correction is GNSS-only. Heading is
+orientation and invariant to translation; a yaw-rate gyro reads the same
+anywhere on a rigid body; no linear acceleration is fused, so there is no
+accelerometer lever-arm term. Only the GNSS position and GNSS SOG/COG paths
+change. It stays 3-DOF planar: with no roll or pitch in the model, antenna
+height does not project into horizontal position, so the offset carried and used
+is planar `[x, y]`, with `z` reserved for a future 6-DOF model.
+
+The frame the offset references. The math needs each sensor's offset relative to
+the model's reference point (where the Fossen coefficients are defined), not the
+`origin` label. The simulator plant and the estimator agree on that point by
+construction, so the closed loop is self-consistent without resolving what
+`origin` names. `origin` stays a commissioning concern (it tells the human where
+to measure offsets from) and stays deferred per D-022. This entry answers the
+part of D-022's frame question the estimator actually needed (a per-sensor
+planar offset), and does not force the `[geometry]` schema relocation.
+
+What moves. The contract `SensorConfig` grows one field, the planar body-frame
+offset (a D-023 change, small and exactly what the estimator needs). The
+manifest already authors `pos` (v0.7) and compiles a lever arm it then dropped;
+it now carries it through to `SensorConfig`, with no schema change and no
+`schema_version` bump. The simulator's GNSS sensor models emit at the antenna
+(`R(psi)*r` on position, `omega x r` on the body velocity feeding SOG/COG). The
+estimator's position and SOG/COG updates extend `h(x)` and the Jacobian with the
+offset terms; the position update gains a `psi` column, which retires the
+top-left-2x2 fast path in `update_position`/`update_position_cov`.
+
+Three calls settled with it: the offset is carried as planar `[f64; 2]` (honest
+to the 3-DOF math, `z` reserved); compensation is done properly in `h(x)/H`, not
+by pre-rotating the raw measurement, so cross-covariance is correct and an
+off-centre antenna's position contributes weak heading observability; and
+because that new `psi` column feeds a low-noise high-rate measurement into
+heading, the no-gyro / heading-only 1 Hz divergence case (diary 2026-07-10) is a
+required regression gate for the work, not an afterthought. Backward compatible
+by construction: offset `[0, 0]` makes every new term vanish, so existing replay
+and sim cases are unchanged.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest
