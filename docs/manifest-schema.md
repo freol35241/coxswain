@@ -241,14 +241,16 @@ priority = 100        # the hand controller outranks autonomy on request
 
 # ------------------------------------------------------------
 # Estimator: which model, which promoted sensors, in what config
-# The sensor list here must be a subset of sensors with license = "inner_loop".
+# Each list is an unordered subset of sensors with license = "inner_loop".
+# Every listed sensor is fused, inverse-variance weighted by its declared
+# std; order does not matter and a duplicate is rejected (D-032).
 # ------------------------------------------------------------
 
 [estimator]
 model   = "fossen_3dof"
 gnss    = ["gnss_main"]
 imu     = ["imu_main"]
-heading = ["mag_main", "gyro_retrofit"]   # fusion priority order; provisional, see open question 1
+heading = ["mag_main", "gyro_retrofit"]   # both fused, weighted by declared std (D-032)
 origin  = "midship_waterline"             # vessel body-frame origin convention
 
 # Parameters for the model named above. Inline, so the blob hash covers the
@@ -407,7 +409,8 @@ max_yaw_nm         = 60.0
   correctly-selected sub-table at parse time
 - Every referenced bus/port exists on the declared `conn_node.board` profile
   (a profile per D-016: the hosted profile and dev boards are legitimate values)
-- `estimator.*` references only `inner_loop` sensors
+- `estimator.*` references only `inner_loop` sensors of the fitting role, with no
+  sensor listed twice in a set (the sets are unordered, D-032)
 - `role = "ais"` implies `license = "enrichment"` (D-014)
 - `estimator.params` matches the shape selected by `estimator.model`
 - Geofence polygon is a closed, simple, non-degenerate ring
@@ -528,12 +531,22 @@ thruster, one on a rudder), mapping to the unchanged compiled `lever_arm_m` and
 5 -> 6. Relocating `[estimator].origin` into a dedicated frame section stays
 deferred (below), waiting on the estimator per D-022.
 
+**Settled since v0.7:** estimator fusion (D-032). The `gnss`/`heading`/`imu`
+lists are unordered `inner_loop` sets, every listed sensor fused and
+inverse-variance weighted by its declared std, order ignored and duplicates
+rejected; SOG/COG ride the `gnss` set. No blob or `schema_version` change, only
+the documented meaning and one validation rule. The per-vessel noise-parameter
+part stays open, below.
+
 ## Open questions for v0.8
 
-1. **Fusion priority vs weights.** `heading = [a, b]` as priority order is simple but
-   crude; explicit per-sensor noise parameters may belong in the manifest once the
-   estimator design firms up. Per D-022 this schema does not guess ahead of the
-   estimator, so it stays open until the estimator answers it.
+1. **Per-vessel noise parameters.** Process noise Q is fixed per-model in the
+   estimator and measurement noise R is the per-measurement declared std; neither
+   is authored per vessel. Whether the manifest should carry per-vessel Q or R
+   overrides waits on the system-identification campaign: without it there are no
+   meaningful values to author, and per D-022 the schema does not grow fields it
+   cannot populate. The fusion-policy half of the former question 1 is settled
+   (D-032, above).
 2. **Multiple GNSS / moving-baseline heading** (dual-antenna GNSS setups): needs a
    pairing concept between two sensor entries.
 3. **Signing key custody.** D-017 settles that the blob is signed and that firmware

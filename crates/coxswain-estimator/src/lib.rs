@@ -53,10 +53,10 @@ pub enum Rejection {
 
 /// The fused measurement roles, named for what is measured rather than the
 /// producing hardware (the yaw-rate gyro lives in the config's imu list).
-/// SOG and CourseOverGround ride the Gnss role: v1 licenses them off the
+/// SOG and CourseOverGround ride the Gnss role: they are licensed off the
 /// same `EstimatorConfig::gnss` list as position, on the premise that they
 /// come from the same physical receiver. A separate velocity fusion list is
-/// deliberately not added; open point, schema open question 1 (D-022).
+/// deliberately not added (D-032).
 #[derive(Clone, Copy)]
 enum Role {
     Gnss,
@@ -536,9 +536,8 @@ impl Estimator {
     }
 
     fn admit(&self, sensor: SensorId, role: Role) -> Result<(), Rejection> {
-        // The heading list's priority order is deliberately unused: every
-        // licensed heading sensor is fused, weighted by its reported std
-        // (schema open question 1).
+        // The fusion lists are unordered sets: every licensed sensor is fused,
+        // inverse-variance weighted by its reported std, order ignored (D-032).
         let list = match role {
             Role::Gnss => &self.gnss_list,
             Role::Heading => &self.heading_list,

@@ -115,6 +115,13 @@ pub enum ValidateError {
         list: &'static str,
         sensor: String,
     },
+    /// A sensor listed twice in one estimator fusion set. The sets are
+    /// unordered inner_loop licensing lists, inverse-variance weighted by
+    /// declared std (D-032), so a duplicate would double-count that sensor.
+    EstimatorSensorDuplicated {
+        list: &'static str,
+        sensor: String,
+    },
     /// role = "ais" caps at enrichment (D-014).
     AisMustBeEnrichment {
         sensor: String,
@@ -333,6 +340,9 @@ impl std::fmt::Display for ValidateError {
                     f,
                     "estimator.{list} references {sensor:?}, whose role does not fit"
                 )
+            }
+            Self::EstimatorSensorDuplicated { list, sensor } => {
+                write!(f, "estimator.{list} lists {sensor:?} more than once")
             }
             Self::AisMustBeEnrichment { sensor } => {
                 write!(
@@ -999,6 +1009,12 @@ fn id_list(
         }
         if !roles.contains(&sensor.role) {
             return Err(ValidateError::EstimatorSensorWrongRole {
+                list,
+                sensor: name.clone(),
+            });
+        }
+        if ids.contains(&SensorId(*index)) {
+            return Err(ValidateError::EstimatorSensorDuplicated {
                 list,
                 sensor: name.clone(),
             });

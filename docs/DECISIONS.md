@@ -499,6 +499,40 @@ required regression gate for the work, not an afterthought. Backward compatible
 by construction: offset `[0, 0]` makes every new term vanish, so existing replay
 and sim cases are unchanged.
 
+## D-032: Estimator fusion is unordered inverse-variance weighting, not a priority list
+
+Status: accepted. The manifest's `[estimator]` `gnss`/`heading`/`imu` lists read
+as priority orders (the example even labelled them "fusion priority order,
+provisional"), but the estimator never used order. This settles what it does and
+makes the schema say so. No blob-format change and no `schema_version` bump: the
+lists stay arrays of sensor ids, only their documented meaning and one validation
+rule change.
+
+The lists are unordered `inner_loop` licensing sets. Every licensed sensor in a
+set is fused as its measurements arrive, inverse-variance weighted by that
+measurement's declared std. There is no priority order and no failover: order is
+ignored, and a sensor's influence comes from its declared std and its
+staleness/health, not its position in the list. Inverse-variance weighting is the
+statistically correct combination for independent measurements and uses all the
+information, where a priority/failover scheme would discard some and need a
+hand-tuned switchover. Failover tiers remain a future extension if a vessel ever
+carries redundant sensors of very different quality; nothing needs them now. A
+duplicate id within a set is now rejected (`EstimatorSensorDuplicated`): a set
+has no repeats, and a repeat would double-count that sensor in the fusion.
+
+SOG and COG ride the `gnss` set, on the premise they come from the same physical
+receiver as position; no separate velocity fusion list is added until a vessel
+has an independent velocity source (a Doppler log is the case that would change
+this).
+
+Per-vessel noise parameters stay out of the manifest. Process noise Q is fixed
+per-model in the estimator; measurement noise R is the per-measurement declared
+std. Authoring per-vessel Q or R overrides needs the system-identification
+campaign (parked), and inventing schema fields that cannot be populated is the
+D-022 anti-pattern, so the schema deliberately does not grow noise fields now.
+This is the one part of the former open question that stays open, and it stays
+open for a stated reason rather than for lack of an estimator answer.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest

@@ -290,6 +290,19 @@ fn rejects_estimator_reference_to_unknown_sensor() {
     ));
 }
 
+// Rule 4b: a sensor listed twice in one estimator set (D-032).
+#[test]
+fn rejects_duplicate_sensor_in_estimator_list() {
+    let src = patched(
+        "heading = [\"mag_main\", \"gyro_retrofit\"]",
+        "heading = [\"mag_main\", \"mag_main\"]",
+    );
+    assert!(matches!(
+        expect_invalid(&src),
+        ValidateError::EstimatorSensorDuplicated { list: "heading", sensor } if sensor == "mag_main"
+    ));
+}
+
 // Rule 5: role = "ais" forces license = "enrichment" (D-014).
 #[test]
 fn rejects_inner_loop_ais() {
