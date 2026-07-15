@@ -2,7 +2,7 @@
 //! references, sensor statistics against their configuration, and the
 //! fault-injection hooks the Phase 4 failsafe matrix will drive.
 
-use std::f64::consts::FRAC_PI_2;
+use std::f64::consts::{FRAC_PI_2, PI};
 use std::time::Duration;
 
 use coxswain_allocation::achieved_tau;
@@ -483,4 +483,96 @@ fn gnss_quantization_lands_on_grid() {
             assert!((v - snapped).abs() < 1e-6, "{v} off the 0.5 m grid");
         }
     }
+}
+
+/// The load-bearing D-031 check: a bow antenna reads a ground speed even
+/// though the reference point is stationary, purely from the omega x r
+/// term. Reference-point velocity is zero (u = v = 0, so it stays exactly
+/// zero through the plant's Coriolis/damping terms); only the yaw rate
+/// decays over the sample window, and the window here is 1 us, far too
+/// short for that decay to matter at the asserted tolerance.
+#[test]
+fn velocity_sensor_reports_antenna_speed_under_pure_yaw() {
+    const VEL_ID: SensorId = SensorId(4);
+    let rx = 3.0;
+    let r = 0.4;
+    let mut sim = sim(1);
+    sim.set_truth(
+        0.7, // heading does not enter the SOG magnitude; arbitrary nonzero value
+        BodyVelocity {
+            surge_mps: 0.0,
+            sway_mps: 0.0,
+            yaw_rate_radps: r,
+        },
+    );
+    // Noise-free (std 0 for both SOG and COG) and a bow offset (ry = 0).
+    sim.add_velocity(
+        VEL_ID,
+        VelocityModel::new(1_000_000.0, 0.0, 0.0).with_offset([rx, 0.0]),
+    );
+    let stream = run(&mut sim, 1, Duration::from_micros(1));
+    let sog = stream
+        .iter()
+        .find_map(|m| match m.kind {
+            MeasurementKind::SpeedOverGround { sog_mps, .. } => Some(sog_mps),
+            _ => None,
+        })
+        .expect("expected a SOG measurement");
+    let expected = (r * rx).abs();
+    assert!(
+        (sog - expected).abs() < 1e-5,
+        "sog {sog} vs closed-form {expected}"
+    );
+}
+
+/// A bow/beam antenna offset traces a circle of radius |offset| about the
+/// reference point as heading sweeps, with the reference point held fixed
+/// (nu = 0, so eta does not evolve between samples).
+#[test]
+fn gnss_antenna_offset_traces_circle_about_reference_point() {
+    let rx = 4.0;
+    let mut sim = sim(3);
+    sim.add_gnss(GNSS_ID, GnssModel::new(10.0, 0.0).with_offset([rx, 0.0]));
+    let frame = LocalFrame::new(origin());
+    for psi in [0.0, FRAC_PI_2, PI, 3.0 * FRAC_PI_2, 0.37] {
+        sim.set_truth(
+            psi,
+            BodyVelocity {
+                surge_mps: 0.0,
+                sway_mps: 0.0,
+                yaw_rate_radps: 0.0,
+            },
+        );
+        let fixes = run(&mut sim, 1, Duration::from_millis(100));
+        assert_eq!(fixes.len(), 1);
+        let (n, e) = local(&fixes[0], &frame);
+        let range = n.hypot(e);
+        assert!(
+            (range - rx.abs()).abs() < 1e-6,
+            "psi {psi}: range {range} vs offset {rx}"
+        );
+    }
+}
+
+/// Backward compat (D-031): a zero offset (the default) reproduces the
+/// reference-point emit exactly, heading and displaced position included.
+#[test]
+fn gnss_zero_offset_reproduces_reference_point_position() {
+    let mut sim = sim(5);
+    sim.displace(120.0, -40.0);
+    sim.set_truth(
+        0.9,
+        BodyVelocity {
+            surge_mps: 0.0,
+            sway_mps: 0.0,
+            yaw_rate_radps: 0.0,
+        },
+    );
+    sim.add_gnss(GNSS_ID, GnssModel::new(10.0, 0.0));
+    let fixes = run(&mut sim, 1, Duration::from_millis(100));
+    assert_eq!(fixes.len(), 1);
+    let frame = LocalFrame::new(origin());
+    let (n, e) = local(&fixes[0], &frame);
+    assert!((n - 120.0).abs() < 1e-6, "n {n}");
+    assert!((e - (-40.0)).abs() < 1e-6, "e {e}");
 }

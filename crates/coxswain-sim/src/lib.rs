@@ -48,6 +48,10 @@ pub struct GnssModel {
     pub latency: Duration,
     /// Grid step in local meters, applied per axis after noise and bias.
     pub quantization_m: Option<f64>,
+    /// Antenna position relative to the model's reference point, body-frame
+    /// planar `[rx, ry]` meters (D-031). Zero by default, which reproduces
+    /// the reference-point emit exactly.
+    pub offset_m: [f64; 2],
 }
 
 impl GnssModel {
@@ -58,7 +62,14 @@ impl GnssModel {
             bias_m: 0.0,
             latency: Duration::ZERO,
             quantization_m: None,
+            offset_m: [0.0, 0.0],
         }
+    }
+
+    /// Set the antenna's body-frame planar offset from the reference point.
+    pub fn with_offset(mut self, offset_m: [f64; 2]) -> Self {
+        self.offset_m = offset_m;
+        self
     }
 }
 
@@ -128,6 +139,10 @@ pub struct VelocityModel {
     pub std_cog_rad: f64,
     pub bias_sog_mps: f64,
     pub latency: Duration,
+    /// Antenna position relative to the model's reference point, body-frame
+    /// planar `[rx, ry]` meters (D-031). Zero by default, which reproduces
+    /// the reference-point emit exactly.
+    pub offset_m: [f64; 2],
 }
 
 impl VelocityModel {
@@ -138,7 +153,14 @@ impl VelocityModel {
             std_cog_rad,
             bias_sog_mps: 0.0,
             latency: Duration::ZERO,
+            offset_m: [0.0, 0.0],
         }
+    }
+
+    /// Set the antenna's body-frame planar offset from the reference point.
+    pub fn with_offset(mut self, offset_m: [f64; 2]) -> Self {
+        self.offset_m = offset_m;
+        self
     }
 }
 
@@ -153,6 +175,10 @@ pub struct GnssCovModel {
     pub fix: GnssFixMode,
     pub bias_m: f64,
     pub latency: Duration,
+    /// Antenna position relative to the model's reference point, body-frame
+    /// planar `[rx, ry]` meters (D-031). Zero by default, which reproduces
+    /// the reference-point emit exactly.
+    pub offset_m: [f64; 2],
 }
 
 impl GnssCovModel {
@@ -165,21 +191,32 @@ impl GnssCovModel {
             fix,
             bias_m: 0.0,
             latency: Duration::ZERO,
+            offset_m: [0.0, 0.0],
         }
+    }
+
+    /// Set the antenna's body-frame planar offset from the reference point.
+    pub fn with_offset(mut self, offset_m: [f64; 2]) -> Self {
+        self.offset_m = offset_m;
+        self
     }
 }
 
 #[derive(Copy, Clone, Debug)]
 enum SensorKind {
-    Gnss,
+    Gnss {
+        offset_m: [f64; 2],
+    },
     Heading,
     YawRate,
     Velocity {
         std_cog_rad: f64,
+        offset_m: [f64; 2],
     },
     GnssCov {
         cov_ne_m2: [[f64; 2]; 2],
         fix: GnssFixMode,
+        offset_m: [f64; 2],
     },
 }
 
@@ -257,7 +294,9 @@ impl Simulator {
     pub fn add_gnss(&mut self, id: SensorId, model: GnssModel) {
         self.add_sensor(
             id,
-            SensorKind::Gnss,
+            SensorKind::Gnss {
+                offset_m: model.offset_m,
+            },
             model.rate_hz,
             model.std_m,
             model.bias_m,
@@ -299,6 +338,7 @@ impl Simulator {
             id,
             SensorKind::Velocity {
                 std_cog_rad: model.std_cog_rad,
+                offset_m: model.offset_m,
             },
             model.rate_hz,
             model.std_sog_mps,
@@ -317,6 +357,7 @@ impl Simulator {
             SensorKind::GnssCov {
                 cov_ne_m2: model.cov_ne_m2,
                 fix: model.fix,
+                offset_m: model.offset_m,
             },
             model.rate_hz,
             0.0,
@@ -541,15 +582,10 @@ impl Simulator {
             ));
         };
         match s.kind {
-            SensorKind::Gnss => {
-                let n = quantize(
-                    self.eta[0] + s.bias + self.rng.gaussian(s.std),
-                    s.quantization,
-                );
-                let e = quantize(
-                    self.eta[1] + s.bias + self.rng.gaussian(s.std),
-                    s.quantization,
-                );
+            SensorKind::Gnss { offset_m } => {
+                let (an, ae) = antenna_position(self.eta, offset_m);
+                let n = quantize(an + s.bias + self.rng.gaussian(s.std), s.quantization);
+                let e = quantize(ae + s.bias + self.rng.gaussian(s.std), s.quantization);
                 let kind = MeasurementKind::GnssPosition {
                     position: self.frame.to_geo(n, e),
                     std_m: s.std,
@@ -576,10 +612,20 @@ impl Simulator {
                 };
                 emit(self, kind);
             }
-            SensorKind::Velocity { std_cog_rad } => {
-                // Rotating body velocity into NED does not change its
-                // magnitude, so truth SOG is just the body-frame norm.
-                let sog_truth = self.nu[0].hypot(self.nu[1]);
+            SensorKind::Velocity {
+                std_cog_rad,
+                offset_m,
+            } => {
+                // Antenna body velocity carries an omega x r term: a yawing
+                // vessel shows the antenna moving even when the reference
+                // point (u, v) is still. Rotating into NED does not change
+                // magnitude, so truth SOG is just the antenna's body-frame
+                // norm.
+                let (rx, ry) = (offset_m[0], offset_m[1]);
+                let (u, v, r) = (self.nu[0], self.nu[1], self.nu[2]);
+                let ua = u - r * ry;
+                let va = v + r * rx;
+                let sog_truth = ua.hypot(va);
                 let sampled_sog = (sog_truth + s.bias + self.rng.gaussian(s.std)).max(0.0);
                 emit(
                     self,
@@ -591,7 +637,7 @@ impl Simulator {
                 // Gated on the *sampled* SOG, not truth: a real receiver
                 // decides from its own reported speed.
                 if sampled_sog >= COG_MIN_SPEED_MPS {
-                    let cog_truth = wrap_pi(self.eta[2] + self.nu[1].atan2(self.nu[0]));
+                    let cog_truth = wrap_pi(self.eta[2] + va.atan2(ua));
                     let cog = wrap_pi(cog_truth + self.rng.gaussian(std_cog_rad));
                     emit(
                         self,
@@ -602,11 +648,16 @@ impl Simulator {
                     );
                 }
             }
-            SensorKind::GnssCov { cov_ne_m2, fix } => {
+            SensorKind::GnssCov {
+                cov_ne_m2,
+                fix,
+                offset_m,
+            } => {
+                let (an, ae) = antenna_position(self.eta, offset_m);
                 let std_n = cov_ne_m2[0][0].sqrt();
                 let std_e = cov_ne_m2[1][1].sqrt();
-                let n = self.eta[0] + s.bias + self.rng.gaussian(std_n);
-                let e = self.eta[1] + s.bias + self.rng.gaussian(std_e);
+                let n = an + s.bias + self.rng.gaussian(std_n);
+                let e = ae + s.bias + self.rng.gaussian(std_e);
                 emit(
                     self,
                     MeasurementKind::GnssPositionCov {
@@ -618,6 +669,18 @@ impl Simulator {
             }
         }
     }
+}
+
+/// Antenna position in the local frame, given truth pose `eta = [n, e, psi]`
+/// and a body-frame planar offset `[rx, ry]` from the reference point
+/// (D-031): `R(psi) * offset` added to the reference position.
+fn antenna_position(eta: Vector3<f64>, offset_m: [f64; 2]) -> (f64, f64) {
+    let (rx, ry) = (offset_m[0], offset_m[1]);
+    let psi = eta[2];
+    let (sin_psi, cos_psi) = psi.sin_cos();
+    let an = eta[0] + cos_psi * rx - sin_psi * ry;
+    let ae = eta[1] + sin_psi * rx + cos_psi * ry;
+    (an, ae)
 }
 
 fn quantize(value: f64, step: Option<f64>) -> f64 {
