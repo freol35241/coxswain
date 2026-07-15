@@ -203,6 +203,10 @@ impl Estimator {
             }
         }
 
+        // Computed up front: a method call borrows all of self, which would
+        // conflict with the `&mut self.filter` match below (disjoint field
+        // borrows only work for direct field accesses).
+        let lever_arm = self.lever_arm(m.sensor);
         match &mut self.filter {
             Some(filter) => {
                 filter.ekf.predict(
@@ -215,7 +219,7 @@ impl Estimator {
                     MeasurementKind::GnssPosition { position, std_m } => {
                         // The frame exists whenever the filter does.
                         let (n, e) = self.frame.as_ref().unwrap().to_local(position);
-                        filter.ekf.update_position(n, e, std_m);
+                        filter.ekf.update_position(n, e, std_m, lever_arm);
                     }
                     MeasurementKind::GnssPositionCov {
                         position,
@@ -223,7 +227,7 @@ impl Estimator {
                         ..
                     } => {
                         let (n, e) = self.frame.as_ref().unwrap().to_local(position);
-                        filter.ekf.update_position_cov(n, e, cov_ne_m2);
+                        filter.ekf.update_position_cov(n, e, cov_ne_m2, lever_arm);
                     }
                     MeasurementKind::Heading {
                         heading_rad,
@@ -498,6 +502,17 @@ impl Estimator {
         let filter = self.filter.as_mut().expect("call after init");
         filter.ekf.x[3] = u;
         filter.ekf.x[4] = v;
+    }
+
+    /// The sensor's declared planar antenna offset (D-031), `[0, 0]` if not
+    /// found; defensive only, `handle` reaches this after `admit` has
+    /// already confirmed the sensor is in `self.sensors`.
+    fn lever_arm(&self, sensor: SensorId) -> [f64; 2] {
+        self.sensors
+            .iter()
+            .find(|s| s.id == sensor)
+            .map(|s| s.lever_arm_m)
+            .unwrap_or([0.0, 0.0])
     }
 
     fn admit(&self, sensor: SensorId, role: Role) -> Result<(), Rejection> {

@@ -1021,3 +1021,165 @@ fn compass_loss_with_cog_stays_finite_and_bounded() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Lever-arm compensation (D-031, increment 3): GNSS position couples through
+// the antenna offset, not the reference point.
+
+// A bow-mounted antenna, 3 m forward of the reference point.
+const LEVER_ARM_M: [f64; 2] = [3.0, 0.0];
+
+/// A sustained turn so `R(psi) * offset` sweeps through more than a full
+/// revolution; truth always carries the real antenna offset via
+/// `sample_gnss_with_offset`, only what the estimator is *told* varies
+/// between the two runs in `lever_arm_compensation_case`.
+fn lever_arm_streams() -> (Trajectory, Vec<Measurement>) {
+    let traj = Trajectory::turn(origin(), deg(0.0), 2.0, deg(4.0), 150.0);
+    let mut rng = Rng::new(31);
+    let ms = merge(vec![
+        sample_gnss_with_offset(&traj, (0.0, 150.0), 1.0, 2.0, LEVER_ARM_M, &mut rng),
+        sample_heading(
+            &traj,
+            HEADING_ID,
+            (0.0, 150.0),
+            5.0,
+            deg(1.0),
+            0.0,
+            &mut rng,
+        ),
+        sample_yaw_rate(&traj, (0.0, 150.0), 20.0, 0.01, &mut rng),
+    ]);
+    (traj, ms)
+}
+
+// Scenario 12: the "prove it matters" case. Same measurement stream fed to
+// two estimators that differ only in the declared `lever_arm_m`: told the
+// true offset, the filter must recover the reference point's pose (same
+// accuracy class as the offset-free noisy-straight scenario); told [0, 0]
+// (pre-D-031 behavior), the swept `R(psi) r` term must show up as a position
+// bias on the order of the offset magnitude. Both must hold for the
+// compensation to be shown necessary (b regresses) and sufficient (a
+// recovers).
+fn lever_arm_compensation_case(variant: Variant) {
+    let (traj, ms) = lever_arm_streams();
+    let commands = variant.commands(&traj, 150.0);
+
+    let mut est_compensated = Estimator::new(&test_config_with_gnss_lever_arm(
+        variant.model(),
+        LEVER_ARM_M,
+    ));
+    let errs_compensated = run_probed(&mut est_compensated, &ms, &commands, &traj, 20.0, 150.0);
+
+    let mut est_uncompensated = Estimator::new(&test_config(variant.model()));
+    let errs_uncompensated = run_probed(&mut est_uncompensated, &ms, &commands, &traj, 20.0, 150.0);
+
+    let nees = mean(&errs_compensated.nees);
+    println!(
+        "lever-arm compensation [{}]: compensated pos RMSE {:.3} m (mean pos err {:.3} m, mean \
+         NEES {:.2}), uncompensated pos RMSE {:.3} m (mean pos err {:.3} m)",
+        variant.label(),
+        rmse(&errs_compensated.pos_m),
+        mean(&errs_compensated.pos_m),
+        nees,
+        rmse(&errs_uncompensated.pos_m),
+        mean(&errs_uncompensated.pos_m),
+    );
+
+    // (a) Told the true offset: same bound as the noisy-straight scenario
+    // (same per-axis GNSS/heading/gyro noise budget) and an honest NEES band
+    // (same reasoning as straight_line_noisy_case).
+    assert!(
+        rmse(&errs_compensated.pos_m) < 2.5,
+        "compensated pos RMSE {:.3} m exceeds the noisy-straight bound",
+        rmse(&errs_compensated.pos_m)
+    );
+    assert!(
+        (1.0..12.0).contains(&nees),
+        "compensated mean NEES {nees} outside [1, 12]"
+    );
+
+    // (b) Told [0, 0]: the reference-point position estimate must carry a
+    // bias on the order of the 3 m offset, and be markedly worse than the
+    // compensated run on the same stream.
+    assert!(
+        mean(&errs_uncompensated.pos_m) > 1.5,
+        "uncompensated mean pos err {:.3} m is not on the order of the {:.1} m offset",
+        mean(&errs_uncompensated.pos_m),
+        LEVER_ARM_M[0].hypot(LEVER_ARM_M[1])
+    );
+    // Measured ratio is ~1.7x (constant-velocity) to ~2.5x (hydrodynamic);
+    // 1.5x leaves margin below both while still catching a regression back
+    // toward "compensation does nothing".
+    assert!(
+        rmse(&errs_uncompensated.pos_m) > 1.5 * rmse(&errs_compensated.pos_m),
+        "uncompensated pos RMSE {:.3} m must be markedly worse than compensated {:.3} m",
+        rmse(&errs_uncompensated.pos_m),
+        rmse(&errs_compensated.pos_m)
+    );
+}
+
+#[test]
+fn lever_arm_compensation_recovers_pose_cv() {
+    lever_arm_compensation_case(Variant::ConstantVelocity);
+}
+
+#[test]
+fn lever_arm_compensation_recovers_pose_hydro() {
+    lever_arm_compensation_case(Variant::Hydrodynamic);
+}
+
+// Scenario 8's no-gyro, 1 Hz degraded-heading divergence case again, this
+// time with a nonzero antenna offset (D-031's required regression gate): the
+// new psi column in `update_position`/`update_position_cov` must not
+// reintroduce the diary/2026-07-10 divergence-to-NaN under the same degraded
+// conditions that caused it.
+#[test]
+fn no_gyro_degraded_heading_with_lever_arm_stays_finite() {
+    let traj = Trajectory::straight(origin(), deg(40.0), 3.0, 120.0);
+    let mut rng = Rng::new(2);
+    let ms = merge(vec![
+        sample_gnss_with_offset(&traj, (0.0, 120.0), 1.0, 2.0, LEVER_ARM_M, &mut rng),
+        sample_heading(
+            &traj,
+            HEADING_ID,
+            (0.0, 120.0),
+            1.0,
+            deg(1.0),
+            0.0,
+            &mut rng,
+        ),
+        // No yaw-rate stream: this is the condition that diverged.
+    ]);
+    let commands = sample_commands(&traj, (0.0, 120.0), COMMAND_RATE_HZ);
+    let mut est = Estimator::new(&test_config_with_gnss_lever_arm(
+        ModelParams::Fossen3Dof(example_fossen_params()),
+        LEVER_ARM_M,
+    ));
+    let errs = run_probed(&mut est, &ms, &commands, &traj, 20.0, 120.0);
+
+    println!(
+        "no-gyro degraded heading + lever arm [hydrodynamic]: pos RMSE {:.3} m, heading RMSE \
+         {:.3} deg",
+        rmse(&errs.pos_m),
+        rmse(&errs.psi_rad).to_degrees()
+    );
+    assert!(
+        errs.pos_m.iter().all(|v| v.is_finite()),
+        "position diverged"
+    );
+    assert!(
+        errs.psi_rad.iter().all(|v| v.is_finite()),
+        "heading diverged"
+    );
+    assert!(
+        errs.surge_mps.iter().all(|v| v.is_finite()),
+        "surge diverged"
+    );
+    // Same tripwire as scenario 8: not an accuracy claim, just proof the
+    // added psi coupling did not push this degraded case into instability.
+    assert!(
+        rmse(&errs.psi_rad) < deg(10.0),
+        "heading RMSE {:.3} deg exceeds the divergence tripwire",
+        rmse(&errs.psi_rad).to_degrees()
+    );
+}

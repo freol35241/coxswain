@@ -217,6 +217,39 @@ pub fn sample_gnss(
         .collect()
 }
 
+/// `sample_gnss` for an antenna mounted off the reference point (D-031):
+/// truth is the reference point's `n, e` displaced by `R(psi) * offset_m`
+/// before noise, same transform as coxswain-sim's `antenna_position`
+/// (reproduced here rather than imported: this harness is deliberately
+/// closed-form and does not depend on coxswain-sim's numerical plant).
+pub fn sample_gnss_with_offset(
+    traj: &Trajectory,
+    window: (f64, f64),
+    rate_hz: f64,
+    std_m: f64,
+    offset_m: [f64; 2],
+    rng: &mut Rng,
+) -> Vec<Measurement> {
+    let frame = traj.frame();
+    let (rx, ry) = (offset_m[0], offset_m[1]);
+    sample_times(window, rate_hz)
+        .map(|t| {
+            let truth = traj.truth_at(t);
+            let (n, e) = frame.to_local(truth.position);
+            let (s, c) = (truth.psi.sin(), truth.psi.cos());
+            let (an, ae) = (n + c * rx - s * ry, e + s * rx + c * ry);
+            Measurement {
+                sensor: GNSS_ID,
+                t: ts(t),
+                kind: MeasurementKind::GnssPosition {
+                    position: frame.to_geo(an + rng.gaussian(std_m), ae + rng.gaussian(std_m)),
+                    std_m,
+                },
+            }
+        })
+        .collect()
+}
+
 /// `bias_rad` models a miscalibrated stream (scenario: unlicensed sensor with
 /// a large bias); pass 0.0 for an honest sensor.
 pub fn sample_heading(
@@ -458,6 +491,26 @@ pub fn test_config(model: ModelParams) -> VesselConfig {
         },
         effectors: BoundedList::new(),
     }
+}
+
+/// `test_config` with the GNSS sensor's declared antenna offset (D-031) set
+/// to `lever_arm_m` instead of the default `[0, 0]`.
+pub fn test_config_with_gnss_lever_arm(model: ModelParams, lever_arm_m: [f64; 2]) -> VesselConfig {
+    let mut cfg = test_config(model);
+    let sensors: Vec<SensorConfig> = cfg
+        .sensors
+        .as_slice()
+        .iter()
+        .map(|s| {
+            let mut s = *s;
+            if s.id == GNSS_ID {
+                s.lever_arm_m = lever_arm_m;
+            }
+            s
+        })
+        .collect();
+    cfg.sensors = BoundedList::from_slice(&sensors).unwrap();
+    cfg
 }
 
 // ---------------------------------------------------------------------------

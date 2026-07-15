@@ -155,12 +155,30 @@ impl Ekf {
         self.p = f * self.p * f.transpose() + q;
     }
 
-    /// GNSS fix in the local frame. Sequential scalar updates are exact for
-    /// a linear measurement with diagonal R, and avoid the 2x2 inverse.
-    pub fn update_position(&mut self, n: f64, e: f64, std_m: f64) {
-        let r = std_m * std_m;
-        self.scalar_update(0, n - self.x[0], r);
-        self.scalar_update(1, e - self.x[1], r);
+    /// GNSS fix in the local frame, measured at the antenna rather than the
+    /// model's reference point. `lever_arm_m` is the sensor's planar
+    /// body-frame offset `[rx, ry]` from that reference point (D-031):
+    /// h_n(x) = n + cos(psi) rx - sin(psi) ry, h_e(x) = e + sin(psi) rx +
+    /// cos(psi) ry. At `[0, 0]` every psi term below vanishes and this
+    /// reduces exactly to the pre-D-031 direct-index update. Sequential
+    /// scalar updates stay exact for a linear-at-the-linearization-point
+    /// measurement with diagonal R; each axis's Jacobian is evaluated at the
+    /// filter's current psi, so the second (e) update sees the small psi
+    /// correction the first (n) update already applied, same as any EKF
+    /// sequential scalar update.
+    pub fn update_position(&mut self, n: f64, e: f64, std_m: f64, lever_arm_m: [f64; 2]) {
+        let var = std_m * std_m;
+        let (rx, ry) = (lever_arm_m[0], lever_arm_m[1]);
+
+        let psi = self.x[2];
+        let (s, c) = (libm::sin(psi), libm::cos(psi));
+        let h = StateVec::from([1.0, 0.0, -s * rx - c * ry, 0.0, 0.0, 0.0]);
+        self.scalar_update_h(&h, n - (self.x[0] + c * rx - s * ry), var);
+
+        let psi = self.x[2]; // refreshed by the n-axis correction above
+        let (s, c) = (libm::sin(psi), libm::cos(psi));
+        let h = StateVec::from([0.0, 1.0, c * rx - s * ry, 0.0, 0.0, 0.0]);
+        self.scalar_update_h(&h, e - (self.x[1] + s * rx + c * ry), var);
     }
 
     pub fn update_heading(&mut self, psi: f64, std_rad: f64) {
@@ -174,18 +192,38 @@ impl Ekf {
         self.scalar_update(5, r_radps - self.x[5], std_radps * std_radps);
     }
 
-    /// GNSS fix with a full 2x2 NE covariance (e.g. RTK), closed-form 2D
-    /// update on [n, e] rather than two sequential scalar updates: those
-    /// assume a diagonal R, which a real covariance need not be. H picks
-    /// state indices 0 and 1 directly, so H P H^T is P's top-left 2x2 block
-    /// and P H^T is just P's first two columns.
-    pub fn update_position_cov(&mut self, n: f64, e: f64, cov_ne_m2: [[f64; 2]; 2]) {
-        let pn = self.p.column(0).into_owned();
-        let pe = self.p.column(1).into_owned();
-        let s00 = pn[0] + cov_ne_m2[0][0];
-        let s01 = pn[1] + cov_ne_m2[0][1];
-        let s10 = pe[0] + cov_ne_m2[1][0];
-        let s11 = pe[1] + cov_ne_m2[1][1];
+    /// GNSS fix with a full 2x2 NE covariance (e.g. RTK), closed-form 2-row
+    /// update rather than two sequential scalar updates: those assume a
+    /// diagonal R, which a real covariance need not be. `lever_arm_m` is the
+    /// antenna offset, same h(x)/H as `update_position`'s doc comment
+    /// (D-031). H's rows are no longer the standard basis vectors e_0, e_1
+    /// once the offset is nonzero, so H P H^T is no longer literally P's
+    /// top-left 2x2 block; but P symmetric still gives H P = [(P h_n)^T;
+    /// (P h_e)^T] (h_n^T P = (P^T h_n)^T = (P h_n)^T), so the closed-form
+    /// two-column K survives unchanged in shape, just built from P h_n/P h_e
+    /// instead of P's raw columns 0/1. At `lever_arm_m = [0, 0]`, h_n = e_0
+    /// and h_e = e_1 exactly, and this reduces to the pre-D-031 arithmetic.
+    pub fn update_position_cov(
+        &mut self,
+        n: f64,
+        e: f64,
+        cov_ne_m2: [[f64; 2]; 2],
+        lever_arm_m: [f64; 2],
+    ) {
+        let (rx, ry) = (lever_arm_m[0], lever_arm_m[1]);
+        let psi = self.x[2];
+        let (s, c) = (libm::sin(psi), libm::cos(psi));
+        let h_n = StateVec::from([1.0, 0.0, -s * rx - c * ry, 0.0, 0.0, 0.0]);
+        let h_e = StateVec::from([0.0, 1.0, c * rx - s * ry, 0.0, 0.0, 0.0]);
+        let y0 = n - (self.x[0] + c * rx - s * ry);
+        let y1 = e - (self.x[1] + s * rx + c * ry);
+
+        let p_hn = self.p * h_n; // P h_n^T
+        let p_he = self.p * h_e; // P h_e^T
+        let s00 = h_n.dot(&p_hn) + cov_ne_m2[0][0];
+        let s01 = h_n.dot(&p_he) + cov_ne_m2[0][1];
+        let s10 = h_e.dot(&p_hn) + cov_ne_m2[1][0];
+        let s11 = h_e.dot(&p_he) + cov_ne_m2[1][1];
         let det = s00 * s11 - s01 * s10;
         // The declared covariance is validated positive-definite at intake
         // and P is positive-semidefinite by construction, so S = H P H^T + R
@@ -195,15 +233,14 @@ impl Ekf {
             return;
         }
         let (i00, i01, i10, i11) = (s11 / det, -s01 / det, -s10 / det, s00 / det);
-        let y0 = n - self.x[0];
-        let y1 = e - self.x[1];
-        // K = P H^T S^-1 = [pn | pe] S^-1, as two column vectors.
-        let k0 = pn * i00 + pe * i10;
-        let k1 = pn * i01 + pe * i11;
+        // K = P H^T S^-1 = [p_hn | p_he] S^-1, as two column vectors.
+        let k0 = p_hn * i00 + p_he * i10;
+        let k1 = p_hn * i01 + p_he * i11;
         self.x += k0 * y0 + k1 * y1;
         self.x[2] = wrap_angle(self.x[2]);
-        // P -= K H P; H P is [pn; pe] as rows (P symmetric, so column = row).
-        self.p -= k0 * pn.transpose() + k1 * pe.transpose();
+        // P -= K H P; H P is [p_hn; p_he] as rows (P symmetric, so H's row
+        // h_i contracted with P is (P h_i)^T).
+        self.p -= k0 * p_hn.transpose() + k1 * p_he.transpose();
         self.p = (self.p + self.p.transpose()) * 0.5;
     }
 
@@ -504,6 +541,52 @@ mod tests {
         }
     }
 
+    /// `update_position`/`update_position_cov`'s antenna-offset Jacobian
+    /// (D-031: h_n = n + cos(psi) rx - sin(psi) ry, h_e = e + sin(psi) rx +
+    /// cos(psi) ry) against a central finite difference in n and psi (h_n)
+    /// and e and psi (h_e), at a few non-trivial (psi, rx, ry) points. The
+    /// in-repo substitute for a symbolic (SymPy) Jacobian check. dh_n/de and
+    /// dh_e/dn are 0 by inspection (h_n/h_e each take only one of n, e), not
+    /// re-derived by finite difference here.
+    #[test]
+    fn position_offset_jacobian_matches_finite_difference() {
+        let h_n =
+            |n: f64, psi: f64, rx: f64, ry: f64| n + libm::cos(psi) * rx - libm::sin(psi) * ry;
+        let h_e =
+            |e: f64, psi: f64, rx: f64, ry: f64| e + libm::sin(psi) * rx + libm::cos(psi) * ry;
+        let cases = [
+            (0.3, 3.0, 0.0),
+            (1.2, 3.0, 1.5),
+            (-0.8, -2.0, 0.6),
+            (2.5, 0.0, -4.0),
+        ];
+        let eps = 1e-6;
+        for (psi, rx, ry) in cases {
+            let (s, c) = (libm::sin(psi), libm::cos(psi));
+            // Analytic Jacobian, per update_position's doc comment.
+            let dhn_dpsi = -s * rx - c * ry;
+            let dhe_dpsi = c * rx - s * ry;
+
+            let fd_hn_dn = (h_n(eps, psi, rx, ry) - h_n(-eps, psi, rx, ry)) / (2.0 * eps);
+            let fd_hn_dpsi =
+                (h_n(0.0, psi + eps, rx, ry) - h_n(0.0, psi - eps, rx, ry)) / (2.0 * eps);
+            let fd_he_de = (h_e(eps, psi, rx, ry) - h_e(-eps, psi, rx, ry)) / (2.0 * eps);
+            let fd_he_dpsi =
+                (h_e(0.0, psi + eps, rx, ry) - h_e(0.0, psi - eps, rx, ry)) / (2.0 * eps);
+
+            assert!(libm::fabs(1.0 - fd_hn_dn) < 1e-6, "dh_n/dn: fd {fd_hn_dn}");
+            assert!(
+                libm::fabs(dhn_dpsi - fd_hn_dpsi) < 1e-6,
+                "dh_n/dpsi at psi={psi}, r=({rx},{ry}): {dhn_dpsi} vs fd {fd_hn_dpsi}"
+            );
+            assert!(libm::fabs(1.0 - fd_he_de) < 1e-6, "dh_e/de: fd {fd_he_de}");
+            assert!(
+                libm::fabs(dhe_dpsi - fd_he_dpsi) < 1e-6,
+                "dh_e/dpsi at psi={psi}, r=({rx},{ry}): {dhe_dpsi} vs fd {fd_he_dpsi}"
+            );
+        }
+    }
+
     /// A SOG measurement above the floor must pull the surge estimate toward
     /// the measured speed.
     #[test]
@@ -553,8 +636,13 @@ mod tests {
         let mut cov = scalar;
         let std_m = 1.5;
 
-        scalar.update_position(3.0, -2.0, std_m);
-        cov.update_position_cov(3.0, -2.0, [[std_m * std_m, 0.0], [0.0, std_m * std_m]]);
+        scalar.update_position(3.0, -2.0, std_m, [0.0, 0.0]);
+        cov.update_position_cov(
+            3.0,
+            -2.0,
+            [[std_m * std_m, 0.0], [0.0, std_m * std_m]],
+            [0.0, 0.0],
+        );
 
         for i in 0..6 {
             assert!(libm::fabs(scalar.x[i] - cov.x[i]) < 1e-9, "x[{i}] mismatch");
@@ -575,8 +663,8 @@ mod tests {
         let mut diag = Ekf::init(0.0, 0.0, 5.0, 0.0, 0.1);
         let mut corr = diag;
 
-        diag.update_position_cov(4.0, 4.0, [[4.0, 0.0], [0.0, 4.0]]);
-        corr.update_position_cov(4.0, 4.0, [[4.0, 3.9], [3.9, 4.0]]);
+        diag.update_position_cov(4.0, 4.0, [[4.0, 0.0], [0.0, 4.0]], [0.0, 0.0]);
+        corr.update_position_cov(4.0, 4.0, [[4.0, 3.9], [3.9, 4.0]], [0.0, 0.0]);
 
         assert!(
             libm::fabs(diag.x[0] - corr.x[0]) > 1e-6 || libm::fabs(diag.x[1] - corr.x[1]) > 1e-6,
