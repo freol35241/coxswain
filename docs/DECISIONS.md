@@ -533,6 +533,37 @@ D-022 anti-pattern, so the schema deliberately does not grow noise fields now.
 This is the one part of the former open question that stays open, and it stays
 open for a stated reason rather than for lack of an estimator answer.
 
+## D-033: The body frame gets its own section; origin moves off the estimator (schema_version 6 -> 7)
+
+Status: accepted. `origin` (the named body-frame reference point, e.g.
+"midship_waterline") sat on `[estimator]` and was parsed and discarded. The
+estimator does not own the vessel's body frame: sensors, effectors, and the
+estimator all reference it. This moves the declaration to a dedicated
+`[geometry]` section that owns it, closing the Q6-origin relocation D-030
+deferred.
+
+Origin stays descriptive, not compiled. D-031 established that the control path
+needs each sensor's offset relative to the model reference point, not the origin
+label; the label only tells the commissioning engineer which physical point the
+Fossen model's reference point corresponds to, so offsets are measured from the
+right place. Nothing in firmware or the control loop reads it. So origin is
+metadata like `[manifest].author`/`date`: it stays out of the blob and out of the
+hash. Compiling an operationally inert value would be speculative and would put a
+label that changes no behavior into the audit hash. The axis convention (x fwd,
+y stbd, z down, WGS84) is fixed by D-023 and stays a documented invariant, not a
+per-manifest field, so `[geometry]` carries only `origin` today.
+
+The bump. schema_version 6 -> 7: the authored shape changes (origin leaves
+`[estimator]`, `[geometry]` appears), so the host tool rejects a v6 manifest
+against the v7 model cleanly rather than emitting an unknown-field parse error,
+the same doctrine as D-030. The blob layout does not move, since origin was never
+compiled; only the `schema_version` integer changes. Blast radius: `toml_model.rs`
+(the field moves to a new `GeometryToml`), the version const, every fixture's
+`schema_version` and the version-rejection tests, the hosted rigs' embedded
+manifests, and the schema doc. With D-031 this completes the frame story: the
+control path consumes per-sensor offsets, and the manifest declares the frame
+they are measured in.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest
