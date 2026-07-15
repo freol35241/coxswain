@@ -3,7 +3,7 @@
 # ============================================================
 
 [manifest]
-schema_version = 6          # firmware refuses unknown major versions
+schema_version = 7          # firmware refuses unknown major versions
 vessel_id      = "example-vessel-01"
 name           = "Example"
 revision       = 7          # monotonically increasing per vessel
@@ -18,6 +18,14 @@ date           = "2026-07-08"
 [conn_node]
 board          = "nucleo-h753zi"     # hardware profile, not necessarily fabricated hardware (D-016)
 watchdog_ms    = 250                 # hardware watchdog kick interval
+
+# ------------------------------------------------------------
+# Geometry: the body frame's named reference point (D-033). Descriptive
+# only, not compiled; axis convention (x fwd, y stbd, z down, WGS84) is
+# fixed and not authored here.
+# ------------------------------------------------------------
+[geometry]
+origin  = "midship_waterline"             # vessel body-frame origin convention
 
 # ------------------------------------------------------------
 # Buses: every sensor/actuator references one of these by id.
@@ -210,7 +218,6 @@ model   = "fossen_3dof"
 gnss    = ["gnss_main"]
 imu     = ["imu_main"]
 heading = ["mag_main", "gyro_retrofit"]   # fusion priority order; provisional, see open question 1
-origin  = "midship_waterline"             # vessel body-frame origin convention
 
 # Parameters for the model named above. Inline, so the blob hash covers the
 # physics and not just the wiring (D-018). Opaque to the schema: the reader

@@ -6,7 +6,7 @@
 # ============================================================
 
 [manifest]
-schema_version = 6
+schema_version = 7
 vessel_id      = "se-rise-rudderboat-01"
 name           = "Rudderboat"
 revision       = 1
@@ -16,6 +16,9 @@ date           = "2026-07-12"
 [conn_node]
 board          = "nucleo-h753zi"
 watchdog_ms    = 250
+
+[geometry]
+origin  = "midship_waterline"
 
 # ------------------------------------------------------------
 # Buses
@@ -147,7 +150,6 @@ priority = 100        # the hand controller outranks autonomy on request
 model   = "fossen_3dof"
 gnss    = ["gnss_main"]
 heading = ["heading_main"]
-origin  = "midship_waterline"
 
 [estimator.params]
 mass_kg   = 180.0

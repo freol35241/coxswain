@@ -46,7 +46,7 @@ fn example_compiles_and_roundtrips() {
     assert_eq!(manifest.vessel_id.as_str(), "example-vessel-01");
     assert_eq!(manifest.name.as_str(), "Example");
     assert_eq!(manifest.revision, 7);
-    assert_eq!(manifest.schema_version, 6);
+    assert_eq!(manifest.schema_version, 7);
     assert_eq!(manifest.buses.len(), 6);
     assert_eq!(manifest.sensors.len(), 7);
     assert_eq!(manifest.actuator_nodes.len(), 3);
@@ -466,14 +466,14 @@ fn rejects_inner_loop_on_udp_bus_outside_conn_segment() {
     ));
 }
 
-// Rule 10: schema_version must be 6. A prior-version manifest (schema_version
-// 5) is rejected outright now, same doctrine as every prior bump.
+// Rule 10: schema_version must be 7. A prior-version manifest (schema_version
+// 6) is rejected outright now, same doctrine as every prior bump.
 #[test]
 fn rejects_unknown_schema_version() {
-    let src = patched("schema_version = 6", "schema_version = 5");
+    let src = patched("schema_version = 7", "schema_version = 6");
     assert_eq!(
         expect_invalid(&src),
-        ValidateError::UnsupportedSchemaVersion(5)
+        ValidateError::UnsupportedSchemaVersion(6)
     );
 }
 

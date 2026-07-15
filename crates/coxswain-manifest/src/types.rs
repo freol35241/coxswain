@@ -18,11 +18,14 @@ use serde::{Deserialize, Serialize};
 /// Cyphal actuation path needs, plus the `cyphal_can` bus `node_id` and the
 /// role=power sensor `subject` (D-029). Bumped 5 -> 6 for the authoring reshape
 /// (D-030): discriminant-gated fields nest in named sub-tables and both
-/// position notations become a single `pos`. The blob layout is unchanged; the
-/// bump is forced by the authored shape so a v5 reader rejects a v6 manifest
-/// and vice versa. Deliberate: pre-release, so old readers simply reject new
-/// blobs and new readers reject old ones, no migration path needed.
-pub const SCHEMA_VERSION: u16 = 6;
+/// position notations become a single `pos`. Bumped 6 -> 7 for the dedicated
+/// `[geometry]` section (D-033): the body-frame `origin` label moves off
+/// `[estimator]`, which does not own the frame. The blob layout is unchanged
+/// in every case; the bump is forced by the authored shape so a v(n) reader
+/// rejects a v(n+1) manifest and vice versa. Deliberate: pre-release, so old
+/// readers simply reject new blobs and new readers reject old ones, no
+/// migration path needed.
+pub const SCHEMA_VERSION: u16 = 7;
 
 /// Fixed-capacity UTF-8 string, zero-padded. Exists so the blob needs no
 /// allocator; 32 bytes fits every identifier the schema doc uses.

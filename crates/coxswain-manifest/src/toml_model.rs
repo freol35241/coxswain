@@ -10,6 +10,11 @@ use serde::Deserialize;
 pub struct ManifestToml {
     pub manifest: MetaToml,
     pub conn_node: ConnNodeToml,
+    /// The body frame's reference point (D-033), optional: a vessel need not
+    /// declare it. Parsed and discarded, like `[manifest].author`/`date`.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub geometry: Option<GeometryToml>,
     #[serde(default, rename = "bus")]
     pub buses: Vec<BusToml>,
     #[serde(default, rename = "sensor")]
@@ -46,6 +51,19 @@ pub struct MetaToml {
 pub struct ConnNodeToml {
     pub board: String,
     pub watchdog_ms: u32,
+}
+
+/// The body frame's named reference point (D-033): a descriptive label, e.g.
+/// "midship_waterline", telling the commissioning engineer which physical
+/// point the Fossen model's reference point corresponds to. Axis convention
+/// is fixed (x fwd, y stbd, z down, WGS84, D-023) and not authored here. Not
+/// compiled: like `[manifest].author`/`date`, it changes no behavior, so it
+/// stays out of the blob and out of the hash.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeometryToml {
+    #[allow(dead_code)]
+    pub origin: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Deserialize)]
@@ -356,10 +374,6 @@ pub struct EstimatorToml {
     pub imu: Vec<String>,
     #[serde(default)]
     pub heading: Vec<String>,
-    // Body-frame origin convention; not compiled, the contract does not
-    // carry it yet (D-022).
-    #[allow(dead_code)]
-    pub origin: Option<String>,
     /// Opaque here; validated against the shape `model` selects.
     pub params: Option<toml::Table>,
 }

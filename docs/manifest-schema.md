@@ -1,15 +1,15 @@
-# Coxswain Vessel Manifest: Schema Draft v0.7
+# Coxswain Vessel Manifest: Schema Draft v0.8
 
 The manifest is the per-vessel statement of what exists, where it terminates, and what
 the estimator is licensed to trust. It is authored as TOML, validated and compiled
 host-side to a signed, CRC-protected binary blob (postcard), and written to an A/B flash
 region on the conn node during commissioning. The firmware treats it as pure data.
 
-Doc revision is v0.7. The wire-facing `manifest.schema_version` bumps 5 -> 6 for the
-authoring reshape (D-030): every discriminant-gated field moves into a named sub-table
-and both position notations collapse to a single `pos`. The compiled blob layout does
-not change, only the version integer; the bump is forced by the authored shape so a
-schema_version 5 reader rejects a schema_version 6 blob outright rather than
+Doc revision is v0.8. The wire-facing `manifest.schema_version` bumps 6 -> 7 for a
+dedicated `[geometry]` section (D-033): the body-frame `origin` label moves off
+`[estimator]`, which does not own the frame. The compiled blob layout does not
+change, only the version integer; the bump is forced by the authored shape so a
+schema_version 6 reader rejects a schema_version 7 blob outright rather than
 mis-parsing it, same doctrine as every prior bump.
 
 Design rules encoded in this schema:
@@ -42,7 +42,7 @@ Design rules encoded in this schema:
 # ============================================================
 
 [manifest]
-schema_version = 6          # firmware refuses unknown major versions
+schema_version = 7          # firmware refuses unknown major versions
 vessel_id      = "example-vessel-01"
 name           = "Example"
 revision       = 7          # monotonically increasing per vessel
@@ -57,6 +57,14 @@ date           = "2026-07-08"
 [conn_node]
 board          = "nucleo-h753zi"     # hardware profile, not necessarily fabricated hardware (D-016)
 watchdog_ms    = 250                 # hardware watchdog kick interval
+
+# ------------------------------------------------------------
+# Geometry: the body frame's named reference point (D-033). Descriptive
+# only, not compiled; axis convention (x fwd, y stbd, z down, WGS84) is
+# fixed and not authored here.
+# ------------------------------------------------------------
+[geometry]
+origin  = "midship_waterline"             # vessel body-frame origin convention
 
 # ------------------------------------------------------------
 # Buses: every sensor/actuator references one of these by id.
@@ -251,7 +259,6 @@ model   = "fossen_3dof"
 gnss    = ["gnss_main"]
 imu     = ["imu_main"]
 heading = ["mag_main", "gyro_retrofit"]   # both fused, weighted by declared std (D-032)
-origin  = "midship_waterline"             # vessel body-frame origin convention
 
 # Parameters for the model named above. Inline, so the blob hash covers the
 # physics and not just the wiring (D-018). Opaque to the schema: the reader
@@ -538,7 +545,15 @@ rejected; SOG/COG ride the `gnss` set. No blob or `schema_version` change, only
 the documented meaning and one validation rule. The per-vessel noise-parameter
 part stays open, below.
 
-## Open questions for v0.8
+**Settled since v0.8:** a dedicated `[geometry]` section (D-033), closing former
+open question 5. `origin`, the body frame's named reference point, moves off
+`[estimator]` (which does not own the frame) into `[geometry]`, optional and
+parsed-and-discarded like `[manifest].author`/`date`: the contract still does
+not carry it, and nothing in firmware or the control loop reads it. The blob
+layout does not move; only `schema_version` bumps 6 -> 7, forced by the
+authored shape.
+
+## Open questions for v0.9
 
 1. **Per-vessel noise parameters.** Process noise Q is fixed per-model in the
    estimator and measurement noise R is the per-measurement declared std; neither
@@ -557,10 +572,3 @@ part stays open, below.
    through center (two segments, three points). A real ESC/prop pair is rarely
    linear across its full range; a proper curve (more points, or a fitted
    function) is a recorded later refinement, not guessed now.
-5. **A frame section for `[estimator].origin`.** D-030 unified the position
-   notation to `pos` but left the frame origin the positions are measured against
-   as `[estimator].origin`, a field the compiler parses and discards (the contract
-   does not carry it yet, D-022). Relocating it into a dedicated `[geometry]` (or
-   `[conn_node]`) section, with the estimator referencing it rather than owning it,
-   waits until the estimator answers what it needs from the frame, rather than
-   moving a discarded field now and risking a second move.
