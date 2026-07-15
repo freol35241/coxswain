@@ -550,6 +550,7 @@ mod tests {
             role,
             license,
             max_age: Duration::from_secs(2),
+            lever_arm_m: [0.0, 0.0],
         }
     }
 

@@ -78,6 +78,7 @@ fn config(geofence: GeofenceConfig) -> VesselConfig {
         role,
         license: License::InnerLoop,
         max_age: Duration::from_secs(1),
+        lever_arm_m: [0.0, 0.0],
     };
     VesselConfig {
         sensors: BoundedList::from_slice(&[

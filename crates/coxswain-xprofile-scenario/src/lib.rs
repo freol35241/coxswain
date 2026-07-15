@@ -145,6 +145,7 @@ fn sensor(id: SensorId, role: SensorRole, max_age_ms: u64) -> SensorConfig {
         role,
         license: License::InnerLoop,
         max_age: Duration::from_millis(max_age_ms),
+        lever_arm_m: [0.0, 0.0],
     }
 }
 

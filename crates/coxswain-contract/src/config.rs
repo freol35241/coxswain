@@ -46,6 +46,9 @@ pub struct SensorConfig {
     pub role: SensorRole,
     pub license: License,
     pub max_age: Duration,
+    /// Body-frame planar offset from the model reference point, `[x, y]`
+    /// (D-031); `z` is dropped, honest to the 3-DOF planar model.
+    pub lever_arm_m: [f64; 2],
 }
 
 // Dead-tail filler for BoundedList only; the values carry no meaning. Kept a
@@ -57,6 +60,7 @@ impl Default for SensorConfig {
             role: SensorRole::Gnss,
             license: License::Enrichment,
             max_age: Duration::ZERO,
+            lever_arm_m: [0.0, 0.0],
         }
     }
 }

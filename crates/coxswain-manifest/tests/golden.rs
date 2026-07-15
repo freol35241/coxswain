@@ -114,6 +114,26 @@ fn coxswain_contract_id(n: u16) -> coxswain_contract::SensorId {
 }
 
 #[test]
+fn lever_arm_reaches_sensor_config() {
+    // D-031: the manifest's `pos` compiles into `SensorEntry.lever_arm_m`
+    // ([f64; 3]) and from there into `SensorConfig.lever_arm_m` ([f64; 2],
+    // z dropped). gnss_main declares a non-zero antenna offset; sensors with
+    // no `pos` (mag_main) fall back to zero.
+    let manifest = coxswain_manifest::compile(EXAMPLE).unwrap();
+    let arms: Vec<[f64; 2]> = manifest
+        .config
+        .sensors
+        .as_slice()
+        .iter()
+        .map(|s| s.lever_arm_m)
+        .collect();
+    // gnss_main=0, imu_main=1, mag_main=2, ...
+    assert_eq!(arms[0], [1.20, 0.00]);
+    assert_eq!(arms[1], [0.00, 0.00]);
+    assert_eq!(arms[2], [0.0, 0.0]);
+}
+
+#[test]
 fn staleness_defaults_per_role_and_quirk_override() {
     let manifest = coxswain_manifest::compile(EXAMPLE).unwrap();
     let ages: Vec<Duration> = manifest

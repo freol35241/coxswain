@@ -401,6 +401,7 @@ fn sensor(id: SensorId, role: SensorRole, license: License, max_age_ms: u64) -> 
         role,
         license,
         max_age: Duration::from_millis(max_age_ms),
+        lever_arm_m: [0.0, 0.0],
     }
 }
 

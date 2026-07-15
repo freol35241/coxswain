@@ -80,6 +80,7 @@ fn vessel_config() -> VesselConfig {
         role,
         license: License::InnerLoop,
         max_age: Duration::from_millis(max_age_ms),
+        lever_arm_m: [0.0, 0.0],
     };
     VesselConfig {
         sensors: BoundedList::from_slice(&[

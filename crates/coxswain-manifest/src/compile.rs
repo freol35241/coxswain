@@ -1519,6 +1519,8 @@ fn sensor_entry(
         role: role(s.role),
         license,
         max_age: Duration::from_millis(max_age_ms),
+        // z dropped (D-031); the estimator stays 3-DOF planar.
+        lever_arm_m: [entry.lever_arm_m[0], entry.lever_arm_m[1]],
     };
     Ok((entry, config))
 }

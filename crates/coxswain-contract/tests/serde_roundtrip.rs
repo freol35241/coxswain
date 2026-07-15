@@ -23,6 +23,7 @@ fn sensor(id: u16, role: SensorRole, license: License, max_age_ms: u64) -> Senso
         role,
         license,
         max_age: Duration::from_millis(max_age_ms),
+        lever_arm_m: [0.0, 0.0],
     }
 }
 
