@@ -57,6 +57,9 @@ struct Errors {
     psi_rad: Vec<f64>,
     surge_mps: Vec<f64>,
     sway_mps: Vec<f64>,
+    // Populated alongside surge/sway; only the increment-4 SOG/COG lever-arm
+    // scenario reads it, other scenarios simply leave it unread.
+    yaw_rate_radps: Vec<f64>,
     nees: Vec<f64>,
     rejected: usize,
 }
@@ -88,6 +91,8 @@ fn probe(est: &Estimator, frame: &LocalFrame, traj: &Trajectory, t: f64, errs: &
     errs.psi_rad.push(dpsi);
     errs.surge_mps.push(s.velocity.surge_mps - truth.u);
     errs.sway_mps.push(s.velocity.sway_mps - truth.v);
+    errs.yaw_rate_radps
+        .push(s.velocity.yaw_rate_radps - truth.r);
 
     let e = SVector::<f64, 6>::from([
         dn,
@@ -1182,4 +1187,135 @@ fn no_gyro_degraded_heading_with_lever_arm_stays_finite() {
         "heading RMSE {:.3} deg exceeds the divergence tripwire",
         rmse(&errs.psi_rad).to_degrees()
     );
+}
+
+// ---------------------------------------------------------------------------
+// SOG/COG lever-arm compensation (D-031, increment 4): the omega x r term
+// couples through the antenna's SOG/COG, not the reference point's.
+
+// A faster sustained yaw than scenario 12's, so the omega x r term at the
+// same bow offset is an appreciable fraction of the CO speed: r * rx =
+// 0.2618 * 3.0 = 0.785 m/s against a 2 m/s CO speed (39%), versus scenario
+// 12's 4 deg/s (7%), which was tuned for the position path, not this one.
+const FAST_TURN_R_RADPS: f64 = 0.2618; // 15 deg/s
+
+/// One antenna, one physical offset: position, SOG, and COG are all sampled
+/// at the same `LEVER_ARM_M` (a real receiver does not report its position
+/// from one point and its velocity from another). Only what the estimator is
+/// *told* varies between the two runs in `sog_cog_lever_arm_compensation_case`.
+fn sog_cog_lever_arm_streams() -> (Trajectory, Vec<Measurement>) {
+    let traj = Trajectory::turn(origin(), deg(0.0), 2.0, FAST_TURN_R_RADPS, 150.0);
+    let mut rng = Rng::new(41);
+    let ms = merge(vec![
+        sample_gnss_with_offset(&traj, (0.0, 150.0), 1.0, 2.0, LEVER_ARM_M, &mut rng),
+        sample_heading(
+            &traj,
+            HEADING_ID,
+            (0.0, 150.0),
+            5.0,
+            deg(1.0),
+            0.0,
+            &mut rng,
+        ),
+        sample_yaw_rate(&traj, (0.0, 150.0), 20.0, 0.01, &mut rng),
+        // Starts after the filter's initial velocity-convergence window (same
+        // reasoning as straight_streams_with_optional_velocity above): a
+        // fresh filter's velocity estimate is exactly zero at init, so an
+        // early sample would hit the LowSpeed guard for a reason that has
+        // nothing to do with this scenario.
+        sample_sog_with_offset(&traj, (15.0, 150.0), 1.0, 0.1, LEVER_ARM_M, &mut rng),
+        sample_cog_with_offset(&traj, (15.0, 150.0), 1.0, deg(2.0), LEVER_ARM_M, &mut rng),
+    ]);
+    (traj, ms)
+}
+
+// Scenario 13: the "prove it matters" case for the SOG/COG path specifically
+// (scenario 12 already covers GNSS position). Same measurement stream fed to
+// two estimators differing only in the declared `lever_arm_m`: told the true
+// offset, the filter must recover the reference-point body velocity (u, v,
+// r); told [0, 0] (pre-D-031-increment-4 behavior), the antenna's omega x r
+// term reads to the naive Jacobian as sway that is not there, and the sway
+// estimate must show a measurable bias toward `r * rx`.
+fn sog_cog_lever_arm_compensation_case(variant: Variant) {
+    let (traj, ms) = sog_cog_lever_arm_streams();
+    let commands = variant.commands(&traj, 150.0);
+
+    let mut est_compensated = Estimator::new(&test_config_with_gnss_lever_arm(
+        variant.model(),
+        LEVER_ARM_M,
+    ));
+    let errs_compensated = run_probed(&mut est_compensated, &ms, &commands, &traj, 20.0, 150.0);
+
+    let mut est_uncompensated = Estimator::new(&test_config(variant.model()));
+    let errs_uncompensated = run_probed(&mut est_uncompensated, &ms, &commands, &traj, 20.0, 150.0);
+
+    let nees = mean(&errs_compensated.nees);
+    println!(
+        "SOG/COG lever-arm compensation [{}]: compensated surge RMSE {:.3} m/s, sway RMSE {:.3} \
+         m/s (mean {:.3}), yaw-rate RMSE {:.4} rad/s, mean NEES {:.2}; uncompensated surge RMSE \
+         {:.3} m/s, sway RMSE {:.3} m/s (mean {:.3})",
+        variant.label(),
+        rmse(&errs_compensated.surge_mps),
+        rmse(&errs_compensated.sway_mps),
+        mean(&errs_compensated.sway_mps),
+        rmse(&errs_compensated.yaw_rate_radps),
+        nees,
+        rmse(&errs_uncompensated.surge_mps),
+        rmse(&errs_uncompensated.sway_mps),
+        mean(&errs_uncompensated.sway_mps),
+    );
+
+    // (a) Told the true offset: recovers the body velocity within an honest
+    // bound and an honest NEES band (same reasoning as scenario 12/
+    // straight_line_noisy_case).
+    assert!(
+        rmse(&errs_compensated.surge_mps) < 0.3,
+        "compensated surge RMSE {:.3} m/s too large",
+        rmse(&errs_compensated.surge_mps)
+    );
+    assert!(
+        rmse(&errs_compensated.sway_mps) < 0.3,
+        "compensated sway RMSE {:.3} m/s too large",
+        rmse(&errs_compensated.sway_mps)
+    );
+    assert!(
+        (0.5..15.0).contains(&nees),
+        "compensated mean NEES {nees} outside the honest band"
+    );
+
+    // (b) Told [0, 0]: the omega x r term the antenna picks up must show as a
+    // sway bias, and be markedly worse than the compensated run on the
+    // identical stream. Under constant velocity the bias lands close to the
+    // full kinematic r * rx = 0.785 m/s (measured mean 0.792 m/s); under the
+    // hydrodynamic prior the balancing tau makes the true (undistorted) nu a
+    // fixed point of the dynamics, so the process model itself resists the
+    // SOG/COG-induced sway distortion and the bias is markedly damped
+    // (measured mean 0.125 m/s) rather than absent. The floor below is set
+    // an order of magnitude under r * rx so it holds for both process
+    // models without asserting a magnitude the hydrodynamic prior does not
+    // actually produce; the RMSE-ratio check below is the model-independent
+    // "compensation matters" claim.
+    let expected_bias = FAST_TURN_R_RADPS * LEVER_ARM_M[0];
+    assert!(
+        mean(&errs_uncompensated.sway_mps).abs() > 0.1 * expected_bias,
+        "uncompensated mean sway err {:.3} m/s is not on the order of the r*rx = {:.3} m/s term",
+        mean(&errs_uncompensated.sway_mps),
+        expected_bias
+    );
+    assert!(
+        rmse(&errs_uncompensated.sway_mps) > 1.5 * rmse(&errs_compensated.sway_mps),
+        "uncompensated sway RMSE {:.3} m/s must be markedly worse than compensated {:.3} m/s",
+        rmse(&errs_uncompensated.sway_mps),
+        rmse(&errs_compensated.sway_mps)
+    );
+}
+
+#[test]
+fn sog_cog_lever_arm_compensation_recovers_velocity_cv() {
+    sog_cog_lever_arm_compensation_case(Variant::ConstantVelocity);
+}
+
+#[test]
+fn sog_cog_lever_arm_compensation_recovers_velocity_hydro() {
+    sog_cog_lever_arm_compensation_case(Variant::Hydrodynamic);
 }

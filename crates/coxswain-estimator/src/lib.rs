@@ -35,9 +35,11 @@ use ekf::{Ekf, ProcessModel};
 /// the same way a non-finite one does. `OutOfRange`: a GNSS position's
 /// lat/lon is finite but geometrically impossible, a declared SOG is
 /// negative, or a declared COG exceeds one turn in magnitude. `LowSpeed`: a
-/// SOG or COG measurement arrived while the filter's current speed estimate
-/// is below `COG_MIN_SPEED_MPS`; costs the filter nothing (rejected before
-/// predict), see `ekf::update_sog`/`update_cog` for why.
+/// SOG or COG measurement arrived while the reporting sensor's antenna speed
+/// estimate (the filter's `u, v` folded through the sensor's declared
+/// `lever_arm_m` and yaw rate, D-031) is below `COG_MIN_SPEED_MPS`; costs the
+/// filter nothing (rejected before predict), see `ekf::update_sog`/
+/// `update_cog` for why.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Rejection {
     UnknownSensor,
@@ -161,7 +163,7 @@ impl Estimator {
     /// (OutOfRange), then measurements from sensors not in the config's
     /// fusion lists (UnknownSensor), sensors whose license is not InnerLoop
     /// (NotLicensed), timestamps behind the filter (OutOfOrder), and finally
-    /// a SOG/COG measurement while the filter's current speed estimate is
+    /// a SOG/COG measurement while the reporting sensor's antenna speed is
     /// below `COG_MIN_SPEED_MPS` (LowSpeed).
     pub fn handle(&mut self, m: &Measurement) -> Result<(), Rejection> {
         if !Self::values_finite(&m.kind) {
@@ -187,26 +189,36 @@ impl Estimator {
         {
             return Err(Rejection::OutOfOrder);
         }
+        // Computed up front: a method call borrows all of self, which would
+        // conflict with the `&mut self.filter` match below (disjoint field
+        // borrows only work for direct field accesses). Also needed by the
+        // LowSpeed guard immediately below, which folds it into the antenna
+        // speed.
+        let lever_arm = self.lever_arm(m.sensor);
+
         // Checked before predict so a rejection costs the filter nothing
         // (no state or covariance change, no staleness bookkeeping update):
-        // same property every other rejection above already has. Pre-init
-        // (no filter yet) there is no speed estimate to judge against; SOG/
-        // COG are simply not seeded into init below, same as YawRate.
+        // same property every other rejection above already has. Judged on
+        // the antenna speed s_a (the sensor's lever_arm_m folded through the
+        // filter's yaw rate, D-031), not the reference point's hypot(u, v):
+        // s_a is what a receiver actually reports and gates on, and it is
+        // s_a that appears in update_sog/update_cog's Jacobian denominators;
+        // at lever_arm_m = [0, 0] this is exactly hypot(u, v), unchanged from
+        // before D-031. Pre-init (no filter yet) there is no speed estimate
+        // to judge against; SOG/COG are simply not seeded into init below,
+        // same as YawRate.
         if matches!(
             m.kind,
             MeasurementKind::SpeedOverGround { .. } | MeasurementKind::CourseOverGround { .. }
         ) && let Some(filter) = &self.filter
         {
-            let (u, v) = (filter.ekf.x[3], filter.ekf.x[4]);
-            if libm::hypot(u, v) < COG_MIN_SPEED_MPS {
+            let (u, v, r) = (filter.ekf.x[3], filter.ekf.x[4], filter.ekf.x[5]);
+            let (rx, ry) = (lever_arm[0], lever_arm[1]);
+            let s_a = libm::hypot(u - r * ry, v + r * rx);
+            if s_a < COG_MIN_SPEED_MPS {
                 return Err(Rejection::LowSpeed);
             }
         }
-
-        // Computed up front: a method call borrows all of self, which would
-        // conflict with the `&mut self.filter` match below (disjoint field
-        // borrows only work for direct field accesses).
-        let lever_arm = self.lever_arm(m.sensor);
         match &mut self.filter {
             Some(filter) => {
                 filter.ekf.predict(
@@ -238,10 +250,10 @@ impl Estimator {
                         std_radps,
                     } => filter.ekf.update_yaw_rate(yaw_rate_radps, std_radps),
                     MeasurementKind::SpeedOverGround { sog_mps, std_mps } => {
-                        filter.ekf.update_sog(sog_mps, std_mps);
+                        filter.ekf.update_sog(sog_mps, std_mps, lever_arm);
                     }
                     MeasurementKind::CourseOverGround { cog_rad, std_rad } => {
-                        filter.ekf.update_cog(cog_rad, std_rad);
+                        filter.ekf.update_cog(cog_rad, std_rad, lever_arm);
                     }
                 }
             }
@@ -504,6 +516,14 @@ impl Estimator {
         filter.ekf.x[4] = v;
     }
 
+    /// Test-only seam: sets yaw rate directly, alongside `set_velocity`, to
+    /// exercise the antenna-speed low-speed guard (D-031 increment 4)
+    /// without a multi-tick scenario.
+    #[cfg(test)]
+    fn set_yaw_rate(&mut self, r: f64) {
+        self.filter.as_mut().expect("call after init").ekf.x[5] = r;
+    }
+
     /// The sensor's declared planar antenna offset (D-031), `[0, 0]` if not
     /// found; defensive only, `handle` reaches this after `admit` has
     /// already confirmed the sensor is in `self.sensors`.
@@ -610,6 +630,24 @@ mod tests {
             },
             effectors: BoundedList::new(),
         }
+    }
+
+    /// `config()` with the GNSS sensor's declared antenna offset (D-031) set
+    /// to `lever_arm_m` instead of the default `[0, 0]`. Rebuilds the sensor
+    /// list literally (no_std, no `Vec`) rather than mapping over `config()`'s
+    /// list in place.
+    fn config_with_gnss_lever_arm(lever_arm_m: [f64; 2]) -> VesselConfig {
+        let mut cfg = config();
+        let mut gnss = sensor(GNSS, SensorRole::Gnss, License::InnerLoop);
+        gnss.lever_arm_m = lever_arm_m;
+        cfg.sensors = BoundedList::from_slice(&[
+            gnss,
+            sensor(COMPASS, SensorRole::Heading, License::InnerLoop),
+            sensor(GYRO, SensorRole::Imu, License::InnerLoop),
+            sensor(ENRICHMENT_COMPASS, SensorRole::Heading, License::Enrichment),
+        ])
+        .unwrap();
+        cfg
     }
 
     fn ts(secs: f64) -> Timestamp {
@@ -960,6 +998,33 @@ mod tests {
         assert_eq!(est.handle(&cog_at(1.3, GNSS)), Err(Rejection::LowSpeed));
         assert_eq!(est.state(ts(2.0)), baseline.state(ts(2.0)));
         assert_eq!(est.health(ts(2.0)), baseline.health(ts(2.0)));
+    }
+
+    /// The intake-level LowSpeed guard must judge the reporting sensor's
+    /// antenna speed `s_a`, not the reference point's `hypot(u, v)` (D-031
+    /// increment 4): a yawing, stationary reference point puts a side-mounted
+    /// antenna's ground speed above the floor even though `hypot(u, v) = 0`
+    /// (would be rejected by an old CO-speed guard); conversely a
+    /// reference-point speed above the floor can cancel toward zero at the
+    /// antenna (would be accepted by an old CO-speed guard, but must not be).
+    #[test]
+    fn low_speed_guard_judges_antenna_speed_not_reference_point_speed() {
+        const OFFSET: [f64; 2] = [0.0, 3.0]; // side-mounted, ry = 3
+        let mut est = Estimator::new(&config_with_gnss_lever_arm(OFFSET));
+        est.handle(&gnss_at(1.0)).unwrap();
+        est.handle(&heading_at(1.2, COMPASS)).unwrap();
+
+        // hypot(u, v) = 0; s_a = |r * ry| = 0.3 * 3.0 = 0.9, above the floor.
+        est.set_velocity(0.0, 0.0);
+        est.set_yaw_rate(0.3);
+        assert_eq!(est.handle(&sog_at(1.3, GNSS)), Ok(()));
+
+        // hypot(u, v) = 0.6, above COG_MIN_SPEED_MPS; the omega x r term
+        // exactly cancels it at the antenna: ua = u - r*ry = 0.6 - 0.2*3.0 =
+        // 0.0, s_a = 0, below the floor.
+        est.set_velocity(0.6, 0.0);
+        est.set_yaw_rate(0.2);
+        assert_eq!(est.handle(&cog_at(1.4, GNSS)), Err(Rejection::LowSpeed));
     }
 
     #[test]

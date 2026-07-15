@@ -350,6 +350,66 @@ pub fn sample_cog(
         .collect()
 }
 
+/// `sample_sog` for an antenna mounted off the reference point (D-031,
+/// increment 4): truth is the antenna's body-frame velocity norm, `ua = u -
+/// r*ry, va = v + r*rx` (the omega x r term a yawing vessel's off-centre
+/// antenna picks up), same convention as coxswain-sim's `Sim::sample`
+/// (increment 1). No floor is applied here, same reasoning as `sample_sog`.
+pub fn sample_sog_with_offset(
+    traj: &Trajectory,
+    window: (f64, f64),
+    rate_hz: f64,
+    std_mps: f64,
+    offset_m: [f64; 2],
+    rng: &mut Rng,
+) -> Vec<Measurement> {
+    let (rx, ry) = (offset_m[0], offset_m[1]);
+    sample_times(window, rate_hz)
+        .map(|t| {
+            let truth = traj.truth_at(t);
+            let (ua, va) = (truth.u - truth.r * ry, truth.v + truth.r * rx);
+            let sog_truth = (ua * ua + va * va).sqrt();
+            Measurement {
+                sensor: GNSS_ID,
+                t: ts(t),
+                kind: MeasurementKind::SpeedOverGround {
+                    // A real receiver never reports negative speed.
+                    sog_mps: (sog_truth + rng.gaussian(std_mps)).max(0.0),
+                    std_mps,
+                },
+            }
+        })
+        .collect()
+}
+
+/// `sample_cog` for an antenna mounted off the reference point (D-031,
+/// increment 4), same antenna velocity `ua, va` as `sample_sog_with_offset`.
+pub fn sample_cog_with_offset(
+    traj: &Trajectory,
+    window: (f64, f64),
+    rate_hz: f64,
+    std_rad: f64,
+    offset_m: [f64; 2],
+    rng: &mut Rng,
+) -> Vec<Measurement> {
+    let (rx, ry) = (offset_m[0], offset_m[1]);
+    sample_times(window, rate_hz)
+        .map(|t| {
+            let truth = traj.truth_at(t);
+            let (ua, va) = (truth.u - truth.r * ry, truth.v + truth.r * rx);
+            let cog_truth = wrap(truth.psi + va.atan2(ua));
+            Measurement {
+                sensor: GNSS_ID,
+                t: ts(t),
+                kind: MeasurementKind::CourseOverGround {
+                    cog_rad: wrap(cog_truth + rng.gaussian(std_rad)),
+                    std_rad,
+                },
+            }
+        })
+        .collect()
+}
+
 /// `cov_ne_m2` is diagonal-noise-sampled here (per-axis std from the
 /// declared diagonal): correlated noise generation would need a Cholesky
 /// factor for no additional verification value in these scenarios, which

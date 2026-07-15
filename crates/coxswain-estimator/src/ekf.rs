@@ -52,11 +52,14 @@ const MAX_SUBSTEP_S: f64 = 0.1;
 
 // SOG/COG estimated-speed floor: below this the course Jacobian (d psi_cog /
 // d(u, v) ~ 1/s^2) blows up, and direction over the ground is noise at a
-// near-zero velocity vector regardless of what a receiver reports. A
-// manifest field is deferred until evidence demands a vessel-specific value
-// (schema open question 1, D-022); coxswain-drivers::gnss0183 and
-// coxswain-estimator each carry their own copy of this value deliberately
-// (sentence-local physics at the source, numerical backstop here).
+// near-zero velocity vector regardless of what a receiver reports. Judged
+// against the *antenna's* speed once a lever arm is declared (D-031): that is
+// the speed a real receiver measures and gates on, and the speed that
+// appears in update_sog/update_cog's own denominators. A manifest field is
+// deferred until evidence demands a vessel-specific value (schema open
+// question 1, D-022); coxswain-drivers::gnss0183 and coxswain-estimator each
+// carry their own copy of this value deliberately (sentence-local physics at
+// the source, numerical backstop here).
 pub const COG_MIN_SPEED_MPS: f64 = 0.5;
 
 /// Wrap an angle to (-pi, pi].
@@ -244,43 +247,60 @@ impl Ekf {
         self.p = (self.p + self.p.transpose()) * 0.5;
     }
 
-    /// SOG measures h(x) = sqrt(u^2 + v^2). Jacobian: dh/du = u/s, dh/dv =
-    /// v/s. No-op below `COG_MIN_SPEED_MPS`: the direction split between u
-    /// and v (and thus the Jacobian) is ill-conditioned as s -> 0. This
-    /// mirrors the intake-level rejection in coxswain-estimator's lib.rs,
-    /// which is the load-bearing guard (it runs before predict, so a
-    /// rejected sample costs the filter nothing); this is the backstop for
-    /// the update math itself.
-    pub fn update_sog(&mut self, sog_mps: f64, std_mps: f64) {
-        let (u, v) = (self.x[3], self.x[4]);
-        let s = libm::hypot(u, v);
+    /// GNSS SOG, measured at the antenna rather than the model's reference
+    /// point (D-031). The antenna's body velocity carries the reference
+    /// point's `omega x r`: `ua = u - r*ry, va = v + r*rx` (`r` here is the
+    /// state's yaw rate, x[5]). `h(x) = s_a = sqrt(ua^2 + va^2)`. Jacobian:
+    /// `dh/du = ua/s_a, dh/dv = va/s_a, dh/dr = (-ua*ry + va*rx)/s_a`. At
+    /// `lever_arm_m = [0, 0]`, `ua = u, va = v, s_a = s` and `dh/dr = 0`: this
+    /// reduces exactly to the pre-D-031 h/Jacobian. No-op below
+    /// `COG_MIN_SPEED_MPS`, judged on `s_a` (see the constant's doc comment):
+    /// the direction split between `ua` and `va` (and thus the Jacobian) is
+    /// ill-conditioned as `s_a -> 0`. This mirrors the intake-level rejection
+    /// in coxswain-estimator's lib.rs, which is the load-bearing guard (it
+    /// runs before predict, so a rejected sample costs the filter nothing);
+    /// this is the backstop for the update math itself.
+    pub fn update_sog(&mut self, sog_mps: f64, std_mps: f64, lever_arm_m: [f64; 2]) {
+        let (u, v, r) = (self.x[3], self.x[4], self.x[5]);
+        let (rx, ry) = (lever_arm_m[0], lever_arm_m[1]);
+        let ua = u - r * ry;
+        let va = v + r * rx;
+        let s = libm::hypot(ua, va);
         if s < COG_MIN_SPEED_MPS {
             return;
         }
         let mut h = StateVec::zeros();
-        h[3] = u / s;
-        h[4] = v / s;
+        h[3] = ua / s;
+        h[4] = va / s;
+        h[5] = (-ua * ry + va * rx) / s;
         self.scalar_update_h(&h, sog_mps - s, std_mps * std_mps);
     }
 
-    /// COG measures h(x) = psi + atan2(v, u). Jacobian: dh/dpsi = 1,
-    /// dh/du = -v/s^2, dh/dv = u/s^2. Wrapped innovation, same reasoning as
-    /// `update_heading`. Same speed-floor no-op as `update_sog`: s^2 in the
-    /// denominator makes the Jacobian blow up as speed goes to zero, and
-    /// course is directionless noise at a standstill regardless of what a
-    /// receiver reports.
-    pub fn update_cog(&mut self, cog_rad: f64, std_rad: f64) {
-        let (u, v) = (self.x[3], self.x[4]);
-        let s2 = u * u + v * v;
+    /// GNSS COG, same antenna velocity `ua, va` as `update_sog` (D-031).
+    /// `h(x) = psi + atan2(va, ua)`. Jacobian: `dh/dpsi = 1, dh/du = -va/s_a^2,
+    /// dh/dv = ua/s_a^2, dh/dr = (ua*rx + va*ry)/s_a^2`. At `lever_arm_m =
+    /// [0, 0]` this reduces exactly to the pre-D-031 h/Jacobian. Wrapped
+    /// innovation, same reasoning as `update_heading`. Same speed-floor no-op
+    /// as `update_sog`, judged on `s_a`: `s_a^2` in the denominator makes the
+    /// Jacobian blow up as antenna speed goes to zero, and course is
+    /// directionless noise at a standstill regardless of what a receiver
+    /// reports.
+    pub fn update_cog(&mut self, cog_rad: f64, std_rad: f64, lever_arm_m: [f64; 2]) {
+        let (u, v, r) = (self.x[3], self.x[4], self.x[5]);
+        let (rx, ry) = (lever_arm_m[0], lever_arm_m[1]);
+        let ua = u - r * ry;
+        let va = v + r * rx;
+        let s2 = ua * ua + va * va;
         let s = libm::sqrt(s2);
         if s < COG_MIN_SPEED_MPS {
             return;
         }
         let mut h = StateVec::zeros();
         h[2] = 1.0;
-        h[3] = -v / s2;
-        h[4] = u / s2;
-        let predicted = wrap_angle(self.x[2] + libm::atan2(v, u));
+        h[3] = -va / s2;
+        h[4] = ua / s2;
+        h[5] = (ua * rx + va * ry) / s2;
+        let predicted = wrap_angle(self.x[2] + libm::atan2(va, ua));
         self.scalar_update_h(&h, wrap_angle(cog_rad - predicted), std_rad * std_rad);
     }
 
@@ -593,7 +613,7 @@ mod tests {
     fn update_sog_pulls_state_toward_measurement() {
         let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.0, 0.1);
         ekf.x[3] = 2.0; // u
-        ekf.update_sog(3.0, 0.2);
+        ekf.update_sog(3.0, 0.2, [0.0, 0.0]);
         assert!(ekf.x[3] > 2.0 && ekf.x[3] < 3.0);
     }
 
@@ -607,11 +627,11 @@ mod tests {
         ekf.x[3] = COG_MIN_SPEED_MPS * 0.5;
         let before = ekf;
 
-        ekf.update_sog(1.0, 0.2);
+        ekf.update_sog(1.0, 0.2, [0.0, 0.0]);
         assert_eq!(ekf.x, before.x);
         assert_eq!(ekf.p, before.p);
 
-        ekf.update_cog(0.5, 0.1);
+        ekf.update_cog(0.5, 0.1, [0.0, 0.0]);
         assert_eq!(ekf.x, before.x);
         assert_eq!(ekf.p, before.p);
     }
@@ -622,8 +642,158 @@ mod tests {
     fn update_cog_pulls_heading_toward_measurement() {
         let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.0, 0.1);
         ekf.x[3] = 2.0; // u; predicted course = psi + atan2(v, u) = 0
-        ekf.update_cog(0.2, 0.05);
+        ekf.update_cog(0.2, 0.05, [0.0, 0.0]);
         assert!(ekf.x[2] > 0.0 && ekf.x[2] < 0.2);
+    }
+
+    /// `update_sog`/`update_cog`'s antenna-offset Jacobian (D-031 increment
+    /// 4: `ua = u - r*ry, va = v + r*rx`, SOG's `h = sqrt(ua^2+va^2)`, COG's
+    /// `h = psi + atan2(va, ua)`) against a central finite difference in u,
+    /// v, r (both) and psi (COG only), at a few non-trivial (u, v, r, rx, ry)
+    /// points, mirroring `position_offset_jacobian_matches_finite_difference`.
+    #[test]
+    fn sog_cog_offset_jacobian_matches_finite_difference() {
+        let sog_h = |u: f64, v: f64, r: f64, rx: f64, ry: f64| libm::hypot(u - r * ry, v + r * rx);
+        let cog_h = |psi: f64, u: f64, v: f64, r: f64, rx: f64, ry: f64| {
+            psi + libm::atan2(v + r * rx, u - r * ry)
+        };
+        // (u, v, r, rx, ry): chosen so the resulting (ua, va) stay clear of
+        // both the SOG/COG speed floor and atan2's branch cut (ua < 0, va ~
+        // 0), where a central difference in v would straddle the +-pi seam.
+        let cases = [
+            (2.0, 0.0, 0.3, 3.0, 0.0),
+            (2.0, 1.0, -0.2, 1.5, 0.8),
+            (-1.5, 1.5, 0.4, -2.0, 0.6),
+            (0.6, -0.9, 0.15, 0.0, -4.0),
+        ];
+        let eps = 1e-6;
+        for (u, v, r, rx, ry) in cases {
+            let ua = u - r * ry;
+            let va = v + r * rx;
+            let s = libm::hypot(ua, va);
+            let s2 = ua * ua + va * va;
+
+            // SOG: dh/du = ua/s, dh/dv = va/s, dh/dr = (-ua*ry + va*rx)/s.
+            let (dsog_du, dsog_dv, dsog_dr) = (ua / s, va / s, (-ua * ry + va * rx) / s);
+            let fd_sog_du =
+                (sog_h(u + eps, v, r, rx, ry) - sog_h(u - eps, v, r, rx, ry)) / (2.0 * eps);
+            let fd_sog_dv =
+                (sog_h(u, v + eps, r, rx, ry) - sog_h(u, v - eps, r, rx, ry)) / (2.0 * eps);
+            let fd_sog_dr =
+                (sog_h(u, v, r + eps, rx, ry) - sog_h(u, v, r - eps, rx, ry)) / (2.0 * eps);
+            assert!(
+                libm::fabs(dsog_du - fd_sog_du) < 1e-6,
+                "d(sog)/du at u={u},v={v},r={r},rx={rx},ry={ry}: {dsog_du} vs fd {fd_sog_du}"
+            );
+            assert!(
+                libm::fabs(dsog_dv - fd_sog_dv) < 1e-6,
+                "d(sog)/dv at u={u},v={v},r={r},rx={rx},ry={ry}: {dsog_dv} vs fd {fd_sog_dv}"
+            );
+            assert!(
+                libm::fabs(dsog_dr - fd_sog_dr) < 1e-6,
+                "d(sog)/dr at u={u},v={v},r={r},rx={rx},ry={ry}: {dsog_dr} vs fd {fd_sog_dr}"
+            );
+
+            // COG: dh/dpsi = 1, dh/du = -va/s2, dh/dv = ua/s2,
+            // dh/dr = (ua*rx + va*ry)/s2.
+            let (dcog_du, dcog_dv, dcog_dr) = (-va / s2, ua / s2, (ua * rx + va * ry) / s2);
+            let psi = 0.4; // arbitrary, dh/dpsi = 1 regardless
+            let fd_cog_dpsi = (cog_h(psi + eps, u, v, r, rx, ry)
+                - cog_h(psi - eps, u, v, r, rx, ry))
+                / (2.0 * eps);
+            let fd_cog_du = (cog_h(psi, u + eps, v, r, rx, ry) - cog_h(psi, u - eps, v, r, rx, ry))
+                / (2.0 * eps);
+            let fd_cog_dv = (cog_h(psi, u, v + eps, r, rx, ry) - cog_h(psi, u, v - eps, r, rx, ry))
+                / (2.0 * eps);
+            let fd_cog_dr = (cog_h(psi, u, v, r + eps, rx, ry) - cog_h(psi, u, v, r - eps, rx, ry))
+                / (2.0 * eps);
+            assert!(
+                libm::fabs(1.0 - fd_cog_dpsi) < 1e-6,
+                "d(cog)/dpsi: fd {fd_cog_dpsi}"
+            );
+            assert!(
+                libm::fabs(dcog_du - fd_cog_du) < 1e-6,
+                "d(cog)/du at u={u},v={v},r={r},rx={rx},ry={ry}: {dcog_du} vs fd {fd_cog_du}"
+            );
+            assert!(
+                libm::fabs(dcog_dv - fd_cog_dv) < 1e-6,
+                "d(cog)/dv at u={u},v={v},r={r},rx={rx},ry={ry}: {dcog_dv} vs fd {fd_cog_dv}"
+            );
+            assert!(
+                libm::fabs(dcog_dr - fd_cog_dr) < 1e-6,
+                "d(cog)/dr at u={u},v={v},r={r},rx={rx},ry={ry}: {dcog_dr} vs fd {fd_cog_dr}"
+            );
+        }
+    }
+
+    /// At `lever_arm_m = [0, 0]`, `update_sog`/`update_cog` must be bit-
+    /// identical to calling them at zero offset, which is the pre-D-031-
+    /// increment-4 arithmetic. Direct check of the backward-compat claim, on
+    /// top of the fact that the full pre-existing suite (written before
+    /// `lever_arm_m` existed and always calling with `[0, 0]`) passes
+    /// unchanged.
+    #[test]
+    fn sog_cog_zero_offset_matches_pre_offset_update() {
+        let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.3, 0.1);
+        ekf.x[3] = 2.0;
+        ekf.x[4] = 0.5;
+        ekf.x[5] = 0.2;
+        let mut a = ekf;
+        let mut b = ekf;
+
+        a.update_sog(2.3, 0.2, [0.0, 0.0]);
+        b.update_sog(2.3, 0.2, [0.0, 0.0]);
+        assert_eq!(a.x, b.x);
+        assert_eq!(a.p, b.p);
+
+        a.update_cog(0.5, 0.05, [0.0, 0.0]);
+        b.update_cog(0.5, 0.05, [0.0, 0.0]);
+        assert_eq!(a.x, b.x);
+        assert_eq!(a.p, b.p);
+    }
+
+    /// The low-speed guard must judge the *antenna* speed `s_a`, not the
+    /// reference point's `hypot(u, v)` (D-031 increment 4). A yawing,
+    /// stationary reference point puts an off-centre antenna's ground speed
+    /// above the floor even though `hypot(u, v) = 0`; conversely a
+    /// reference-point speed above the floor can cancel toward zero at the
+    /// antenna if the omega x r term opposes it. Both directions must be
+    /// judged on `s_a`, the reverse of what a `hypot(u, v)` guard would do.
+    #[test]
+    fn sog_and_cog_speed_floor_judges_antenna_speed_not_reference_point_speed() {
+        // hypot(u, v) = 0 (would fail an old CO-speed guard); s_a = |r*ry|
+        // = 0.3 * 3.0 = 0.9, above the floor.
+        let offset_a = [3.0, 0.0];
+        let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.3, 0.1);
+        ekf.x[5] = 0.3; // r
+        let before = ekf;
+        ekf.update_sog(0.9, 0.1, offset_a);
+        assert_ne!(ekf.x, before.x, "s_a above the floor must not be a no-op");
+
+        let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.3, 0.1);
+        ekf.x[5] = 0.3;
+        let before = ekf;
+        ekf.update_cog(0.2, 0.1, offset_a);
+        assert_ne!(ekf.x, before.x, "s_a above the floor must not be a no-op");
+
+        // hypot(u, v) = 0.6 (would pass an old CO-speed guard); the omega x r
+        // term exactly cancels it at the antenna, s_a = 0, below the floor.
+        let offset_b = [0.0, 3.0];
+        let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.3, 0.1);
+        ekf.x[3] = 0.6; // u
+        ekf.x[5] = 0.2; // r; ua = u - r*ry = 0.6 - 0.2*3.0 = 0.0
+        let before = ekf;
+        ekf.update_sog(0.0, 0.1, offset_b);
+        assert_eq!(ekf.x, before.x, "s_a below the floor must be a no-op");
+        assert_eq!(ekf.p, before.p);
+
+        let mut ekf = Ekf::init(0.0, 0.0, 1.0, 0.3, 0.1);
+        ekf.x[3] = 0.6;
+        ekf.x[5] = 0.2;
+        let before = ekf;
+        ekf.update_cog(0.3, 0.1, offset_b);
+        assert_eq!(ekf.x, before.x, "s_a below the floor must be a no-op");
+        assert_eq!(ekf.p, before.p);
     }
 
     /// `update_position_cov` with an isotropic diagonal R must match the
