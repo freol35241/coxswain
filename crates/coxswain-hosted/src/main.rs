@@ -41,6 +41,7 @@ mod can;
 mod recorder;
 mod sd_notify;
 mod serial;
+mod stall_watchdog;
 mod udp;
 
 const TICK: Duration = Duration::from_millis(100);
@@ -1305,6 +1306,12 @@ fn run() -> Result<(), String> {
     // exactly this before treating the unit as started.
     let mut notifier = sd_notify::Notifier::from_env();
     notifier.ready();
+    // Armed after boot so manifest checks and session setup never count as
+    // a stall; the first beat lands within one tick.
+    let heartbeat = stall_watchdog::spawn(
+        stall_watchdog::STALL_TIMEOUT,
+        stall_watchdog::abort_on_stall,
+    );
 
     // Publish failures must not stop the loop; log the first error kind once
     // so a dead router does not flood stderr at 10 Hz.
@@ -1352,6 +1359,7 @@ fn run() -> Result<(), String> {
         // and covers the board itself; this one exists today and only
         // covers the Linux process.
         notifier.watchdog(tick_start);
+        heartbeat.beat();
         if let Some(prev) = prev_tick_start {
             interval_max = interval_max.max(tick_start - prev);
         }
