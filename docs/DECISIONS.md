@@ -564,6 +564,102 @@ manifests, and the schema doc. With D-031 this completes the frame story: the
 control path consumes per-sensor offsets, and the manifest declares the frame
 they are measured in.
 
+## D-034: SIL I/O backend over zenoh, test builds only
+
+Status: proposed. `--sim` (D-020) runs the plant inside the process. It cannot
+host a third-party plant, a perception simulator in Keelson land, or several
+vessels in one scenario. This adds a third I/O backend beside `--sim` and
+`--port` for those cases: sensor measurements arrive over zenoh from an external
+simulator and per-effector outputs leave over zenoh to it. A test instrument, not
+a vessel interface; nothing here is a sensor bus or output backend for a real
+hull, and invariant 1 is not reopened.
+
+Shape. `--sil` selects the backend and is mutually exclusive with `--port` and
+`--sim`, so a SIL process opens no serial or CAN port and simulated data can
+never reach a real actuator. That exclusion is the load-bearing safety rule. The
+backend sits at the same two seams as real hardware: inbound messages become
+contract `Measurement`s through `core.ingest`, outbound values come from an
+`OutputBackend` taking the allocator's per-effector physical outputs. Drivers and
+parsers are bypassed; their own tests and the replay harness cover them.
+
+The manifest is the real vessel's and is not changed: no SIL bus kind, no
+schema bump. In SIL mode every manifest sensor is sourced from SIL by name and
+every effector is rendered to SIL regardless of its declared bus. Licensing
+applies unchanged, so an `enrichment` sensor is rejected from fusion exactly as
+on the water. Exercising the real trust path is the reason to build this rather
+than mock around the core.
+
+Wire. Same zenoh session as the Keelson adapter; one router, no second network
+setup. Payloads are Keelson's well-known subjects and messages, so any
+Keelson-speaking simulator works without a Coxswain-specific schema. Separation
+from telemetry comes from the entity, not the subject: the simulator publishes
+under its own entity id (`--sil-entity`, default `<vessel_id>-sil`), never the
+vessel's, because Coxswain's raw and fused telemetry already occupies
+`location_fix` and the rest under the vessel entity and would otherwise be
+ingested as input. Source id is the manifest sensor or effector id. Coxswain
+subscribes to exact keys derived from the manifest, not wildcards. Message
+definitions and key helpers live in coxswain-keelson; the backend lives in
+coxswain-hosted.
+
+Mapping, in. `location_fix` (covariance in-message) for GNSS position,
+`location_fix_quality` for fix mode, `heading_true_north_deg` with
+`heading_accuracy_deg`, `yaw_rate_degps`, `speed_over_ground_knots`,
+`course_over_ground_deg`, `battery_voltage_v` for `PowerStatus`. Injection is at
+the measurement level, so a compass sensor arrives as true heading; declination
+is the simulator's concern. Mapping, out: one message per effector per tick,
+rudder angle and thrust setpoint by effector id.
+
+Missing from Keelson, coxswain-specific subjects until upstream has them, in the
+existing `depth_below_transducer_m` manner, then retired:
+`yaw_rate_accuracy_degps`, `speed_over_ground_accuracy_knots`,
+`course_over_ground_accuracy_deg` (following `heading_accuracy_deg`), and
+commanded actuator values, `rudder_angle_setpoint_deg` and
+`thrust_setpoint_newton`. Keelson's `rudder_angle_deg` means the actual angle and
+`force_newton` is a general force vector; publishing commands on them would
+collide with a simulator's or a later actuator's reported state.
+`LocationFixQuality` and `Decomposed3DVector` need vendoring. The mapping was
+surveyed against keelson main; every subject is to be confirmed against the
+pinned 0.5.4 before code.
+
+Uncertainty. Keelson carries value and accuracy on separate subjects, and most
+streams have no accuracy subject at all. Each value takes its std from the latest
+accuracy message from the same source id, if that is within the sensor's
+staleness window; otherwise from the default the real driver uses for that
+measurement kind (`NMEA0183_HEADING_STD_RAD`, `SOG_STD_MPS` and the COG
+derivation from it, `fallback_std_m` for position), under the same bound as the
+driver self-test: a default never claims finer precision than a good measured
+value. A `location_fix` with covariance type `UNKNOWN` or an all-zero covariance
+counts as no accuracy; fusing a zero std would treat the fix as perfect. Yaw rate
+has no real driver yet, so it gets one new constant, documented as crude like
+`SOG_STD_MPS`. Fallback is logged once per sensor and published per sensor in
+health (std measured or defaulted), so a test can assert on it. Rejected: dropping
+values without accuracy (no stock Keelson simulator could feed yaw rate, SOG, or
+COG, and SIL would diverge from the real driver path); per-sensor std in a SIL
+config (configuration D-032 keeps out until system identification can fill it).
+
+Timing. Free-running clocks, as with hardware. Coxswain stamps each SIL message
+on arrival with its own monotonic clock and ignores the simulator's time, as it
+does for serial bytes. The simulator publishes at realistic rates and consumes
+outputs as they arrive. Latency, jitter, and loss reach the estimator as they
+would on a vessel, and a silent simulator trips staleness and failsafe like a
+dead sensor. Runs are not bit-reproducible; reproducibility stays with `--sim`
+and the replay harness.
+
+Containment. Behind a `sil` cargo feature on coxswain-hosted, off by default.
+The release image (contrib/docker) builds default features, so the binary on a
+vessel cannot enter SIL mode; a separate image tag carries it. The I/O backend
+in use (real, sim, sil) is published in health so nothing upstream mistakes a
+test vessel for a real one; `--sim` has the same confusability and gets the same
+marker. Arming and conn claims work as normal in SIL mode, since testing them is
+the point. Hosted-only; H7 hardware-in-the-loop takes its own path (TASKS
+Phase 8).
+
+Open within this entry: actuator feedback from the simulator (Cyphal-style
+reports, where its `rudder_angle_deg` would come in), deferred until a test
+needs it; proposing the missing subjects upstream to Keelson; and whether a
+raw-sentence injection mode is worth adding to exercise the drivers, deferred
+with no current case.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest
