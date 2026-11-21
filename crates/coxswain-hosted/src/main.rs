@@ -455,13 +455,36 @@ fn parse_n2k_sources(raw: &str) -> SourceFilter {
     )
 }
 
+/// Raw pass-through source ids by compiler-assigned sensor id:
+/// `coxswain/<sensor name>` (Keelson 0.6 §2.1.1). Built once at boot; the
+/// numeric id never reaches the bus.
+fn raw_source_ids(sensors: &[SensorEntry]) -> HashMap<u16, String> {
+    sensors
+        .iter()
+        .map(|s| {
+            (
+                s.id.0,
+                coxswain_keelson::keys::sensor_source_id(s.name.as_str()),
+            )
+        })
+        .collect()
+}
+
+/// A measurement's raw source id. Every measurement comes from a manifest
+/// sensor, so the fallback is unreachable in practice; it keeps a bug
+/// visible on the bus rather than a panic in the loop.
+fn raw_source_id(ids: &HashMap<u16, String>, sensor: SensorId) -> &str {
+    ids.get(&sensor.0)
+        .map_or("coxswain/unknown_sensor", String::as_str)
+}
+
 /// One sensor's manifest-declared N2K filter: which PGNs belong to it
 /// (`Nmea2000Quirks::pgns`) and which source addresses it accepts. Several
 /// enrichment sensors can share one physical CAN bus (example.toml's
 /// "instruments" bus), each selecting its own slice of the traffic.
 struct Nmea2000SensorFilter {
-    /// The sensor's authored id, used as the Keelson source_id its decoded
-    /// values publish under.
+    /// The Keelson source_id its decoded values publish under: producer
+    /// `coxswain`, then the sensor's authored id.
     source_id: String,
     pgns: Vec<u32>,
     sources: SourceFilter,
@@ -484,7 +507,7 @@ fn nmea2000_sensors(bus_id: &str, sensors: &[SensorEntry]) -> Vec<Nmea2000Sensor
         .filter_map(|s| {
             let quirks = s.nmea2000?;
             Some(Nmea2000SensorFilter {
-                source_id: s.name.as_str().to_string(),
+                source_id: coxswain_keelson::keys::sensor_source_id(s.name.as_str()),
                 pgns: quirks.pgns.as_slice().to_vec(),
                 sources: parse_n2k_sources(quirks.sources.as_str()),
             })
@@ -1304,6 +1327,8 @@ fn run() -> Result<(), String> {
     // tell systemd, if it's listening (`$NOTIFY_SOCKET` unset otherwise, the
     // no-op case). `contrib/coxswain.service`'s `Type=notify` waits for
     // exactly this before treating the unit as started.
+    let raw_sources = raw_source_ids(manifest.sensors.as_slice());
+
     let mut notifier = sd_notify::Notifier::from_env();
     notifier.ready();
     // Armed after boot so manifest checks and session setup never count as
@@ -1398,7 +1423,7 @@ fn run() -> Result<(), String> {
             for m in sim.step(dt) {
                 ingest_measurement(&mut core, &mut ingest_error_logged, &m);
                 publish(
-                    endpoint.publish_raw(wall, &m, &format!("raw/{}", m.sensor.0)),
+                    endpoint.publish_raw(wall, &m, raw_source_id(&raw_sources, m.sensor)),
                     &mut publish_error_logged,
                 );
             }
@@ -1428,7 +1453,11 @@ fn run() -> Result<(), String> {
                         for m in batch.iter() {
                             ingest_measurement(&mut core, &mut ingest_error_logged, m);
                             publish(
-                                endpoint.publish_raw(wall, m, &format!("raw/{}", m.sensor.0)),
+                                endpoint.publish_raw(
+                                    wall,
+                                    m,
+                                    raw_source_id(&raw_sources, m.sensor),
+                                ),
                                 &mut publish_error_logged,
                             );
                         }
@@ -1752,7 +1781,7 @@ mod tests {
         ];
         let filters = nmea2000_sensors("instruments", &sensors);
         assert_eq!(filters.len(), 1);
-        assert_eq!(filters[0].source_id, "n2k_wind");
+        assert_eq!(filters[0].source_id, "coxswain/n2k_wind");
         assert_eq!(filters[0].pgns, vec![130306]);
     }
 
@@ -1769,6 +1798,18 @@ mod tests {
             ..Default::default()
         }];
         assert!(nmea2000_sensors("instruments", &sensors).is_empty());
+    }
+
+    #[test]
+    fn raw_source_ids_use_the_authored_name_not_the_numeric_id() {
+        let sensors = [SensorEntry {
+            id: SensorId(4),
+            name: FixedStr32::new("gnss_main").unwrap(),
+            ..Default::default()
+        }];
+        let ids = raw_source_ids(&sensors);
+        assert_eq!(raw_source_id(&ids, SensorId(4)), "coxswain/gnss_main");
+        assert_eq!(raw_source_id(&ids, SensorId(9)), "coxswain/unknown_sensor");
     }
 
     #[test]
@@ -1797,8 +1838,14 @@ mod tests {
         ];
         let filters = nmea2000_sensors("instruments", &sensors);
         assert_eq!(filters.len(), 2);
-        let wind = filters.iter().find(|f| f.source_id == "n2k_wind").unwrap();
-        let depth = filters.iter().find(|f| f.source_id == "n2k_depth").unwrap();
+        let wind = filters
+            .iter()
+            .find(|f| f.source_id == "coxswain/n2k_wind")
+            .unwrap();
+        let depth = filters
+            .iter()
+            .find(|f| f.source_id == "coxswain/n2k_depth")
+            .unwrap();
         assert!(wind.matches(130306, 5));
         assert!(!wind.matches(128267, 5));
         assert!(depth.matches(128267, 5));

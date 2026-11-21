@@ -19,7 +19,7 @@ use zenoh::pubsub::Subscriber;
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 const BASE_PATH: &str = "cox_test";
 const ENTITY: &str = "raw_loopback";
-const SOURCE: &str = "raw/1";
+const SOURCE: &str = "coxswain/gnss_main";
 
 fn isolated_session() -> zenoh::Session {
     let mut config = zenoh::Config::default();

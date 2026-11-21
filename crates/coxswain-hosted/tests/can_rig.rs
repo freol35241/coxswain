@@ -650,7 +650,7 @@ fn heading_pinning_and_gnss_fast_packet() {
                 source_id,
                 heading_deg,
                 ..
-            } if source_id == "n2k_heading" => {
+            } if source_id == "coxswain/n2k_heading" => {
                 heading_values.push(heading_deg);
             }
             StateUpdate::Position {
@@ -658,7 +658,7 @@ fn heading_pinning_and_gnss_fast_packet() {
                 lat_deg,
                 lon_deg,
                 ..
-            } if source_id == "n2k_position" => {
+            } if source_id == "coxswain/n2k_position" => {
                 position = Some((lat_deg, lon_deg));
             }
             _ => {}

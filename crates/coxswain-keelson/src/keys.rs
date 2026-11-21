@@ -1,10 +1,19 @@
-//! Keelson key expressions. Conventions per RISE-Maritime/keelson 0.5.4:
+//! Keelson key expressions. Conventions per RISE-Maritime/keelson
+//! 0.6.0-pre.19 (docs/protocol-specification.md):
 //! `{base_path}/@v0/{entity_id}/pubsub/{subject}/{source_id}` for pub/sub,
-//! `{base_path}/@v0/{entity_id}/@rpc/{procedure}/{responder_id}` for RPC.
+//! with `source_id` = `{producer}/.../{identity}` (§2.1.1), and liveliness
+//! tokens per producer and per subject (§5).
+//!
+//! RPC keys are `{base_path}/@v0/{entity_id}/@rpc/{procedure}/{responder_id}`.
+//! That predates 0.6's `@rpc/{interface}/{version}/...` shape and is kept
+//! deliberately until the D-035 command-interface split; for the same reason
+//! no RPC interface liveliness token is declared, since its key is defined by
+//! interface and version.
 
 use coxswain_contract::ClaimantId;
 
-/// Responder and source id for everything the vessel side serves.
+/// Producer id for everything the vessel side publishes and serves. Fused
+/// streams use it alone; raw pass-through extends it with the sensor name.
 pub const COXSWAIN: &str = "coxswain";
 
 /// Well-known Keelson subjects (messages/subjects.yaml) used here, plus the
@@ -33,10 +42,9 @@ pub mod subject {
     pub const APPARENT_WIND_SPEED_MPS: &str = "apparent_wind_speed_mps";
     /// keelson.TimestampedFloat, degrees.
     pub const APPARENT_WIND_ANGLE_DEG: &str = "apparent_wind_angle_deg";
-    /// keelson.TimestampedFloat, metres. Not in keelson 0.5.4's registry
-    /// (surveyed against messages/subjects.yaml at authoring time): a
-    /// minimal coxswain-specific addition, N2K PGN 128267's primary value
-    /// only (offset/range are dropped, not worth a subject each yet).
+    /// keelson.TimestampedFloat, metres. Coxswain-specific when added, now a
+    /// well-known subject (Keelson 0.6 echo-sounder depth). N2K PGN 128267's
+    /// primary value only; offset and range are dropped.
     pub const DEPTH_BELOW_TRANSDUCER_M: &str = "depth_below_transducer_m";
     /// keelson.EntityHealth.
     pub const ENTITY_HEALTH: &str = "entity_health";
@@ -55,6 +63,20 @@ pub fn pubsub_key(base_path: &str, entity_id: &str, subject: &str, source_id: &s
 
 pub fn rpc_key(base_path: &str, entity_id: &str, procedure: &str, responder_id: &str) -> String {
     format!("{base_path}/@v0/{entity_id}/@rpc/{procedure}/{responder_id}")
+}
+
+/// Source id for a sensor's raw pass-through: producer `coxswain`, the
+/// device as the identity chunk (§2.1.1, §2.1.2). The authored sensor name,
+/// not the compiler-assigned numeric id, which means nothing off the vessel.
+pub fn sensor_source_id(sensor_name: &str) -> String {
+    format!("{COXSWAIN}/{sensor_name}")
+}
+
+/// Source-level liveliness token key (§5.1): the producer is present,
+/// category-agnostic. Subject-level tokens use [`pubsub_key`] at the producer
+/// prefix (§5.2).
+pub fn source_token_key(base_path: &str, entity_id: &str, producer: &str) -> String {
+    format!("{base_path}/@v0/{entity_id}/*/{producer}")
 }
 
 /// Source id a claimant publishes setpoints under. The key chunk is the only
@@ -89,6 +111,28 @@ mod tests {
         assert_eq!(
             rpc_key("example", "vessel", "conn_request", "coxswain"),
             "example/@v0/vessel/@rpc/conn_request/coxswain"
+        );
+    }
+
+    #[test]
+    fn sensor_source_id_is_producer_then_device() {
+        assert_eq!(sensor_source_id("gnss_main"), "coxswain/gnss_main");
+        assert_eq!(
+            pubsub_key(
+                "keelson",
+                "vessel",
+                "location_fix",
+                &sensor_source_id("gnss_main")
+            ),
+            "keelson/@v0/vessel/pubsub/location_fix/coxswain/gnss_main"
+        );
+    }
+
+    #[test]
+    fn source_token_key_exact() {
+        assert_eq!(
+            source_token_key("keelson", "vessel", COXSWAIN),
+            "keelson/@v0/vessel/*/coxswain"
         );
     }
 
