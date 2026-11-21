@@ -583,10 +583,15 @@ tests and the replay harness cover them. Licensing applies unchanged, so an
 other bus. A `keelson` bus needs no `--port`; the manifest specifies it fully, as
 for `nmea0183_udp`.
 
-Self-sufficiency is a property of the bus kind. Serial, CAN, SPI, I2C, PWM, and
-`nmea0183_udp` on `segment = "conn"` terminate at the conn node; `keelson` is
-external, since its path runs through a zenoh router and whatever publishes
-there. The manifest declares `[conn_node] self_sufficient = true | false`, and
+Self-sufficiency follows the path, evaluated per bus from its kind, segment,
+and source pinning, not from the protocol. Serial, CAN, SPI, I2C, and PWM buses
+terminate at the conn node. An `nmea0183_udp` bus does when it is on `segment =
+"conn"` with `source_ip` pinned, the condition D-014 already sets for
+`inner_loop`. A `keelson` bus is always external in this entry: its path runs
+through a zenoh router and its publishers cannot be pinned. A router-less,
+pinned zenoh peer on the conn segment would be conn-terminated on the same
+reasoning; classing it so is left to its own decision, and effectors on it
+would still meet D-011. The manifest declares `[conn_node] self_sufficient = true | false`, and
 the compiler requires the declaration to match the manifest exactly: `true` if
 and only if no `inner_loop` sensor and no effector sits on an external bus.
 Enrichment sensors on an external bus do not affect it. A mismatch either way
