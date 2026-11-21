@@ -38,8 +38,8 @@ coxswain-n2k = { path = "../coxswain-n2k" }
 # --record-nmea's raw-log format (recorder.rs); the same JSONL format
 # cxconvert reads, so today's capture is this evening's replay regression.
 coxswain-replay = { path = "../coxswain-replay" }
-# Session construction only; same 1.9 line the keelson crate pins.
-zenoh = "1.9"
+# Session construction only; same 1.10 line the keelson crate pins.
+zenoh = "1.10"
 # Raw termios for real serial ports (serial.rs); already a transitive
 # dependency via zenoh, promoted to direct since this crate now calls it.
 libc = "0.2"

@@ -5,7 +5,7 @@
 # spawned by integration tests (CLAUDE.md: same image as CI).
 set -euo pipefail
 
-ZENOH_VERSION=1.9.0
+ZENOH_VERSION=1.10.1
 
 rustup show
 
