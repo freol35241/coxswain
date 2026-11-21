@@ -1,15 +1,14 @@
-# Coxswain Vessel Manifest: Schema Draft v0.8
+# Coxswain Vessel Manifest: Schema Draft v0.9
 
 The manifest is the per-vessel statement of what exists, where it terminates, and what
 the estimator is licensed to trust. It is authored as TOML, validated and compiled
 host-side to a signed, CRC-protected binary blob (postcard), and written to an A/B flash
 region on the conn node during commissioning. The firmware treats it as pure data.
 
-Doc revision is v0.8. The wire-facing `manifest.schema_version` bumps 6 -> 7 for a
-dedicated `[geometry]` section (D-033): the body-frame `origin` label moves off
-`[estimator]`, which does not own the frame. The compiled blob layout does not
-change, only the version integer; the bump is forced by the authored shape so a
-schema_version 6 reader rejects a schema_version 7 blob outright rather than
+Doc revision is v0.9. The wire-facing `manifest.schema_version` bumps 7 -> 8 for
+the `keelson` bus kind and the declared `[conn_node] self_sufficient` promise
+(D-034). Unlike the last few bumps the compiled blob layout changes too. A
+schema_version 7 reader rejects a schema_version 8 blob outright rather than
 mis-parsing it, same doctrine as every prior bump.
 
 Design rules encoded in this schema:
@@ -57,6 +56,7 @@ date           = "2026-07-08"
 [conn_node]
 board          = "nucleo-h753zi"     # hardware profile, not necessarily fabricated hardware (D-016)
 watchdog_ms    = 250                 # hardware watchdog kick interval
+self_sufficient = true               # declared, compiler-checked (D-034)
 
 # ------------------------------------------------------------
 # Geometry: the body frame's named reference point (D-033). Descriptive
@@ -69,7 +69,7 @@ origin  = "midship_waterline"             # vessel body-frame origin convention
 # ------------------------------------------------------------
 # Buses: every sensor/actuator references one of these by id.
 # Kinds: cyphal_can | nmea2000_can | nmea0183_uart | nmea0183_udp | spi | i2c | uart
-#      | actuator_uart | pwm | crsf_uart
+#      | actuator_uart | pwm | crsf_uart | keelson
 # Identity (id/kind/port) is flat; kind-gated fields nest in [bus.<kind>]
 # (D-030). spi/i2c/pwm gate no fields, so no sub-table.
 # ------------------------------------------------------------
@@ -448,6 +448,15 @@ max_yaw_nm         = 60.0
   `coxswain-allocation`'s own config checks so a bad table fails at compile
   rather than at the allocator's boot self-test
 - A `pwm` bus is refused when `conn_node.board = "hosted"` (D-027)
+- A `keelson` bus exists only when `conn_node.board = "hosted"`, must author
+  `[bus.keelson] entity`, and that entity must not be `manifest.vessel_id`
+  (D-034). It claims no physical port, so several may share a placeholder
+  `port`. A keelson effector's `[effector.output]` table is present and empty
+- `[conn_node] self_sufficient` is required and must match the manifest
+  exactly: `true` if and only if no `inner_loop` sensor and no effector sits on
+  an external bus. A `keelson` bus is always external; an `nmea0183_udp` bus is
+  external unless it is pinned (`source_ip`) on `segment = "conn"`; every other
+  kind terminates at the conn node. Enrichment sensors do not count (D-034)
 - Per serial output bus, `[[effector]]` channels are exactly `0..n`, no gaps:
   they are positional on the wire (Cyphal effectors are addressed by subject,
   not channel, so they do not participate)
@@ -553,7 +562,26 @@ not carry it, and nothing in firmware or the control loop reads it. The blob
 layout does not move; only `schema_version` bumps 6 -> 7, forced by the
 authored shape.
 
-## Open questions for v0.9
+**Settled since v0.9:** the `keelson` bus kind and the self-sufficiency promise
+(D-034). A keelson bus carries sensors and effectors over zenoh as Keelson
+messages under its own entity:
+
+```toml
+[[bus]]
+id   = "sil"
+kind = "keelson"
+port = "zenoh"                 # placeholder; a keelson bus claims no port
+[bus.keelson]
+entity = "cx-sil-01-sil"       # never the vessel's own entity
+```
+
+Sensors on it author `driver = "keelson"`; effectors on it author an empty
+`[effector.output]`. `[conn_node] self_sufficient` declares whether anything
+licensed or actuating rides an external bus; the compiler checks the
+declaration, the signed blob carries it, health publishes it, and release
+builds refuse `false`.
+
+## Open questions for v0.10
 
 1. **Per-vessel noise parameters.** Process noise Q is fixed per-model in the
    estimator and measurement noise R is the per-measurement declared std; neither

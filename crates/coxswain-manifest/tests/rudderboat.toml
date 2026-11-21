@@ -6,7 +6,7 @@
 # ============================================================
 
 [manifest]
-schema_version = 7
+schema_version = 8
 vessel_id      = "se-rise-rudderboat-01"
 name           = "Rudderboat"
 revision       = 1
@@ -16,6 +16,7 @@ date           = "2026-07-12"
 [conn_node]
 board          = "nucleo-h753zi"
 watchdog_ms    = 250
+self_sufficient = true
 
 [geometry]
 origin  = "midship_waterline"

@@ -306,7 +306,7 @@ impl Drop for FrameSender {
 
 const MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 7
+schema_version = 8
 vessel_id      = "cx-cyphal-rig-01"
 name           = "Cyphal CAN Rig"
 revision       = 1
@@ -316,6 +316,7 @@ date           = "2026-07-14"
 [conn_node]
 board       = "hosted"
 watchdog_ms = 250
+self_sufficient = true
 
 [[bus]]
 id       = "ctrl"
