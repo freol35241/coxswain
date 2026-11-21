@@ -464,7 +464,7 @@ fn raw_source_ids(sensors: &[SensorEntry]) -> HashMap<u16, String> {
         .map(|s| {
             (
                 s.id.0,
-                coxswain_keelson::keys::sensor_source_id(s.name.as_str()),
+                coxswain_keelson::keys::device_source_id(s.name.as_str()),
             )
         })
         .collect()
@@ -507,7 +507,7 @@ fn nmea2000_sensors(bus_id: &str, sensors: &[SensorEntry]) -> Vec<Nmea2000Sensor
         .filter_map(|s| {
             let quirks = s.nmea2000?;
             Some(Nmea2000SensorFilter {
-                source_id: coxswain_keelson::keys::sensor_source_id(s.name.as_str()),
+                source_id: coxswain_keelson::keys::device_source_id(s.name.as_str()),
                 pgns: quirks.pgns.as_slice().to_vec(),
                 sources: parse_n2k_sources(quirks.sources.as_str()),
             })
@@ -1670,7 +1670,10 @@ fn run() -> Result<(), String> {
                         low_voltage: out.directive.low_voltage,
                         power_stale: out.directive.power_stale,
                     },
-                    &actuation,
+                    coxswain_keelson::IoHealth {
+                        actuation: &actuation,
+                        std_sources: &[],
+                    },
                 ),
                 &mut publish_error_logged,
             );
@@ -1679,7 +1682,17 @@ fn run() -> Result<(), String> {
                 &mut publish_error_logged,
             );
             publish(
-                endpoint.publish_manifest_info(wall, hash, manifest.revision),
+                endpoint.publish_manifest_info(
+                    wall,
+                    hash,
+                    manifest.revision,
+                    manifest.conn_node.self_sufficient,
+                    if sim_enabled {
+                        coxswain_keelson::IoSource::Sim
+                    } else {
+                        coxswain_keelson::IoSource::Buses
+                    },
+                ),
                 &mut publish_error_logged,
             );
             // Rust's stdout is line-buffered; each line lands whole in the

@@ -8,6 +8,7 @@
 //! Host-only. The core runs on injected monotonic time; wall-clock time
 //! enters here at the edge, as `SystemTime` parameters on every publish.
 
+mod bus;
 mod claimant;
 mod convert;
 mod error;
@@ -15,8 +16,12 @@ pub mod keys;
 pub mod proto;
 mod vessel;
 
+pub use bus::{
+    BusEffector, BusEffectorKind, BusInput, BusSensor, BusSensorKind, KeelsonBusInput,
+    KeelsonBusOutput, StdDefaults, StdSource,
+};
 pub use claimant::{ClaimantClient, HealthUpdate, StateUpdate};
 pub use convert::{ned_cov_to_enu, setpoint_from_proto, setpoint_to_proto};
 pub use error::Error;
 pub use proto::coxswain::conn_reply::Result as ConnReplyResult;
-pub use vessel::{ConnEvent, Event, PowerHealth, ReplyHandle, VesselEndpoint};
+pub use vessel::{ConnEvent, Event, IoHealth, IoSource, PowerHealth, ReplyHandle, VesselEndpoint};
