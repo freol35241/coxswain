@@ -574,28 +574,27 @@ whatever publishes there, effectors on it are rendered to zenoh. It is a bus
 kind like `nmea0183_udp`, not a mode, so it composes with real buses in one
 manifest.
 
-Shape. The bus sits at the same two seams as every other bus: inbound
-messages become contract `Measurement`s through `core.ingest`, outbound values
-come from an `OutputBackend` taking the allocator's per-effector physical
-outputs. Drivers and parsers are bypassed for sensors on this bus; their own
-tests and the replay harness cover them. Licensing applies unchanged, so an
-`enrichment` sensor on a `keelson` bus is rejected from fusion exactly as on any
-other bus. A `keelson` bus needs no `--port`; the manifest specifies it fully, as
-for `nmea0183_udp`.
+Shape. The bus sits at the same two seams as every other bus: inbound messages
+become contract `Measurement`s through `core.ingest`, outbound values come from
+an `OutputBackend` taking the allocator's per-effector physical outputs. Drivers
+and parsers are bypassed for sensors on this bus; their own tests and the replay
+harness cover them. Licensing applies unchanged, so an `enrichment` sensor on a
+`keelson` bus is rejected from fusion exactly as on any other bus. A `keelson`
+bus needs no `--port`; the manifest specifies it fully, as for `nmea0183_udp`.
 
-Self-sufficiency follows the path, evaluated per bus from its kind, segment,
-and source pinning, not from the protocol. Serial, CAN, SPI, I2C, and PWM buses
+Self-sufficiency follows the path, evaluated per bus from its kind, segment, and
+source pinning, not from the protocol. Serial, CAN, SPI, I2C, and PWM buses
 terminate at the conn node. An `nmea0183_udp` bus does when it is on `segment =
 "conn"` with `source_ip` pinned, the condition D-014 already sets for
 `inner_loop`. A `keelson` bus is always external in this entry: its path runs
 through a zenoh router and its publishers cannot be pinned. A router-less,
 pinned zenoh peer on the conn segment would be conn-terminated on the same
-reasoning; classing it so is left to its own decision, and effectors on it
-would still meet D-011. The manifest declares `[conn_node] self_sufficient = true | false`, and
-the compiler requires the declaration to match the manifest exactly: `true` if
-and only if no `inner_loop` sensor and no effector sits on an external bus.
-Enrichment sensors on an external bus do not affect it. A mismatch either way
-is a compile error, so the declared value is never stale.
+reasoning; classing it so is left to its own decision, and effectors on it would
+still meet D-011. The manifest declares `[conn_node] self_sufficient = true |
+false`, and the compiler requires the declaration to match the manifest exactly:
+`true` if and only if no `inner_loop` sensor and no effector sits on an external
+bus. Enrichment sensors on an external bus do not affect it. A mismatch either
+way is a compile error, so the declared value is never stale.
 
 Why declared and checked rather than inferred: inferring it would let one
 changed bus reference silently downgrade the vessel's guarantee. Declaring it
@@ -658,8 +657,8 @@ existing `depth_below_transducer_m` manner, then retired:
 `yaw_rate_accuracy_degps`, `speed_over_ground_accuracy_knots`,
 `course_over_ground_accuracy_deg` (following `heading_accuracy_deg`), and
 commanded actuator values, `rudder_angle_setpoint_deg` and
-`thrust_setpoint_newton`. Keelson's `rudder_angle_deg` means the actual angle and
-`force_newton` is a general force vector; publishing commands on them would
+`thrust_setpoint_newton`. Keelson's `rudder_angle_deg` means the actual angle
+and `force_newton` is a general force vector; publishing commands on them would
 collide with a simulator's or a later actuator's reported state.
 `LocationFixQuality` and `Decomposed3DVector` need vendoring. The mapping was
 surveyed against keelson main; every subject is to be confirmed against the
