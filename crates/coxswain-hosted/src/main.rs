@@ -38,6 +38,8 @@ use coxswain_sim::{GnssModel, HeadingModel, Simulator, YawRateModel};
 use zenoh::Wait;
 
 mod can;
+#[cfg(feature = "keelson-bus")]
+mod keelson_bus;
 mod recorder;
 mod sd_notify;
 mod serial;
@@ -821,6 +823,20 @@ fn run() -> Result<(), String> {
     let manifest =
         coxswain_manifest::read(&blob, &pubkey).map_err(|e| format!("{}: {e}", args.manifest))?;
     let hash = coxswain_manifest::manifest_hash(&blob);
+    // D-034: a release build runs only manifests that declare themselves
+    // self-sufficient. The manifest cannot guard against being deployed to
+    // the wrong place; the binary can.
+    #[cfg(not(feature = "keelson-bus"))]
+    if !manifest.conn_node.self_sufficient {
+        return Err(format!(
+            "{}: declares self_sufficient = false; this build runs only self-sufficient \
+             manifests (D-034). Test setups use a build with --features keelson-bus",
+            args.manifest
+        ));
+    }
+    // Opened before any bus is wired: a keelson bus rides this session too
+    // (D-034). The Keelson adapter takes a clone further down.
+    let session = open_session(&args)?;
 
     let boot = Instant::now();
     let now_ts = |boot: &Instant| Timestamp::from_nanos(boot.elapsed().as_nanos() as u64);
@@ -838,7 +854,29 @@ fn run() -> Result<(), String> {
         b.kind == BusKind::Nmea0183Udp
             && nmea0183_wiring(b.id.as_str(), manifest.sensors.as_slice()).is_some()
     });
-    let sim_enabled = args.sim || (args.ports.is_empty() && !udp_gnss_wired);
+    // A keelson bus carrying sensors or effectors is real I/O in the same
+    // sense (D-034), on a build that can wire it. Without the feature such a
+    // bus can only hold enrichment sensors (the compiler guarantees it for a
+    // self-sufficient manifest) and is left unwired below.
+    let keelson_carrying: Vec<&str> = manifest
+        .buses
+        .iter()
+        .filter(|b| {
+            b.kind == BusKind::Keelson
+                && (manifest.sensors.iter().any(|s| s.bus == b.id)
+                    || manifest.effectors.iter().any(|e| e.bus == b.id))
+        })
+        .map(|b| b.id.as_str())
+        .collect();
+    let keelson_wired = cfg!(feature = "keelson-bus") && !keelson_carrying.is_empty();
+    if args.sim && keelson_wired {
+        return Err(format!(
+            "--sim with keelson buses carrying sensors or effectors ({}): two plants would \
+             feed one estimator (D-034)",
+            keelson_carrying.join(", ")
+        ));
+    }
+    let sim_enabled = args.sim || (args.ports.is_empty() && !udp_gnss_wired && !keelson_wired);
     let mut sim: Option<Simulator> = if sim_enabled {
         // This profile's simulator backend needs a plant; a
         // constant_velocity manifest has no physics to run forward, so it
@@ -920,6 +958,12 @@ fn run() -> Result<(), String> {
             .iter()
             .find(|b| b.id.as_str() == bus_id)
             .ok_or_else(|| format!("--port {bus_id}=...: no such bus in the manifest"))?;
+        if bus.kind == BusKind::Keelson {
+            return Err(format!(
+                "--port {bus_id}=...: a keelson bus needs no --port; the manifest specifies it \
+                 fully (D-034)"
+            ));
+        }
         if !matches!(
             bus.kind,
             BusKind::Nmea0183Uart
@@ -963,6 +1007,11 @@ fn run() -> Result<(), String> {
     if !sim_enabled {
         for bus in manifest.buses.iter() {
             if port_map.contains_key(bus.id.as_str()) {
+                continue;
+            }
+            if bus.kind == BusKind::Keelson {
+                // Needs no --port (D-034); wired by the keelson block below,
+                // or warned unwired on a build without the feature.
                 continue;
             }
             if bus.kind == BusKind::Nmea0183Udp {
@@ -1306,6 +1355,16 @@ fn run() -> Result<(), String> {
         .collect();
     let mut actuation_diverged = vec![false; manifest.effectors.as_slice().len()];
 
+    #[cfg(feature = "keelson-bus")]
+    let mut keelson_links = keelson_bus::open_links(&session, &manifest, boot)?;
+    #[cfg(not(feature = "keelson-bus"))]
+    for bus_id in &keelson_carrying {
+        eprintln!(
+            "coxswain-hosted: keelson bus {bus_id:?} carries enrichment only and this build has \
+             no keelson-bus feature; not wired"
+        );
+    }
+
     let mut core = Core::new(&manifest.config);
     // Register the RC claimant at boot with its manifest-authored id
     // (`[rc].claimant`, the rudderboat example's `[[claimant]] name = "rc"`),
@@ -1319,16 +1378,15 @@ fn run() -> Result<(), String> {
     }
     let mut rc_kill_engaged = false;
 
-    let session = open_session(&args)?;
-    let mut endpoint = VesselEndpoint::new(session, "keelson", manifest.vessel_id.as_str())
+    let mut endpoint = VesselEndpoint::new(session.clone(), "keelson", manifest.vessel_id.as_str())
         .map_err(|e| format!("keelson endpoint: {e}"))?;
+
+    let raw_sources = raw_source_ids(manifest.sensors.as_slice());
 
     // Boot complete (manifest verified, buses mapped, zenoh session up):
     // tell systemd, if it's listening (`$NOTIFY_SOCKET` unset otherwise, the
     // no-op case). `contrib/coxswain.service`'s `Type=notify` waits for
     // exactly this before treating the unit as started.
-    let raw_sources = raw_source_ids(manifest.sensors.as_slice());
-
     let mut notifier = sd_notify::Notifier::from_env();
     notifier.ready();
     // Armed after boot so manifest checks and session setup never count as
@@ -1431,6 +1489,33 @@ fn run() -> Result<(), String> {
                 t: now,
                 voltage_v: sim.voltage(),
             });
+        }
+
+        // Keelson buses (D-034): measurements take the same ingest/publish
+        // path as any driver's; voltage feeds the supervisor's power intake.
+        #[cfg(feature = "keelson-bus")]
+        for link in &mut keelson_links {
+            for input in link.input.poll() {
+                match input {
+                    coxswain_keelson::BusInput::Measurement(m) => {
+                        ingest_measurement(&mut core, &mut ingest_error_logged, &m);
+                        publish(
+                            endpoint.publish_raw(wall, &m, raw_source_id(&raw_sources, m.sensor)),
+                            &mut publish_error_logged,
+                        );
+                    }
+                    coxswain_keelson::BusInput::Power { t, voltage_v } => {
+                        core.power(PowerStatus { t, voltage_v });
+                    }
+                }
+            }
+            if !link.dropped_logged && link.input.dropped() > 0 {
+                eprintln!(
+                    "coxswain-hosted: keelson bus {:?}: malformed samples dropped (continuing)",
+                    link.bus_id
+                );
+                link.dropped_logged = true;
+            }
         }
 
         // Real GNSS-over-0183: drain whatever bytes the reader threads
@@ -1645,6 +1730,17 @@ fn run() -> Result<(), String> {
                     .write_outputs(outputs.values.as_slice(), &mut sink);
             }
         }
+        // Keelson bus effectors (D-034): one setpoint per effector per tick,
+        // zero demand included, same doctrine as the links above.
+        #[cfg(feature = "keelson-bus")]
+        for link in &keelson_links {
+            if let (Some(output), Some(outputs)) = (&link.output, out.outputs.as_ref()) {
+                publish(
+                    output.publish(wall, outputs.values.as_slice()),
+                    &mut publish_error_logged,
+                );
+            }
+        }
 
         if let Some(state) = &out.state {
             publish(
@@ -1656,6 +1752,13 @@ fn run() -> Result<(), String> {
         let elapsed = boot.elapsed();
         tick_max = tick_max.max(tick_start.elapsed());
         if elapsed >= next_status {
+            #[cfg(feature = "keelson-bus")]
+            let std_sources: Vec<(String, coxswain_keelson::StdSource)> = keelson_links
+                .iter()
+                .flat_map(|l| l.input.std_sources().iter().cloned())
+                .collect();
+            #[cfg(not(feature = "keelson-bus"))]
+            let std_sources: Vec<(String, coxswain_keelson::StdSource)> = Vec::new();
             let actuation: Vec<(&str, bool)> = actuation_effectors
                 .iter()
                 .map(|(i, name)| (name.as_str(), actuation_diverged[*i]))
@@ -1672,7 +1775,7 @@ fn run() -> Result<(), String> {
                     },
                     coxswain_keelson::IoHealth {
                         actuation: &actuation,
-                        std_sources: &[],
+                        std_sources: &std_sources,
                     },
                 ),
                 &mut publish_error_logged,

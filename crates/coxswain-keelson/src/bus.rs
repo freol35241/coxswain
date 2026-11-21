@@ -583,6 +583,229 @@ impl KeelsonBusOutput {
     }
 }
 
+/// The far side of a keelson bus: what a simulator, or a test, uses to feed
+/// sensors and receive setpoints, the way [`crate::ClaimantClient`] is the
+/// far side of the conn protocol. Publishes under `{subject}/{sensor name}`
+/// on the bus entity, the source id a simulator authoring its own vessel may
+/// use (Keelson 0.6 §2.1.2), and declares a producer token per sensor.
+pub struct KeelsonBusPeer {
+    session: zenoh::Session,
+    base_path: String,
+    entity: String,
+    _subscribers: Vec<Subscriber<()>>,
+    _liveliness: Vec<LivelinessToken>,
+}
+
+impl KeelsonBusPeer {
+    /// `sensors` fixes the subject tokens declared; `effectors` the
+    /// setpoints received, delivered as `(effector name, physical value)`
+    /// in radians or newtons.
+    pub fn new(
+        session: &zenoh::Session,
+        base_path: &str,
+        entity: &str,
+        sensors: &[(&str, BusSensorKind)],
+        effectors: &[(&str, BusEffectorKind)],
+    ) -> Result<(Self, Receiver<(String, f64)>), Error> {
+        let (tx, rx) = mpsc::channel();
+        let mut subscribers = Vec::new();
+        for &(name, kind) in effectors {
+            let subj = match kind {
+                BusEffectorKind::Rudder => subject::RUDDER_ANGLE_SETPOINT_DEG,
+                BusEffectorKind::Thruster => subject::THRUST_SETPOINT_NEWTON,
+            };
+            let key = keys::pubsub_key(base_path, entity, subj, &keys::device_source_id(name));
+            let tx = tx.clone();
+            let name = name.to_string();
+            let sub = session
+                .declare_subscriber(key)
+                .callback(move |sample| {
+                    let Ok((_, inner)) = open(&sample.payload().to_bytes()) else {
+                        return;
+                    };
+                    let Ok(msg) = keelson::TimestampedFloat::decode(inner.as_slice()) else {
+                        return;
+                    };
+                    let value = f64::from(msg.value);
+                    let value = match kind {
+                        BusEffectorKind::Rudder => value.to_radians(),
+                        BusEffectorKind::Thruster => value,
+                    };
+                    let _ = tx.send((name.clone(), value));
+                })
+                .wait()?;
+            subscribers.push(sub);
+        }
+        let mut liveliness = Vec::new();
+        for &(name, kind) in sensors {
+            liveliness.push(
+                session
+                    .liveliness()
+                    .declare_token(keys::source_token_key(base_path, entity, name))
+                    .wait()?,
+            );
+            for subj in kind.subjects() {
+                liveliness.push(
+                    session
+                        .liveliness()
+                        .declare_token(keys::pubsub_key(base_path, entity, subj, name))
+                        .wait()?,
+                );
+            }
+        }
+        Ok((
+            Self {
+                session: session.clone(),
+                base_path: base_path.to_string(),
+                entity: entity.to_string(),
+                _subscribers: subscribers,
+                _liveliness: liveliness,
+            },
+            rx,
+        ))
+    }
+
+    fn put_float(
+        &self,
+        subj: &str,
+        sensor: &str,
+        t_wall: SystemTime,
+        value: f64,
+    ) -> Result<(), Error> {
+        let msg = keelson::TimestampedFloat {
+            timestamp: Some(wall_to_proto(t_wall)),
+            value: value as f32,
+        };
+        let key = keys::pubsub_key(&self.base_path, &self.entity, subj, sensor);
+        self.session.put(key, seal(t_wall, &msg)).wait()?;
+        Ok(())
+    }
+
+    /// Publish one contract measurement as the Keelson subjects it maps to.
+    /// With `with_accuracy` the declared std goes out too, on the accuracy
+    /// subject or as the fix covariance; without it the bus falls back to
+    /// the driver default, as for a real instrument that reports none.
+    pub fn publish(
+        &self,
+        sensor: &str,
+        t_wall: SystemTime,
+        kind: &MeasurementKind,
+        with_accuracy: bool,
+    ) -> Result<(), Error> {
+        match *kind {
+            MeasurementKind::GnssPosition { position, std_m } => {
+                let var = std_m * std_m;
+                let (cov, cov_type) = if with_accuracy {
+                    (
+                        vec![var, 0.0, 0.0, 0.0, var, 0.0, 0.0, 0.0, 0.0],
+                        PositionCovarianceType::DiagonalKnown,
+                    )
+                } else {
+                    (vec![0.0; 9], PositionCovarianceType::Unknown)
+                };
+                let fix = foxglove::LocationFix {
+                    timestamp: Some(wall_to_proto(t_wall)),
+                    frame_id: String::new(),
+                    latitude: position.lat_rad.to_degrees(),
+                    longitude: position.lon_rad.to_degrees(),
+                    altitude: 0.0,
+                    position_covariance: cov,
+                    position_covariance_type: cov_type as i32,
+                };
+                let key =
+                    keys::pubsub_key(&self.base_path, &self.entity, subject::LOCATION_FIX, sensor);
+                self.session.put(key, seal(t_wall, &fix)).wait()?;
+            }
+            MeasurementKind::Heading {
+                heading_rad,
+                std_rad,
+            } => {
+                if with_accuracy {
+                    self.put_float(
+                        subject::HEADING_ACCURACY_DEG,
+                        sensor,
+                        t_wall,
+                        std_rad.to_degrees(),
+                    )?;
+                }
+                self.put_float(
+                    subject::HEADING_TRUE_NORTH_DEG,
+                    sensor,
+                    t_wall,
+                    heading_rad.to_degrees(),
+                )?;
+            }
+            MeasurementKind::YawRate {
+                yaw_rate_radps,
+                std_radps,
+            } => {
+                if with_accuracy {
+                    self.put_float(
+                        subject::YAW_RATE_ACCURACY_DEGPS,
+                        sensor,
+                        t_wall,
+                        std_radps.to_degrees(),
+                    )?;
+                }
+                self.put_float(
+                    subject::YAW_RATE_DEGPS,
+                    sensor,
+                    t_wall,
+                    yaw_rate_radps.to_degrees(),
+                )?;
+            }
+            MeasurementKind::SpeedOverGround { sog_mps, std_mps } => {
+                if with_accuracy {
+                    self.put_float(
+                        subject::SPEED_OVER_GROUND_ACCURACY_KNOTS,
+                        sensor,
+                        t_wall,
+                        std_mps / KNOTS_TO_MPS,
+                    )?;
+                }
+                self.put_float(
+                    subject::SPEED_OVER_GROUND_KNOTS,
+                    sensor,
+                    t_wall,
+                    sog_mps / KNOTS_TO_MPS,
+                )?;
+            }
+            MeasurementKind::CourseOverGround { cog_rad, std_rad } => {
+                if with_accuracy {
+                    self.put_float(
+                        subject::COURSE_OVER_GROUND_ACCURACY_DEG,
+                        sensor,
+                        t_wall,
+                        std_rad.to_degrees(),
+                    )?;
+                }
+                self.put_float(
+                    subject::COURSE_OVER_GROUND_DEG,
+                    sensor,
+                    t_wall,
+                    cog_rad.to_degrees(),
+                )?;
+            }
+            MeasurementKind::GnssPositionCov { .. } => {
+                return Err(Error::Protocol(
+                    "KeelsonBusPeer publishes GnssPosition, not GnssPositionCov",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish bus voltage on `battery_voltage_v`.
+    pub fn publish_voltage(
+        &self,
+        sensor: &str,
+        t_wall: SystemTime,
+        voltage_v: f64,
+    ) -> Result<(), Error> {
+        self.put_float(subject::BATTERY_VOLTAGE_V, sensor, t_wall, voltage_v)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

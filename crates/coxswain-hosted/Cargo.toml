@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# The keelson bus kind (D-034): sensors and effectors over zenoh, for SIL and
+# mixed bench setups. Off in release builds, which also refuse any manifest
+# declaring self_sufficient = false.
+keelson-bus = []
+
 [dependencies]
 coxswain-contract = { path = "../coxswain-contract" }
 coxswain-estimator = { path = "../coxswain-estimator" }
@@ -50,3 +56,7 @@ libc = "0.2"
 coxswain-model = { path = "../coxswain-model" }
 # The integration tests compile the example vessel manifest themselves.
 coxswain-manifest = { path = "../coxswain-manifest", features = ["std"] }
+
+[[test]]
+name = "keelson_bus_rig"
+required-features = ["keelson-bus"]

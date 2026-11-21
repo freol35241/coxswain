@@ -12,6 +12,7 @@ use zenoh::liveliness::LivelinessToken;
 use zenoh::pubsub::Subscriber;
 
 use crate::ConnReplyResult;
+use crate::bus::StdSource;
 use crate::convert::{open, seal, setpoint_to_proto, wall_to_proto};
 use crate::error::Error;
 use crate::keys::{self, COXSWAIN, subject};
@@ -49,6 +50,9 @@ pub struct HealthUpdate {
     /// subject: a Cyphal power node's voltage reaching the observable surface.
     pub low_voltage: bool,
     pub actuation_diverged: Vec<(String, bool)>,
+    /// Per keelson bus quantity (`<sensor>/<quantity>`), whether its last
+    /// std was measured or a driver default (D-034). Empty without one.
+    pub keelson_std: Vec<(String, StdSource)>,
 }
 
 pub struct ClaimantClient {
@@ -269,6 +273,7 @@ fn distill_health(enclosed_at: SystemTime, health: &keelson::EntityHealth) -> He
     let mut armed = false;
     let mut low_voltage = false;
     let mut actuation_diverged = Vec::new();
+    let mut keelson_std = Vec::new();
     for source in &health.sources {
         match source.name.as_str() {
             "supervisor" => {
@@ -286,6 +291,20 @@ fn distill_health(enclosed_at: SystemTime, health: &keelson::EntityHealth) -> He
                     actuation_diverged.push((subject.name.clone(), subject.level != nominal));
                 }
             }
+            "keelson_bus" => {
+                for subject in &source.subjects {
+                    let measured = subject
+                        .checks
+                        .iter()
+                        .any(|c| c.name == "std" && c.detail == "measured");
+                    let std = if measured {
+                        StdSource::Measured
+                    } else {
+                        StdSource::Defaulted
+                    };
+                    keelson_std.push((subject.name.clone(), std));
+                }
+            }
             _ => {}
         }
     }
@@ -294,6 +313,7 @@ fn distill_health(enclosed_at: SystemTime, health: &keelson::EntityHealth) -> He
         armed,
         low_voltage,
         actuation_diverged,
+        keelson_std,
     }
 }
 

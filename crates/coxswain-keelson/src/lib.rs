@@ -18,7 +18,7 @@ mod vessel;
 
 pub use bus::{
     BusEffector, BusEffectorKind, BusInput, BusSensor, BusSensorKind, KeelsonBusInput,
-    KeelsonBusOutput, StdDefaults, StdSource,
+    KeelsonBusOutput, KeelsonBusPeer, StdDefaults, StdSource,
 };
 pub use claimant::{ClaimantClient, HealthUpdate, StateUpdate};
 pub use convert::{ned_cov_to_enu, setpoint_from_proto, setpoint_to_proto};
