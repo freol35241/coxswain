@@ -1,0 +1,37 @@
+# SIL rig: zenohd and coxswain-hosted built with the keelson bus (D-034).
+# Bring your own simulator: it connects to the router and speaks the keys
+# below for the vessel manifest in /etc/coxswain (one with
+# `self_sufficient = false` and its sensors and effectors on a keelson bus).
+#
+#   in:  keelson/@v0/<bus entity>/pubsub/<subject>/<sensor id>
+#   out: keelson/@v0/<bus entity>/pubsub/{rudder_angle_setpoint_deg,thrust_setpoint_newton}/coxswain/<effector id>
+#
+# coxswain_keelson::KeelsonBusPeer is a Rust implementation of that far
+# side. Claimants and observers use the vessel's own entity, as on a boat.
+services:
+  zenohd:
+    image: eclipse/zenoh:1.10.1
+    restart: always
+    ports:
+      - "7447:7447"
+
+  coxswain:
+    image: coxswain-hosted:sil
+    build:
+      context: ../..
+      dockerfile: contrib/docker/Dockerfile
+      args:
+        CARGO_FEATURES: keelson-bus
+    restart: always
+    init: true
+    depends_on:
+      - zenohd
+    volumes:
+      - /etc/coxswain:/etc/coxswain:ro
+    command:
+      - --manifest
+      - /etc/coxswain/vessel.cxmanifest
+      - --pubkey
+      - /etc/coxswain/vessel.pubkey
+      - --connect
+      - tcp/zenohd:7447

@@ -6,9 +6,13 @@
 # matches. Toolchain version must match rust-toolchain.toml.
 
 FROM rust:1.97.0-slim-bookworm AS build
+# Empty for the release image. A SIL or bench image passes
+# --build-arg CARGO_FEATURES=keelson-bus (D-034); release builds refuse
+# manifests that are not self-sufficient, test builds accept them.
+ARG CARGO_FEATURES=""
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p coxswain-hosted
+RUN cargo build --release --locked -p coxswain-hosted ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/coxswain-hosted /usr/local/bin/coxswain-hosted

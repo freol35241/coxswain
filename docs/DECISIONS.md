@@ -642,10 +642,13 @@ from telemetry comes from the entity, not the subject: the simulator publishes
 under the entity id the bus declares (`[bus.keelson] entity`), which the
 compiler rejects if it equals the vessel's own, because Coxswain's raw and fused
 telemetry already occupies `location_fix` and the rest under the vessel entity
-and would otherwise be ingested as input. Source id is the manifest sensor or
-effector id. Coxswain subscribes to exact keys derived from the manifest, not
-wildcards. Message definitions and key helpers live in coxswain-keelson; the
-backend lives in coxswain-hosted.
+and would otherwise be ingested as input. Inbound, the source id is the manifest
+sensor id, the name Keelson 0.6 allows a simulator authoring its own vessel
+(§2.1.2). Outbound, Coxswain is the producer on the bus entity: setpoints go out
+under `coxswain/<effector id>`, and Coxswain declares its liveliness there.
+`coxswain_keelson::KeelsonBusPeer` implements the far side. Coxswain subscribes
+to exact keys derived from the manifest, not wildcards. Message definitions and
+key helpers live in coxswain-keelson; the backend lives in coxswain-hosted.
 
 Mapping, in. `location_fix` (covariance in-message) for GNSS position,
 `location_fix_quality` for fix mode, `heading_true_north_deg` with
