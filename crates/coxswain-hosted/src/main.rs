@@ -41,6 +41,7 @@ mod can;
 mod recorder;
 mod sd_notify;
 mod serial;
+mod stall_watchdog;
 mod udp;
 
 const TICK: Duration = Duration::from_millis(100);
@@ -1305,10 +1306,18 @@ fn run() -> Result<(), String> {
     // exactly this before treating the unit as started.
     let mut notifier = sd_notify::Notifier::from_env();
     notifier.ready();
+    // Armed after boot so manifest checks and session setup never count as
+    // a stall; the first beat lands within one tick.
+    let heartbeat = stall_watchdog::spawn(
+        stall_watchdog::STALL_TIMEOUT,
+        stall_watchdog::abort_on_stall,
+    );
 
     // Publish failures must not stop the loop; log the first error kind once
     // so a dead router does not flood stderr at 10 Hz.
     let mut publish_error_logged = false;
+    // Same single-shot treatment for the stdout status line.
+    let mut status_error_logged = false;
     let publish = |r: Result<(), coxswain_keelson::Error>, logged: &mut bool| {
         if let Err(e) = r
             && !*logged
@@ -1352,6 +1361,7 @@ fn run() -> Result<(), String> {
         // and covers the board itself; this one exists today and only
         // covers the Linux process.
         notifier.watchdog(tick_start);
+        heartbeat.beat();
         if let Some(prev) = prev_tick_start {
             interval_max = interval_max.max(tick_start - prev);
         }
@@ -1646,17 +1656,23 @@ fn run() -> Result<(), String> {
                 &mut publish_error_logged,
             );
             // Rust's stdout is line-buffered; each line lands whole in the
-            // test's pipe reader.
-            println!(
-                "{}",
-                status_line(
-                    now.as_nanos() as f64 / 1e9,
-                    &out,
-                    out.state.as_ref(),
-                    tick_max,
-                    interval_max,
-                )
+            // test's pipe reader. Written, not println!: println! panics on a
+            // closed stdout, and the status line is evidence, not control, so
+            // a reader going away must not take the loop with it (same
+            // doctrine as `publish` above).
+            let line = status_line(
+                now.as_nanos() as f64 / 1e9,
+                &out,
+                out.state.as_ref(),
+                tick_max,
+                interval_max,
             );
+            if let Err(e) = writeln!(std::io::stdout(), "{line}")
+                && !status_error_logged
+            {
+                eprintln!("coxswain-hosted: status line not written (continuing): {e}");
+                status_error_logged = true;
+            }
             tick_max = Duration::ZERO;
             interval_max = Duration::ZERO;
             next_status += STATUS_PERIOD;
