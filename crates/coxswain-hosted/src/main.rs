@@ -1399,6 +1399,8 @@ fn run() -> Result<(), String> {
     // Publish failures must not stop the loop; log the first error kind once
     // so a dead router does not flood stderr at 10 Hz.
     let mut publish_error_logged = false;
+    // Same single-shot treatment for the stdout status line.
+    let mut status_error_logged = false;
     let publish = |r: Result<(), coxswain_keelson::Error>, logged: &mut bool| {
         if let Err(e) = r
             && !*logged
@@ -1799,17 +1801,23 @@ fn run() -> Result<(), String> {
                 &mut publish_error_logged,
             );
             // Rust's stdout is line-buffered; each line lands whole in the
-            // test's pipe reader.
-            println!(
-                "{}",
-                status_line(
-                    now.as_nanos() as f64 / 1e9,
-                    &out,
-                    out.state.as_ref(),
-                    tick_max,
-                    interval_max,
-                )
+            // test's pipe reader. Written, not println!: println! panics on a
+            // closed stdout, and the status line is evidence, not control, so
+            // a reader going away must not take the loop with it (same
+            // doctrine as `publish` above).
+            let line = status_line(
+                now.as_nanos() as f64 / 1e9,
+                &out,
+                out.state.as_ref(),
+                tick_max,
+                interval_max,
             );
+            if let Err(e) = writeln!(std::io::stdout(), "{line}")
+                && !status_error_logged
+            {
+                eprintln!("coxswain-hosted: status line not written (continuing): {e}");
+                status_error_logged = true;
+            }
             tick_max = Duration::ZERO;
             interval_max = Duration::ZERO;
             next_status += STATUS_PERIOD;
