@@ -574,28 +574,27 @@ whatever publishes there, effectors on it are rendered to zenoh. It is a bus
 kind like `nmea0183_udp`, not a mode, so it composes with real buses in one
 manifest.
 
-Shape. The backend sits at the same two seams as every other bus: inbound
-messages become contract `Measurement`s through `core.ingest`, outbound values
-come from an `OutputBackend` taking the allocator's per-effector physical
-outputs. Drivers and parsers are bypassed for sensors on this bus; their own
-tests and the replay harness cover them. Licensing applies unchanged, so an
-`enrichment` sensor on a `keelson` bus is rejected from fusion exactly as on any
-other bus. A `keelson` bus needs no `--port`; the manifest specifies it fully, as
-for `nmea0183_udp`.
+Shape. The bus sits at the same two seams as every other bus: inbound messages
+become contract `Measurement`s through `core.ingest`, outbound values come from
+an `OutputBackend` taking the allocator's per-effector physical outputs. Drivers
+and parsers are bypassed for sensors on this bus; their own tests and the replay
+harness cover them. Licensing applies unchanged, so an `enrichment` sensor on a
+`keelson` bus is rejected from fusion exactly as on any other bus. A `keelson`
+bus needs no `--port`; the manifest specifies it fully, as for `nmea0183_udp`.
 
-Self-sufficiency follows the path, evaluated per bus from its kind, segment,
-and source pinning, not from the protocol. Serial, CAN, SPI, I2C, and PWM buses
+Self-sufficiency follows the path, evaluated per bus from its kind, segment, and
+source pinning, not from the protocol. Serial, CAN, SPI, I2C, and PWM buses
 terminate at the conn node. An `nmea0183_udp` bus does when it is on `segment =
 "conn"` with `source_ip` pinned, the condition D-014 already sets for
 `inner_loop`. A `keelson` bus is always external in this entry: its path runs
 through a zenoh router and its publishers cannot be pinned. A router-less,
 pinned zenoh peer on the conn segment would be conn-terminated on the same
-reasoning; classing it so is left to its own decision, and effectors on it
-would still meet D-011. The manifest declares `[conn_node] self_sufficient = true | false`, and
-the compiler requires the declaration to match the manifest exactly: `true` if
-and only if no `inner_loop` sensor and no effector sits on an external bus.
-Enrichment sensors on an external bus do not affect it. A mismatch either way
-is a compile error, so the declared value is never stale.
+reasoning; classing it so is left to its own decision, and effectors on it would
+still meet D-011. The manifest declares `[conn_node] self_sufficient = true |
+false`, and the compiler requires the declaration to match the manifest exactly:
+`true` if and only if no `inner_loop` sensor and no effector sits on an external
+bus. Enrichment sensors on an external bus do not affect it. A mismatch either
+way is a compile error, so the declared value is never stale.
 
 Why declared and checked rather than inferred: inferring it would let one
 changed bus reference silently downgrade the vessel's guarantee. Declaring it
@@ -658,8 +657,8 @@ existing `depth_below_transducer_m` manner, then retired:
 `yaw_rate_accuracy_degps`, `speed_over_ground_accuracy_knots`,
 `course_over_ground_accuracy_deg` (following `heading_accuracy_deg`), and
 commanded actuator values, `rudder_angle_setpoint_deg` and
-`thrust_setpoint_newton`. Keelson's `rudder_angle_deg` means the actual angle and
-`force_newton` is a general force vector; publishing commands on them would
+`thrust_setpoint_newton`. Keelson's `rudder_angle_deg` means the actual angle
+and `force_newton` is a general force vector; publishing commands on them would
 collide with a simulator's or a later actuator's reported state.
 `LocationFixQuality` and `Decomposed3DVector` need vendoring. The mapping was
 surveyed against keelson main; every subject is to be confirmed against the
@@ -690,14 +689,14 @@ estimator as they would on a vessel, and a silent simulator trips staleness and
 failsafe like a dead sensor. Runs are not bit-reproducible; reproducibility
 stays with `--sim` and the replay harness.
 
-Markers. The `--sim` backend gets the same health marker treatment: health
-publishes the I/O backend in use (manifest buses or `--sim`) next to the
-self-sufficiency promise. Arming and conn claims work as normal on every
-backend, since testing them is the point.
+Markers. Health publishes the measurement source in use, `io_source =
+"buses"` or `"sim"` (the in-process plant), next to the self-sufficiency
+promise, so `--sim` gets the same treatment. Arming and conn claims work as
+normal with either source, since testing them is the point.
 
 Rejected: a `--sil` mode mutually exclusive with `--port` (this entry's first
 draft). It made "simulated data never reaches a real actuator" structural, but
-forbade mixed setups and duplicated the backend concept as a mode.
+forbade mixed setups and duplicated the bus concept as a mode.
 
 Schema: `schema_version` 7 -> 8 (the bus kind, its `[bus.keelson]` sub-table,
 and `conn_node.self_sufficient`). A SIL variant of a vessel manifest differs in
@@ -710,6 +709,42 @@ feedback from the simulator (Cyphal-style reports, where its `rudder_angle_deg`
 would come in), deferred until a test needs it; proposing the missing subjects
 upstream to Keelson; and whether a raw-sentence injection mode is worth adding
 to exercise the drivers, deferred with no current case.
+
+## D-035: Claimants and telemetry receivers are separate interfaces; relation to Keelson command authority
+
+Status: proposed. Today one type serves both roles on each side. On the vessel,
+`VesselEndpoint` publishes telemetry and serves the conn RPCs and the setpoint
+subscriber. On the client, `ClaimantClient` is also the only way to observe
+state and health, so watching the vessel means holding a claimant's interface.
+
+The roles differ in kind. A claimant can move the vessel; a telemetry receiver
+cannot. Losing a claimant is a supervisor event (heartbeat loss, failsafe);
+losing a receiver changes nothing. A deployment should be able to offer
+telemetry without offering command, and the reverse, and a consumer should be
+able to observe without anything that can register or claim. So: two
+interfaces. The telemetry interface publishes and takes no input. The command
+interface serves the claimant protocol (register, request, arm, setpoints) and
+is the only path by which anything above the conn node affects actuation, as
+invariant 2 already requires. Vocabulary per docs/glossary.md.
+
+Keelson 0.6 (`protocols/command_authority.yaml`, 0.6.0-pre.19) defines a
+cooperative single-writer lease among remote stations: holder, claimant, and
+observer roles, no arbiter, no seizure, enforcement left to deployment policy.
+It names "the vessel's own veto on accepting remote control"
+`operational_authority`. The two compose without conflict: the lease decides
+which station above may try, the supervisor decides whether that station's
+claimant gets the conn. The supervisor is the vessel's `operational_authority`.
+It does not read the lease as authority; a lease holder still registers and
+claims like any other claimant, and manifest-declared preemption (D-025)
+applies regardless of who holds the lease. Whether Coxswain publishes
+`operational_authority` or observes the lease is left open; neither changes the
+rule above.
+
+Code consequence, deferred to its own task once accepted: `VesselEndpoint`
+splits into a telemetry publisher and a conn server, each opened separately, and
+an observer client stands beside `ClaimantClient` that can subscribe but cannot
+register or claim. No wire change is implied; the keys already separate the
+two (pubsub telemetry versus the conn RPCs and the setpoint stream).
 
 ## Open questions (not yet decided)
 

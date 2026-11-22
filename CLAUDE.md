@@ -58,6 +58,9 @@ member.
 - Rust for everything in this repo. Analysis and tuning notebooks live
   elsewhere (Python is fine there, not here).
 - License: Apache 2.0.
+- Vocabulary (bus, sensor interface, output backend, claimant, telemetry
+  receiver, the three meanings of Keelson) is fixed in docs/glossary.md. Use
+  those words in code, docs, and comments.
 
 ## Build and test
 
