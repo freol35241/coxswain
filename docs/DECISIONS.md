@@ -751,3 +751,8 @@ two (pubsub telemetry versus the conn RPCs and the setpoint stream).
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest
   (deferred to the estimator per D-022)
 - Dual-antenna GNSS heading (sensor pairing concept in the schema)
+- Conn RPC keys predate Keelson 0.6's `@rpc/{interface}/{version}/...` shape
+  and stay as they are until the D-035 command-interface split, which also
+  decides whether arm and disarm move to Keelson's `vehicle_lifecycle/v1`.
+  Until then no RPC interface liveliness token is declared, since that key is
+  defined by interface and version.

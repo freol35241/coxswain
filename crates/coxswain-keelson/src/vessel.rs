@@ -14,6 +14,7 @@ use coxswain_contract::{
 };
 use prost::Message;
 use zenoh::Wait;
+use zenoh::liveliness::LivelinessToken;
 use zenoh::pubsub::Subscriber;
 use zenoh::query::{Query, Queryable};
 
@@ -56,6 +57,27 @@ pub struct PowerHealth {
     pub power_stale: bool,
 }
 
+/// Every subject this endpoint can publish under the `coxswain` producer.
+/// Keelson 0.6 §5.2: a static-capability source declares a subject token for
+/// each at session open, whether or not this vessel will ever produce it.
+/// Keep in step with the `put` calls below.
+const PUBLISHED_SUBJECTS: [&str; 14] = [
+    subject::LOCATION_FIX,
+    subject::HEADING_TRUE_NORTH_DEG,
+    subject::YAW_RATE_DEGPS,
+    subject::SPEED_OVER_GROUND_KNOTS,
+    subject::COURSE_OVER_GROUND_DEG,
+    subject::HEADING_MAGNETIC_DEG,
+    subject::TRUE_WIND_SPEED_MPS,
+    subject::TRUE_WIND_ANGLE_DEG,
+    subject::APPARENT_WIND_SPEED_MPS,
+    subject::APPARENT_WIND_ANGLE_DEG,
+    subject::DEPTH_BELOW_TRANSDUCER_M,
+    subject::ENTITY_HEALTH,
+    subject::CONN_STATE,
+    subject::MANIFEST,
+];
+
 pub struct VesselEndpoint {
     session: zenoh::Session,
     base_path: String,
@@ -64,12 +86,16 @@ pub struct VesselEndpoint {
     // Held so the declarations stay alive for the lifetime of the endpoint.
     _queryables: Vec<Queryable<()>>,
     _setpoint_sub: Subscriber<()>,
+    _liveliness: Vec<LivelinessToken>,
 }
 
 impl VesselEndpoint {
     /// Declares queryables for
     /// `@rpc/{conn_register,conn_request,conn_release,vehicle_arm,vehicle_disarm}/coxswain`
-    /// and a subscriber on `pubsub/setpoint/*`.
+    /// and a subscriber on `pubsub/setpoint/*`, then the liveliness tokens:
+    /// one source-level token for the `coxswain` producer and one subject
+    /// token per [`PUBLISHED_SUBJECTS`]. Tokens come last so presence implies
+    /// the endpoint can already receive (Keelson 0.6 §5).
     pub fn new(session: zenoh::Session, base_path: &str, entity_id: &str) -> Result<Self, Error> {
         let (tx, events) = mpsc::channel();
 
@@ -114,6 +140,22 @@ impl VesselEndpoint {
             })
             .wait()?;
 
+        let mut liveliness = Vec::with_capacity(1 + PUBLISHED_SUBJECTS.len());
+        liveliness.push(
+            session
+                .liveliness()
+                .declare_token(keys::source_token_key(base_path, entity_id, COXSWAIN))
+                .wait()?,
+        );
+        for subj in PUBLISHED_SUBJECTS {
+            liveliness.push(
+                session
+                    .liveliness()
+                    .declare_token(keys::pubsub_key(base_path, entity_id, subj, COXSWAIN))
+                    .wait()?,
+            );
+        }
+
         Ok(Self {
             session,
             base_path: base_path.to_string(),
@@ -121,6 +163,7 @@ impl VesselEndpoint {
             events,
             _queryables: queryables,
             _setpoint_sub: setpoint_sub,
+            _liveliness: liveliness,
         })
     }
 

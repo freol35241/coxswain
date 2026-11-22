@@ -1,12 +1,14 @@
 //! The claimant side: teleoperation client and integration-test tool. Runs
 //! off the vessel, so it uses the wall clock directly.
 
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, SystemTime};
 
 use coxswain_contract::{ClaimantId, Setpoint};
 use prost::Message;
 use zenoh::Wait;
+use zenoh::liveliness::LivelinessToken;
 use zenoh::pubsub::Subscriber;
 
 use crate::ConnReplyResult;
@@ -56,6 +58,9 @@ pub struct ClaimantClient {
     claimant_id: ClaimantId,
     // Held so the subscriptions stay alive for the lifetime of the client.
     subscribers: Vec<Subscriber<()>>,
+    // Declared on the first setpoint, when the client becomes a producer
+    // (Keelson 0.6 §5.4: RPC callers alone are consumers and declare none).
+    liveliness: Mutex<Vec<LivelinessToken>>,
 }
 
 impl ClaimantClient {
@@ -71,6 +76,7 @@ impl ClaimantClient {
             entity_id: entity_id.to_string(),
             claimant_id,
             subscribers: Vec::new(),
+            liveliness: Mutex::new(Vec::new()),
         }
     }
 
@@ -121,6 +127,7 @@ impl ClaimantClient {
     /// heartbeat (Keelson dead-man doctrine): stop publishing and the
     /// supervisor treats the claimant as lost.
     pub fn publish_setpoint(&self, sp: &Setpoint) -> Result<(), Error> {
+        self.declare_liveliness()?;
         let now = SystemTime::now();
         let msg = pb::SetpointMsg {
             timestamp: Some(wall_to_proto(now)),
@@ -138,14 +145,48 @@ impl ClaimantClient {
             .map_err(Error::from)
     }
 
+    /// Source-level and setpoint subject tokens for this claimant, once.
+    fn declare_liveliness(&self) -> Result<(), Error> {
+        let mut tokens = self.liveliness.lock().unwrap_or_else(|e| e.into_inner());
+        if !tokens.is_empty() {
+            return Ok(());
+        }
+        let source = keys::claimant_source_id(self.claimant_id);
+        let liveliness = self.session.liveliness();
+        tokens.push(
+            liveliness
+                .declare_token(keys::source_token_key(
+                    &self.base_path,
+                    &self.entity_id,
+                    &source,
+                ))
+                .wait()?,
+        );
+        tokens.push(
+            liveliness
+                .declare_token(keys::pubsub_key(
+                    &self.base_path,
+                    &self.entity_id,
+                    subject::SETPOINT,
+                    &source,
+                ))
+                .wait()?,
+        );
+        Ok(())
+    }
+
     /// Subscribe to the vessel's `location_fix` and `heading_true_north_deg`
-    /// streams (all source ids). Updates arrive on the returned channel for
+    /// streams (all source ids, fused `coxswain` and raw `coxswain/<sensor>`). Updates arrive on the returned channel for
     /// as long as the client lives; malformed samples are dropped.
     pub fn subscribe_state(&mut self) -> Result<Receiver<StateUpdate>, Error> {
         let (tx, rx) = mpsc::channel();
 
-        let fix_key =
-            keys::pubsub_key(&self.base_path, &self.entity_id, subject::LOCATION_FIX, "*");
+        let fix_key = keys::pubsub_key(
+            &self.base_path,
+            &self.entity_id,
+            subject::LOCATION_FIX,
+            "**",
+        );
         let fix_tx = tx.clone();
         let fix_sub = self
             .session
@@ -169,7 +210,7 @@ impl ClaimantClient {
             &self.base_path,
             &self.entity_id,
             subject::HEADING_TRUE_NORTH_DEG,
-            "*",
+            "**",
         );
         let heading_sub = self
             .session
@@ -256,6 +297,27 @@ fn distill_health(enclosed_at: SystemTime, health: &keelson::EntityHealth) -> He
     }
 }
 
+/// Everything after `/pubsub/{subject}/`: source ids span several chunks
+/// (Keelson 0.6 §2.1.1), so the last chunk alone would drop the producer.
 fn source_id_of(key: &str) -> String {
-    key.rsplit('/').next().unwrap_or("").to_string()
+    key.split_once("/pubsub/")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map_or("", |(_, source)| source)
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_id_of;
+
+    #[test]
+    fn source_id_keeps_every_chunk_after_the_subject() {
+        let key = "keelson/@v0/vessel/pubsub/location_fix/coxswain/gnss_main";
+        assert_eq!(source_id_of(key), "coxswain/gnss_main");
+        assert_eq!(
+            source_id_of("keelson/@v0/vessel/pubsub/location_fix/coxswain"),
+            "coxswain"
+        );
+        assert_eq!(source_id_of("not/a/keelson/key"), "");
+    }
 }
