@@ -564,6 +564,153 @@ manifests, and the schema doc. With D-031 this completes the frame story: the
 control path consumes per-sensor offsets, and the manifest declares the frame
 they are measured in.
 
+## D-034: Keelson bus kind and a declared self-sufficiency promise
+
+Status: proposed. `--sim` (D-020) runs the plant inside the process. It cannot
+host a third-party plant, a perception simulator in Keelson land, several
+vessels in one scenario, or a bench where real actuators follow a simulated
+plant. This adds a `keelson` bus kind: sensors on it are fed over zenoh by
+whatever publishes there, effectors on it are rendered to zenoh. It is a bus
+kind like `nmea0183_udp`, not a mode, so it composes with real buses in one
+manifest.
+
+Shape. The backend sits at the same two seams as every other bus: inbound
+messages become contract `Measurement`s through `core.ingest`, outbound values
+come from an `OutputBackend` taking the allocator's per-effector physical
+outputs. Drivers and parsers are bypassed for sensors on this bus; their own
+tests and the replay harness cover them. Licensing applies unchanged, so an
+`enrichment` sensor on a `keelson` bus is rejected from fusion exactly as on any
+other bus. A `keelson` bus needs no `--port`; the manifest specifies it fully, as
+for `nmea0183_udp`.
+
+Self-sufficiency follows the path, evaluated per bus from its kind, segment,
+and source pinning, not from the protocol. Serial, CAN, SPI, I2C, and PWM buses
+terminate at the conn node. An `nmea0183_udp` bus does when it is on `segment =
+"conn"` with `source_ip` pinned, the condition D-014 already sets for
+`inner_loop`. A `keelson` bus is always external in this entry: its path runs
+through a zenoh router and its publishers cannot be pinned. A router-less,
+pinned zenoh peer on the conn segment would be conn-terminated on the same
+reasoning; classing it so is left to its own decision, and effectors on it
+would still meet D-011. The manifest declares `[conn_node] self_sufficient = true | false`, and
+the compiler requires the declaration to match the manifest exactly: `true` if
+and only if no `inner_loop` sensor and no effector sits on an external bus.
+Enrichment sensors on an external bus do not affect it. A mismatch either way
+is a compile error, so the declared value is never stale.
+
+Why declared and checked rather than inferred: inferring it would let one
+changed bus reference silently downgrade the vessel's guarantee. Declaring it
+makes a downgrade an explicit line in the manifest diff, and the check makes
+intent and content agree, the same pattern as license subset rules (invariant
+4) one level up. The promise is compiled into the signed blob, so the
+commissioning signature approves it and the manifest hash (D-018, D-024)
+records which promise was in force. It is published in health, so operators,
+claimants, and shore can tell a bench rig from a vessel at runtime.
+
+Enforcement at boot. Release builds refuse a manifest with `self_sufficient =
+false`. The `keelson` bus backend and acceptance of such manifests sit behind a
+`keelson-bus` cargo feature on coxswain-hosted, off by default; the release
+image (contrib/docker) builds default features, and a separate image tag
+carries the feature. The manifest cannot protect against being deployed to the
+wrong place; the binary can. Running a non-self-sufficient setup on water stays
+possible, but only by deliberately deploying the test image. H7 release
+firmware refuses the same way; the `keelson` bus kind is hosted-only.
+
+Invariant 1 is amended, not relaxed, for vessels: a manifest that declares
+itself self-sufficient must be, and only such manifests run on a release build.
+On acceptance, CLAUDE.md invariant 1 gains that sentence.
+
+Mixed setups are allowed on test builds: real actuators driven from a
+simulated plant on a bench, or one simulated sensor beside real ones. This
+entry adds no access control for `keelson` buses. Security is assumed at the
+network boundary, as it already is for `nmea0183_udp` (D-014); a zenoh-level
+policy would apply to both and is not designed here.
+
+Effectors on a `keelson` bus are a test-build exception to D-011 and D-027, not
+a revision of them. zenoh pub/sub is the broadcast transport with no authority
+model that D-011 keeps actuator commands off, and nothing on a `keelson` bus
+provides D-027's failsafe path that survives conn-process death. Both hold
+unchanged for every self-sufficient manifest, which by the rule above has no
+effector on an external bus. In a mixed setup, whatever renders a `keelson`
+effector onto real hardware owns that failsafe; Coxswain does not claim it.
+
+Wire. Same zenoh session as the Keelson adapter; one router, no second network
+setup. Payloads are Keelson's well-known subjects and messages, so any
+Keelson-speaking simulator works without a Coxswain-specific schema. Separation
+from telemetry comes from the entity, not the subject: the simulator publishes
+under the entity id the bus declares (`[bus.keelson] entity`), which the
+compiler rejects if it equals the vessel's own, because Coxswain's raw and fused
+telemetry already occupies `location_fix` and the rest under the vessel entity
+and would otherwise be ingested as input. Source id is the manifest sensor or
+effector id. Coxswain subscribes to exact keys derived from the manifest, not
+wildcards. Message definitions and key helpers live in coxswain-keelson; the
+backend lives in coxswain-hosted.
+
+Mapping, in. `location_fix` (covariance in-message) for GNSS position,
+`location_fix_quality` for fix mode, `heading_true_north_deg` with
+`heading_accuracy_deg`, `yaw_rate_degps`, `speed_over_ground_knots`,
+`course_over_ground_deg`, `battery_voltage_v` for `PowerStatus`. Injection is at
+the measurement level, so a compass sensor arrives as true heading; declination
+is the simulator's concern. Mapping, out: one message per effector per tick,
+rudder angle and thrust setpoint by effector id.
+
+Missing from Keelson, coxswain-specific subjects until upstream has them, in the
+existing `depth_below_transducer_m` manner, then retired:
+`yaw_rate_accuracy_degps`, `speed_over_ground_accuracy_knots`,
+`course_over_ground_accuracy_deg` (following `heading_accuracy_deg`), and
+commanded actuator values, `rudder_angle_setpoint_deg` and
+`thrust_setpoint_newton`. Keelson's `rudder_angle_deg` means the actual angle and
+`force_newton` is a general force vector; publishing commands on them would
+collide with a simulator's or a later actuator's reported state.
+`LocationFixQuality` and `Decomposed3DVector` need vendoring. The mapping was
+surveyed against keelson main; every subject is to be confirmed against the
+pinned 0.5.4 before code.
+
+Uncertainty. Keelson carries value and accuracy on separate subjects, and most
+streams have no accuracy subject at all. Each value takes its std from the
+latest accuracy message from the same source id, if that is within the sensor's
+staleness window; otherwise from the default the real driver uses for that
+measurement kind (`NMEA0183_HEADING_STD_RAD`, `SOG_STD_MPS` and the COG
+derivation from it, `fallback_std_m` for position), under the same bound as the
+driver self-test: a default never claims finer precision than a good measured
+value. A `location_fix` with covariance type `UNKNOWN` or an all-zero covariance
+counts as no accuracy; fusing a zero std would treat the fix as perfect. Yaw
+rate has no real driver yet, so it gets one new constant, documented as crude
+like `SOG_STD_MPS`. Fallback is logged once per sensor and published per sensor
+in health (std measured or defaulted), so a test can assert on it. Rejected:
+dropping values without accuracy (no stock Keelson simulator could feed yaw
+rate, SOG, or COG, and the bus would diverge from the real driver path);
+per-sensor std in bus config (configuration D-032 keeps out until system
+identification can fill it).
+
+Timing. Free-running clocks, as with hardware. Coxswain stamps each `keelson`
+bus message on arrival with its own monotonic clock and ignores the simulator's
+time, as it does for serial bytes. The simulator publishes at realistic rates
+and consumes outputs as they arrive. Latency, jitter, and loss reach the
+estimator as they would on a vessel, and a silent simulator trips staleness and
+failsafe like a dead sensor. Runs are not bit-reproducible; reproducibility
+stays with `--sim` and the replay harness.
+
+Markers. The `--sim` backend gets the same health marker treatment: health
+publishes the I/O backend in use (manifest buses or `--sim`) next to the
+self-sufficiency promise. Arming and conn claims work as normal on every
+backend, since testing them is the point.
+
+Rejected: a `--sil` mode mutually exclusive with `--port` (this entry's first
+draft). It made "simulated data never reaches a real actuator" structural, but
+forbade mixed setups and duplicated the backend concept as a mode.
+
+Schema: `schema_version` 7 -> 8 (the bus kind, its `[bus.keelson]` sub-table,
+and `conn_node.self_sufficient`). A SIL variant of a vessel manifest differs in
+bus references and therefore in hash.
+
+Open within this entry: a `coxswain-manifest` subcommand that derives the SIL
+variant from the vessel manifest so the two cannot drift, deferred until the
+first SIL rig shows whether hand-kept variants drift in practice; actuator
+feedback from the simulator (Cyphal-style reports, where its `rudder_angle_deg`
+would come in), deferred until a test needs it; proposing the missing subjects
+upstream to Keelson; and whether a raw-sentence injection mode is worth adding
+to exercise the drivers, deferred with no current case.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest
