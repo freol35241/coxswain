@@ -7,7 +7,7 @@ use coxswain_manifest::{CompileError, EffectorOutput, ValidateError};
 
 const CYPHAL: &str = r#"
 [manifest]
-schema_version = 7
+schema_version = 8
 vessel_id      = "cx-cyphal-01"
 name           = "Cyphal Effector Test"
 revision       = 1
@@ -15,6 +15,7 @@ revision       = 1
 [conn_node]
 board       = "hosted"
 watchdog_ms = 250
+self_sufficient = true
 
 [[bus]]
 id       = "ctrl"

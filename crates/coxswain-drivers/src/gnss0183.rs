@@ -56,7 +56,7 @@ const KNOTS_TO_MPS: f64 = 1852.0 / 3600.0;
 /// Placeholder 1-sigma SOG std, m/s: no per-receiver source of truth exists
 /// yet, same "crude and known to be crude" caveat as `DEFAULT_UERE_M` until
 /// SBF lands.
-const SOG_STD_MPS: f64 = 0.2;
+pub const SOG_STD_MPS: f64 = 0.2;
 
 /// Estimated-speed floor below which a course reading is direction-over-
 /// noise, sentence-local physics: RMC's own reported SOG (not the truth) is
@@ -65,7 +65,7 @@ const SOG_STD_MPS: f64 = 0.2;
 /// about what a sentence's own numbers can support, the estimator's copy is
 /// a numerical backstop for its Jacobians; they share a value today, not a
 /// purpose, so they are not the same constant.
-const COG_MIN_SPEED_MPS: f64 = 0.5;
+pub const COG_MIN_SPEED_MPS: f64 = 0.5;
 
 /// How stale a GST error estimate may be and still pair with a GGA fix. GST
 /// arrives in the same per-epoch burst as GGA, but the order between the two
@@ -76,7 +76,7 @@ const COG_MIN_SPEED_MPS: f64 = 0.5;
 /// up to one epoch, which is acceptable because the receiver's error estimate
 /// varies slowly; the fix mode comes from the current GGA, so an RTK
 /// fixed<->float transition is still reflected immediately.
-const GST_MAX_AGE: Duration = Duration::from_millis(1500);
+pub const GST_MAX_AGE: Duration = Duration::from_millis(1500);
 
 /// Which sentence types the accept filter can name. Mirrors
 /// `coxswain_manifest::Nmea0183Quirks::sentences` without depending on the

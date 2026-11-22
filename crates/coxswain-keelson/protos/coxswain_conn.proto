@@ -88,4 +88,9 @@ message ConnStateMsg {
 message ManifestInfo {
   bytes sha256 = 1;
   uint32 revision = 2;
+  // The declared self-sufficiency promise (D-034).
+  bool self_sufficient = 3;
+  // Where measurements come from: "buses" (the manifest's buses) or "sim"
+  // (the in-process plant).
+  string io_source = 4;
 }

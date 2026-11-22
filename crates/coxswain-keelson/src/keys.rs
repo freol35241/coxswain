@@ -46,6 +46,28 @@ pub mod subject {
     /// well-known subject (Keelson 0.6 echo-sounder depth). N2K PGN 128267's
     /// primary value only; offset and range are dropped.
     pub const DEPTH_BELOW_TRANSDUCER_M: &str = "depth_below_transducer_m";
+    /// keelson.LocationFixQuality. GNSS fix type and RTK status.
+    pub const LOCATION_FIX_QUALITY: &str = "location_fix_quality";
+    /// keelson.TimestampedFloat, degrees, 1-sigma.
+    pub const HEADING_ACCURACY_DEG: &str = "heading_accuracy_deg";
+    /// keelson.TimestampedFloat, volts.
+    pub const BATTERY_VOLTAGE_V: &str = "battery_voltage_v";
+    /// keelson.TimestampedFloat, degrees per second, 1-sigma.
+    /// Coxswain-specific (D-034): Keelson 0.6.0-pre.19 has accuracy subjects
+    /// for heading, roll, and pitch only. Retire once upstream has one.
+    pub const YAW_RATE_ACCURACY_DEGPS: &str = "yaw_rate_accuracy_degps";
+    /// keelson.TimestampedFloat, knots, 1-sigma. Coxswain-specific (D-034).
+    pub const SPEED_OVER_GROUND_ACCURACY_KNOTS: &str = "speed_over_ground_accuracy_knots";
+    /// keelson.TimestampedFloat, degrees, 1-sigma. Coxswain-specific (D-034).
+    pub const COURSE_OVER_GROUND_ACCURACY_DEG: &str = "course_over_ground_accuracy_deg";
+    /// keelson.TimestampedFloat, degrees, commanded. Coxswain-specific
+    /// (D-034): Keelson's `rudder_angle_deg` is the actual angle, and a
+    /// command on it would collide with a reported one.
+    pub const RUDDER_ANGLE_SETPOINT_DEG: &str = "rudder_angle_setpoint_deg";
+    /// keelson.TimestampedFloat, newtons, commanded. Coxswain-specific
+    /// (D-034): Keelson has no thrust subject; `force_newton` is a general
+    /// force vector.
+    pub const THRUST_SETPOINT_NEWTON: &str = "thrust_setpoint_newton";
     /// keelson.EntityHealth.
     pub const ENTITY_HEALTH: &str = "entity_health";
     /// coxswain.SetpointMsg. Coxswain-specific; the stream doubles as the
@@ -65,11 +87,13 @@ pub fn rpc_key(base_path: &str, entity_id: &str, procedure: &str, responder_id: 
     format!("{base_path}/@v0/{entity_id}/@rpc/{procedure}/{responder_id}")
 }
 
-/// Source id for a sensor's raw pass-through: producer `coxswain`, the
-/// device as the identity chunk (§2.1.1, §2.1.2). The authored sensor name,
-/// not the compiler-assigned numeric id, which means nothing off the vessel.
-pub fn sensor_source_id(sensor_name: &str) -> String {
-    format!("{COXSWAIN}/{sensor_name}")
+/// Source id for something Coxswain publishes about one device: a sensor's
+/// raw pass-through, or an effector's setpoint on a keelson bus. Producer
+/// `coxswain`, the device as the identity chunk (§2.1.1, §2.1.2). The
+/// authored name, not a compiler-assigned numeric id, which means nothing
+/// off the vessel.
+pub fn device_source_id(device_name: &str) -> String {
+    format!("{COXSWAIN}/{device_name}")
 }
 
 /// Source-level liveliness token key (§5.1): the producer is present,
@@ -115,14 +139,14 @@ mod tests {
     }
 
     #[test]
-    fn sensor_source_id_is_producer_then_device() {
-        assert_eq!(sensor_source_id("gnss_main"), "coxswain/gnss_main");
+    fn device_source_id_is_producer_then_device() {
+        assert_eq!(device_source_id("gnss_main"), "coxswain/gnss_main");
         assert_eq!(
             pubsub_key(
                 "keelson",
                 "vessel",
                 "location_fix",
-                &sensor_source_id("gnss_main")
+                &device_source_id("gnss_main")
             ),
             "keelson/@v0/vessel/pubsub/location_fix/coxswain/gnss_main"
         );

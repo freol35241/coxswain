@@ -151,6 +151,28 @@ pub enum ValidateError {
         sensor: String,
         bus: String,
     },
+    /// A `keelson` bus must author `[bus.keelson] entity` (D-034).
+    KeelsonEntityMissing {
+        bus: String,
+    },
+    /// A `keelson` bus's entity must not be the vessel's own (D-034): the
+    /// vessel entity carries Coxswain's telemetry, which would be ingested.
+    KeelsonEntityIsVessel {
+        bus: String,
+    },
+    /// The `keelson` bus kind exists only on the hosted profile (D-034).
+    KeelsonBusNotHosted {
+        bus: String,
+    },
+    /// `self_sufficient = true`, but this inner_loop sensor or effector sits
+    /// on an external bus (D-034).
+    SelfSufficiencyViolated {
+        culprit: String,
+        bus: String,
+    },
+    /// `self_sufficient = false`, but no inner_loop sensor or effector sits on
+    /// an external bus (D-034): the declaration must match exactly.
+    SelfSufficiencyUnderclaimed,
     BadSourceIp {
         bus: String,
         ip: String,
@@ -410,7 +432,7 @@ impl std::fmt::Display for ValidateError {
                 write!(
                     f,
                     "effector {effector:?} references bus {bus:?}, which is not an output bus \
-                     (actuator_uart, pwm, or cyphal_can)"
+                     (actuator_uart, pwm, cyphal_can, or keelson)"
                 )
             }
             Self::DuplicateEffectorChannel { bus, channel } => {
@@ -445,6 +467,39 @@ impl std::fmt::Display for ValidateError {
                     f,
                     "effector {effector:?}: a limit, effectiveness, or speed floor is not \
                      strictly positive"
+                )
+            }
+            Self::KeelsonEntityMissing { bus } => {
+                write!(
+                    f,
+                    "bus {bus:?}: kind \"keelson\" needs [bus.keelson] entity (D-034)"
+                )
+            }
+            Self::KeelsonEntityIsVessel { bus } => {
+                write!(
+                    f,
+                    "bus {bus:?}: [bus.keelson] entity is the vessel's own; it would ingest \
+                     Coxswain's own telemetry (D-034)"
+                )
+            }
+            Self::KeelsonBusNotHosted { bus } => {
+                write!(
+                    f,
+                    "bus {bus:?}: kind \"keelson\" exists only on the hosted profile (D-034)"
+                )
+            }
+            Self::SelfSufficiencyViolated { culprit, bus } => {
+                write!(
+                    f,
+                    "[conn_node] self_sufficient = true, but {culprit:?} sits on external bus \
+                     {bus:?} (D-034)"
+                )
+            }
+            Self::SelfSufficiencyUnderclaimed => {
+                write!(
+                    f,
+                    "[conn_node] self_sufficient = false, but no inner_loop sensor or effector \
+                     sits on an external bus; the declaration must match (D-034)"
                 )
             }
             Self::PwmBusOnHosted { bus } => {
@@ -625,6 +680,25 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         // authored. Checked before node-id collection so a stray Cyphal
         // sub-table cannot masquerade as a claim.
         bus_subtable_guard(bus)?;
+        // D-034, ahead of the port checks: a keelson bus names no physical
+        // port, so its own errors are the ones worth reporting.
+        if bus.kind == BusKindToml::Keelson {
+            if board != BOARD_HOSTED {
+                return Err(ValidateError::KeelsonBusNotHosted {
+                    bus: bus.id.clone(),
+                });
+            }
+            let Some(keelson) = bus.keelson.as_ref() else {
+                return Err(ValidateError::KeelsonEntityMissing {
+                    bus: bus.id.clone(),
+                });
+            };
+            if keelson.entity == m.manifest.vessel_id {
+                return Err(ValidateError::KeelsonEntityIsVessel {
+                    bus: bus.id.clone(),
+                });
+            }
+        }
         if !port_allowed(&bus.port) {
             return Err(ValidateError::PortNotOnProfile {
                 owner: bus.id.clone(),
@@ -632,7 +706,9 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
                 board: board.to_string(),
             });
         }
-        if !ports.insert(&bus.port) {
+        // A keelson bus claims no physical port; several may name the same
+        // placeholder ("zenoh").
+        if bus.kind != BusKindToml::Keelson && !ports.insert(&bus.port) {
             return Err(ValidateError::DuplicatePort {
                 port: bus.port.clone(),
             });
@@ -875,7 +951,10 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         };
         if !matches!(
             bus.kind,
-            BusKindToml::ActuatorUart | BusKindToml::Pwm | BusKindToml::CyphalCan
+            BusKindToml::ActuatorUart
+                | BusKindToml::Pwm
+                | BusKindToml::CyphalCan
+                | BusKindToml::Keelson
         ) {
             return Err(ValidateError::EffectorBusWrongKind {
                 effector: e.id.clone(),
@@ -962,6 +1041,8 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         }
     }
 
+    self_sufficiency(m, &bus_by_id)?;
+
     let rc = build_rc(m.rc.as_ref(), &bus_by_id, &claimant_ids)?;
 
     Ok(CompiledManifest {
@@ -972,6 +1053,7 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         conn_node: ConnNodeEntry {
             board: fx("conn_node.board", board)?,
             watchdog_ms: m.conn_node.watchdog_ms,
+            self_sufficient: m.conn_node.self_sufficient,
         },
         config: VesselConfig {
             sensors: sensor_configs,
@@ -1238,6 +1320,7 @@ fn bus_subtable(kind: BusKindToml) -> Option<&'static str> {
         BusKindToml::Uart => Some("uart"),
         BusKindToml::ActuatorUart => Some("actuator_uart"),
         BusKindToml::CrsfUart => Some("crsf_uart"),
+        BusKindToml::Keelson => Some("keelson"),
         BusKindToml::Spi | BusKindToml::I2c | BusKindToml::Pwm => None,
     }
 }
@@ -1254,6 +1337,7 @@ fn bus_subtable_guard(bus: &BusToml) -> Result<(), ValidateError> {
         ("uart", bus.uart.is_some()),
         ("actuator_uart", bus.actuator_uart.is_some()),
         ("crsf_uart", bus.crsf_uart.is_some()),
+        ("keelson", bus.keelson.is_some()),
     ] {
         if present && expected != Some(sub) {
             return Err(ValidateError::BusSubtableUnexpected {
@@ -1319,6 +1403,7 @@ fn bus_entry(bus: &BusToml) -> Result<BusEntry, ValidateError> {
             BusKindToml::ActuatorUart => BusKind::ActuatorUart,
             BusKindToml::Pwm => BusKind::Pwm,
             BusKindToml::CrsfUart => BusKind::CrsfUart,
+            BusKindToml::Keelson => BusKind::Keelson,
         },
         port: fx("bus.port", &bus.port)?,
         rate: bitrate
@@ -1341,7 +1426,58 @@ fn bus_entry(bus: &BusToml) -> Result<BusEntry, ValidateError> {
         },
         listen_only,
         node_id,
+        entity: match bus.keelson.as_ref() {
+            Some(k) => fx("bus.keelson.entity", &k.entity)?,
+            None => FixedStr32::empty(),
+        },
     })
+}
+
+/// Whether a bus's path runs through something that can sit above the conn
+/// node (D-034): evaluated per bus from kind, segment, and pinning. A
+/// `keelson` bus always does; `nmea0183_udp` does unless it is pinned on the
+/// conn segment (D-014); every other kind terminates at the conn node.
+fn bus_is_external(bus: &BusToml) -> bool {
+    match bus.kind {
+        BusKindToml::Keelson => true,
+        BusKindToml::Nmea0183Udp => {
+            let udp = bus.nmea0183_udp.as_ref();
+            let pinned = udp.is_some_and(|u| u.source_ip.is_some());
+            let conn = udp.and_then(|u| u.segment.as_deref()) == Some("conn");
+            !(pinned && conn)
+        }
+        _ => false,
+    }
+}
+
+/// D-034: `[conn_node] self_sufficient` must equal "no inner_loop sensor and
+/// no effector on an external bus", exactly. Enrichment sensors do not count.
+/// Unknown bus references are reported by the table checks, not here.
+fn self_sufficiency(
+    m: &ManifestToml,
+    bus_by_id: &HashMap<&str, &BusToml>,
+) -> Result<(), ValidateError> {
+    let external = |bus_id: &str| bus_by_id.get(bus_id).is_some_and(|b| bus_is_external(b));
+    let culprit = m
+        .sensors
+        .iter()
+        .filter(|s| s.license == LicenseToml::InnerLoop && external(&s.bus))
+        .map(|s| (&s.id, &s.bus))
+        .chain(
+            m.effectors
+                .iter()
+                .filter(|e| external(&e.bus))
+                .map(|e| (&e.id, &e.bus)),
+        )
+        .next();
+    match (m.conn_node.self_sufficient, culprit) {
+        (true, Some((id, bus))) => Err(ValidateError::SelfSufficiencyViolated {
+            culprit: id.clone(),
+            bus: bus.clone(),
+        }),
+        (false, None) => Err(ValidateError::SelfSufficiencyUnderclaimed),
+        _ => Ok(()),
+    }
 }
 
 /// A Cyphal node id or subject id must fit its wire range (D-029). The
@@ -1664,6 +1800,22 @@ fn effector_output(
                 feedback_subject,
                 report_tolerance,
             })
+        }
+        // D-034: the effector's name is the source id; nothing to wire.
+        BusKindToml::Keelson => {
+            for (field, present) in [
+                ("channel", o.channel.is_some()),
+                ("pwm", o.pwm.is_some()),
+                ("node_id", o.node_id.is_some()),
+                ("command_subject", o.command_subject.is_some()),
+                ("feedback_subject", o.feedback_subject.is_some()),
+                ("report_tolerance", o.report_tolerance.is_some()),
+            ] {
+                if present {
+                    return Err(unexpected(field));
+                }
+            }
+            Ok(EffectorOutput::Keelson)
         }
         _ => unreachable!("effector_output called only for output bus kinds"),
     }

@@ -51,6 +51,8 @@ pub struct MetaToml {
 pub struct ConnNodeToml {
     pub board: String,
     pub watchdog_ms: u32,
+    /// Required, no default: declaring the promise is the point (D-034).
+    pub self_sufficient: bool,
 }
 
 /// The body frame's named reference point (D-033): a descriptive label, e.g.
@@ -79,6 +81,7 @@ pub enum BusKindToml {
     ActuatorUart,
     Pwm,
     CrsfUart,
+    Keelson,
 }
 
 #[derive(Copy, Clone, Deserialize)]
@@ -113,6 +116,14 @@ pub struct BusToml {
     pub uart: Option<BusSerialToml>,
     pub actuator_uart: Option<BusSerialToml>,
     pub crsf_uart: Option<BusSerialToml>,
+    pub keelson: Option<BusKeelsonToml>,
+}
+
+/// `[bus.keelson]` (D-034): the entity the bus's traffic lives under.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BusKeelsonToml {
+    pub entity: String,
 }
 
 #[derive(Deserialize)]

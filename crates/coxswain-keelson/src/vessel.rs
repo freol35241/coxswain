@@ -19,6 +19,7 @@ use zenoh::pubsub::Subscriber;
 use zenoh::query::{Query, Queryable};
 
 use crate::ConnReplyResult;
+use crate::bus::StdSource;
 use crate::convert::{heading_deg, ned_cov_to_enu, open, seal, setpoint_from_proto, wall_to_proto};
 use crate::error::Error;
 use crate::keys::{self, COXSWAIN, subject};
@@ -47,6 +48,35 @@ pub struct ReplyHandle {
 
 /// One claimant event and, for RPCs, the handle to answer it with.
 pub type Event = (ConnEvent, Option<ReplyHandle>);
+
+/// The I/O side of the health telemetry, bundled for the same reason as
+/// [`PowerHealth`]. `actuation` is one `(effector name, diverged)` pair per
+/// Cyphal effector (D-029); `std_sources` is one `(<sensor>/<quantity>,
+/// source)` pair per keelson bus quantity (D-034). Either may be empty.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct IoHealth<'a> {
+    pub actuation: &'a [(&'a str, bool)],
+    pub std_sources: &'a [(String, StdSource)],
+}
+
+/// Where measurements come from, published with the manifest identity so a
+/// consumer can tell a simulated vessel from a real one (D-034).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IoSource {
+    /// The manifest's buses, real or keelson.
+    Buses,
+    /// The in-process plant (`--sim`).
+    Sim,
+}
+
+impl IoSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Buses => "buses",
+            Self::Sim => "sim",
+        }
+    }
+}
 
 /// The supervisor's report-only power flags for the health telemetry (D-024):
 /// bus voltage below the low-voltage bound, and the power report gone stale.
@@ -434,13 +464,17 @@ impl VesselEndpoint {
 
     /// `entity_health`: estimator level and staleness, plus conn and arming
     /// as supervisor checks.
-    /// `actuation` is one `(effector name, diverged)` pair per Cyphal effector
-    /// (D-029/D-010): a non-empty slice adds an `actuation` source to the
+    /// `io.actuation` is one `(effector name, diverged)` pair per Cyphal
+    /// effector (D-029/D-010): a non-empty slice adds an `actuation` source to the
     /// published health, degraded when any effector's last command-then-report
     /// comparison diverged. Empty for a vessel with no Cyphal actuation.
     /// `power` carries the supervisor's report-only power flags (D-024): they
     /// surface as a `power` subject under the supervisor source so a claimant
     /// can observe bus voltage health without arming.
+    /// `io.std_sources` is one `(<sensor>/<quantity>, source)` pair per keelson
+    /// bus quantity (D-034): a non-empty slice adds a `keelson_bus` source
+    /// with a `std` check saying whether the last std was measured or a driver
+    /// default. Both are nominal; the check is information, not a fault.
     pub fn publish_health(
         &self,
         t_wall: SystemTime,
@@ -448,8 +482,12 @@ impl VesselEndpoint {
         conn: &ConnState,
         arming: ArmingState,
         power: PowerHealth,
-        actuation: &[(&str, bool)],
+        io: IoHealth<'_>,
     ) -> Result<(), Error> {
+        let IoHealth {
+            actuation,
+            std_sources,
+        } = io;
         let PowerHealth {
             low_voltage,
             power_stale,
@@ -551,6 +589,31 @@ impl VesselEndpoint {
                 subjects,
             });
         }
+        if !std_sources.is_empty() {
+            let nominal = keelson::HealthLevel::HealthNominal as i32;
+            let subjects = std_sources
+                .iter()
+                .map(|(label, source)| keelson::SubjectHealth {
+                    name: label.clone(),
+                    level: nominal,
+                    measured_publication_rate_hz: 0.0,
+                    checks: vec![keelson::CheckResult {
+                        name: "std".to_string(),
+                        level: nominal,
+                        detail: match source {
+                            StdSource::Measured => "measured",
+                            StdSource::Defaulted => "defaulted",
+                        }
+                        .to_string(),
+                    }],
+                })
+                .collect();
+            sources.push(keelson::SourceHealth {
+                name: "keelson_bus".to_string(),
+                level: nominal,
+                subjects,
+            });
+        }
         let msg = keelson::EntityHealth {
             timestamp: Some(wall_to_proto(t_wall)),
             level: health_level(h.level) as i32,
@@ -580,16 +643,22 @@ impl VesselEndpoint {
     }
 
     /// Coxswain-specific `manifest` subject, published so the manifest
-    /// identity is in telemetry from the first heartbeat.
+    /// identity is in telemetry from the first heartbeat. It carries the
+    /// declared self-sufficiency promise and the measurement source next to
+    /// the hash (D-034).
     pub fn publish_manifest_info(
         &self,
         t_wall: SystemTime,
         sha256: [u8; 32],
         revision: u32,
+        self_sufficient: bool,
+        io_source: IoSource,
     ) -> Result<(), Error> {
         let msg = pb::ManifestInfo {
             sha256: sha256.to_vec(),
             revision,
+            self_sufficient,
+            io_source: io_source.as_str().to_string(),
         };
         self.put(subject::MANIFEST, COXSWAIN, seal(t_wall, &msg))
     }

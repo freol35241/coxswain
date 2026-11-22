@@ -212,6 +212,21 @@ this before freezing far-end firmware.
       checked, plus hosted SocketCAN wiring end to end, vcan-tested in CI.)
 - [x] 0183-over-UDP bus: listen socket, source_ip pinning enforcement,
       enrichment cap when unpinned.
+- [x] Keelson 0.6.0-pre.19 migration: protos, zenoh 1.10.1, source ids as
+      `coxswain/<sensor>`, liveliness tokens. Conn RPC keys deliberately
+      unchanged (open question, tied to D-035).
+- [x] Keelson bus kind and the declared self-sufficiency promise (D-034):
+      schema v8, compiler check, `keelson-bus` feature, release-build
+      refusal, rig test with an external plant over zenoh, SIL image and
+      compose file.
+- [ ] Propose upstream to Keelson: `yaw_rate_accuracy_degps`,
+      `speed_over_ground_accuracy_knots`, `course_over_ground_accuracy_deg`,
+      `rudder_angle_setpoint_deg`, `thrust_setpoint_newton` (D-034).
+- [ ] D-035 code split, once accepted: telemetry publisher and conn server
+      from `VesselEndpoint`, an observer client beside `ClaimantClient`;
+      conn RPC keys to Keelson 0.6's interface/version shape.
+- [ ] `coxswain-manifest` subcommand deriving a SIL manifest from a vessel
+      manifest, if hand-kept variants turn out to drift (D-034).
 
 ## Phase 8: Conn node firmware (reference deployment)
 

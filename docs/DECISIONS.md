@@ -566,7 +566,7 @@ they are measured in.
 
 ## D-034: Keelson bus kind and a declared self-sufficiency promise
 
-Status: proposed. `--sim` (D-020) runs the plant inside the process. It cannot
+Status: accepted. `--sim` (D-020) runs the plant inside the process. It cannot
 host a third-party plant, a perception simulator in Keelson land, several
 vessels in one scenario, or a bench where real actuators follow a simulated
 plant. This adds a `keelson` bus kind: sensors on it are fed over zenoh by
@@ -575,12 +575,15 @@ kind like `nmea0183_udp`, not a mode, so it composes with real buses in one
 manifest.
 
 Shape. The bus sits at the same two seams as every other bus: inbound messages
-become contract `Measurement`s through `core.ingest`, outbound values come from
-an `OutputBackend` taking the allocator's per-effector physical outputs. Drivers
-and parsers are bypassed for sensors on this bus; their own tests and the replay
-harness cover them. Licensing applies unchanged, so an `enrichment` sensor on a
-`keelson` bus is rejected from fusion exactly as on any other bus. A `keelson`
-bus needs no `--port`; the manifest specifies it fully, as for `nmea0183_udp`.
+become contract `Measurement`s through `core.ingest`, outbound values are the
+allocator's per-effector physical outputs, the same slice every output backend
+receives. They are published directly rather than through the no_std
+`OutputBackend`/`OutputFrame` trait, which keeps zenoh out of coxswain-drivers.
+Drivers and parsers are bypassed for sensors on this bus; their own tests and
+the replay harness cover them. Licensing applies unchanged, so an `enrichment`
+sensor on a `keelson` bus is rejected from fusion exactly as on any other bus. A
+`keelson` bus needs no `--port`; the manifest specifies it fully, as for
+`nmea0183_udp`.
 
 Self-sufficiency follows the path, evaluated per bus from its kind, segment, and
 source pinning, not from the protocol. Serial, CAN, SPI, I2C, and PWM buses
@@ -616,7 +619,7 @@ firmware refuses the same way; the `keelson` bus kind is hosted-only.
 
 Invariant 1 is amended, not relaxed, for vessels: a manifest that declares
 itself self-sufficient must be, and only such manifests run on a release build.
-On acceptance, CLAUDE.md invariant 1 gains that sentence.
+CLAUDE.md invariant 1 carries that sentence.
 
 Mixed setups are allowed on test builds: real actuators driven from a
 simulated plant on a bench, or one simulated sensor beside real ones. This
@@ -639,10 +642,13 @@ from telemetry comes from the entity, not the subject: the simulator publishes
 under the entity id the bus declares (`[bus.keelson] entity`), which the
 compiler rejects if it equals the vessel's own, because Coxswain's raw and fused
 telemetry already occupies `location_fix` and the rest under the vessel entity
-and would otherwise be ingested as input. Source id is the manifest sensor or
-effector id. Coxswain subscribes to exact keys derived from the manifest, not
-wildcards. Message definitions and key helpers live in coxswain-keelson; the
-backend lives in coxswain-hosted.
+and would otherwise be ingested as input. Inbound, the source id is the manifest
+sensor id, the name Keelson 0.6 allows a simulator authoring its own vessel
+(§2.1.2). Outbound, Coxswain is the producer on the bus entity: setpoints go out
+under `coxswain/<effector id>`, and Coxswain declares its liveliness there.
+`coxswain_keelson::KeelsonBusPeer` implements the far side. Coxswain subscribes
+to exact keys derived from the manifest, not wildcards. Message definitions and
+key helpers live in coxswain-keelson; the backend lives in coxswain-hosted.
 
 Mapping, in. `location_fix` (covariance in-message) for GNSS position,
 `location_fix_quality` for fix mode, `heading_true_north_deg` with
@@ -659,23 +665,24 @@ existing `depth_below_transducer_m` manner, then retired:
 commanded actuator values, `rudder_angle_setpoint_deg` and
 `thrust_setpoint_newton`. Keelson's `rudder_angle_deg` means the actual angle
 and `force_newton` is a general force vector; publishing commands on them would
-collide with a simulator's or a later actuator's reported state.
-`LocationFixQuality` and `Decomposed3DVector` need vendoring. The mapping was
-surveyed against keelson main; every subject is to be confirmed against the
-pinned 0.5.4 before code.
+collide with a simulator's or a later actuator's reported state. The mapping is
+confirmed against Keelson 0.6.0-pre.19, which also vendors `LocationFixQuality`;
+`Decomposed3DVector` is not needed, since thrust goes out as a
+`TimestampedFloat`.
 
 Uncertainty. Keelson carries value and accuracy on separate subjects, and most
 streams have no accuracy subject at all. Each value takes its std from the
-latest accuracy message from the same source id, if that is within the sensor's
-staleness window; otherwise from the default the real driver uses for that
-measurement kind (`NMEA0183_HEADING_STD_RAD`, `SOG_STD_MPS` and the COG
-derivation from it, `fallback_std_m` for position), under the same bound as the
-driver self-test: a default never claims finer precision than a good measured
-value. A `location_fix` with covariance type `UNKNOWN` or an all-zero covariance
-counts as no accuracy; fusing a zero std would treat the fix as perfect. Yaw
-rate has no real driver yet, so it gets one new constant, documented as crude
-like `SOG_STD_MPS`. Fallback is logged once per sensor and published per sensor
-in health (std measured or defaulted), so a test can assert on it. Rejected:
+latest accuracy message from the same source id, if that is within `GST_MAX_AGE`
+(1.5 s), the window the 0183 driver already uses to pair GST with GGA; otherwise
+from the default the real driver uses for that measurement kind
+(`NMEA0183_HEADING_STD_RAD`, `SOG_STD_MPS` and the COG derivation from it,
+`fallback_std_m` for position), under the same bound as the driver self-test: a
+default never claims finer precision than a good measured value. A
+`location_fix` with covariance type `UNKNOWN` or an all-zero covariance counts
+as no accuracy; fusing a zero std would treat the fix as perfect. Yaw rate has
+no real driver yet, so it gets one new constant, documented as crude like
+`SOG_STD_MPS`. Fallback is logged once per sensor and published per sensor in
+health (std measured or defaulted), so a test can assert on it. Rejected:
 dropping values without accuracy (no stock Keelson simulator could feed yaw
 rate, SOG, or COG, and the bus would diverge from the real driver path);
 per-sensor std in bus config (configuration D-032 keeps out until system
@@ -687,7 +694,8 @@ time, as it does for serial bytes. The simulator publishes at realistic rates
 and consumes outputs as they arrive. Latency, jitter, and loss reach the
 estimator as they would on a vessel, and a silent simulator trips staleness and
 failsafe like a dead sensor. Runs are not bit-reproducible; reproducibility
-stays with `--sim` and the replay harness.
+stays with `--sim` and the replay harness. `--sim` refuses a manifest whose
+`keelson` buses carry sensors or effectors: two plants would feed one estimator.
 
 Markers. Health publishes the measurement source in use, `io_source =
 "buses"` or `"sim"` (the in-process plant), next to the self-sufficiency
