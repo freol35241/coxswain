@@ -147,6 +147,29 @@ impl Default for ClaimantPriority {
     }
 }
 
+/// A source the supervisor accepts a stop from (D-037). A stop is not a
+/// claim: it disarms whoever holds the conn and refuses arming while engaged.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum StopSource {
+    /// The RC kill channel, conn-terminated.
+    #[default]
+    Rc,
+}
+
+/// A declared stop source. `stop_on_silence` decides whether the source
+/// going silent stops the vessel or only raises a health warning; it is
+/// declared, never defaulted (D-037).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StopSourceConfig {
+    pub source: StopSource,
+    pub stop_on_silence: bool,
+}
+
+/// One slot per `StopSource` variant.
+pub const MAX_STOP_SOURCES: usize = 1;
+
 /// Vessel-specific constants of the failsafe matrix; the matrix itself is
 /// firmware logic.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -166,6 +189,9 @@ pub struct SupervisorConfig {
     /// crate does not depend on the supervisor crate, so the two are kept in
     /// sync by convention, not by a shared constant.
     pub claimant_priorities: BoundedList<ClaimantPriority, 8>,
+    /// Declared stop sources (D-037). Silence is judged against
+    /// `claimant_heartbeat`, the window that already says a link is gone.
+    pub stop_sources: BoundedList<StopSourceConfig, MAX_STOP_SOURCES>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]

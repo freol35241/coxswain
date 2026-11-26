@@ -28,6 +28,8 @@ message ConnReply {
     REFUSED_POSITION = 8;
     ERROR = 9;
     REFUSED_POWER_STALE = 10;
+    // A stop source is engaged (D-037).
+    REFUSED_STOP = 11;
   }
   Result result = 1;
 }

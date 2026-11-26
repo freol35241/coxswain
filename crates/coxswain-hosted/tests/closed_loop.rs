@@ -106,6 +106,7 @@ fn config(geofence: GeofenceConfig) -> VesselConfig {
                 priority: 100,
             }])
             .unwrap(),
+            stop_sources: BoundedList::new(),
         },
         effectors: BoundedList::new(),
     }

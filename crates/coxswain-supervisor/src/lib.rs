@@ -11,8 +11,8 @@ mod geofence;
 
 use coxswain_contract::{
     AUTONOMY, ArmingState, ClaimantId, ConnGrantDefault, ConnState, EstimatorHealth, GeoPoint,
-    GeofenceAction, HealthLevel, PowerStatus, Setpoint, SupervisorConfig, Timestamp, VesselConfig,
-    VesselState,
+    GeofenceAction, HealthLevel, MAX_STOP_SOURCES, PowerStatus, Setpoint, StopSource,
+    SupervisorConfig, Timestamp, VesselConfig, VesselState,
 };
 
 /// Claimant registry capacity, `AUTONOMY` included.
@@ -34,13 +34,19 @@ pub enum ArmError {
     PositionDegraded,
     VoltageLow,
     PowerStale,
+    /// A stop source is engaged (D-037).
+    Stopped,
 }
 
-/// Failsafe conditions in priority order, highest first. Low voltage and
-/// power-report staleness are report-only and surface as
-/// [`Directive::low_voltage`] and [`Directive::power_stale`], not as a cause.
+/// Failsafe conditions in priority order, highest first. Low voltage,
+/// power-report staleness and stop-source silence are report-only and
+/// surface as [`Directive::low_voltage`], [`Directive::power_stale`] and
+/// [`Directive::stop_silent`], not as a cause.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FailsafeCause {
+    /// A stop source is engaged, or one declared stop-on-silence is silent
+    /// (D-037).
+    Stop,
     CriticalVoltage,
     PositionDegraded,
     GeofenceBreach,
@@ -62,6 +68,10 @@ pub struct Directive {
     /// not battery dying, so it never trips a failsafe or overrides an
     /// already-armed vessel's setpoint.
     pub power_stale: bool,
+    /// A declared stop source has not reported within
+    /// `claimant_heartbeat`, or never has. Report-only unless that source
+    /// is declared stop-on-silence, in which case `failsafe` is `Stop`.
+    pub stop_silent: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -107,6 +117,24 @@ pub struct Supervisor {
     /// with no power link at all, permanently non-finite, never starts
     /// this clock either.
     last_report_t: Option<Timestamp>,
+    /// Latest report per stop source, indexed by `stop_index`. An engaged
+    /// stop holds until the source reports a release: a source that goes
+    /// silent while engaged has not released anything.
+    stops: [StopInput; MAX_STOP_SOURCES],
+    /// A stop-on-silence source was silent at the latest tick.
+    silence_stop: bool,
+}
+
+#[derive(Copy, Clone, Default)]
+struct StopInput {
+    engaged: bool,
+    last_report: Option<Timestamp>,
+}
+
+fn stop_index(source: StopSource) -> usize {
+    match source {
+        StopSource::Rc => 0,
+    }
 }
 
 impl Supervisor {
@@ -136,6 +164,8 @@ impl Supervisor {
             geofence_breach: None,
             claimant_lost: None,
             last_report_t: None,
+            stops: [StopInput::default(); MAX_STOP_SOURCES],
+            silence_stop: false,
         }
     }
 
@@ -234,11 +264,33 @@ impl Supervisor {
         }
     }
 
+    /// One report from a stop source (D-037): its current state, sent on
+    /// every frame the source delivers so that its silence can be judged.
+    /// Accepted from any source, declared or not, because a stop only
+    /// removes actuation. Engaging disarms at once, whoever holds the conn;
+    /// releasing re-arms nothing.
+    pub fn stop_report(&mut self, source: StopSource, engaged: bool, now: Timestamp) {
+        self.stops[stop_index(source)] = StopInput {
+            engaged,
+            last_report: Some(now),
+        };
+        if engaged {
+            self.arming = ArmingState::Disarmed;
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.silence_stop || self.stops.iter().any(|s| s.engaged)
+    }
+
     /// Arm using the cached inputs of the latest tick. Arming before the
     /// first tick is arming blind and is refused.
     pub fn arm(&mut self, id: ClaimantId) -> Result<(), ArmError> {
         if self.conn != ConnState::Held(id) {
             return Err(ArmError::NotHolder);
+        }
+        if self.stopped() {
+            return Err(ArmError::Stopped);
         }
         let Some(cache) = self.last_tick else {
             return Err(ArmError::EstimatorNotReady);
@@ -285,9 +337,10 @@ impl Supervisor {
 
     /// Evaluate the failsafe matrix and produce the tick's directive.
     ///
-    /// Priority: critical voltage, position degraded, geofence breach,
-    /// claimant lost, then the holder's setpoint (with low voltage and
-    /// power-report staleness as report-only flags). The first active
+    /// Priority: stop, critical voltage, position degraded, geofence breach,
+    /// claimant lost, then the holder's setpoint (with low voltage,
+    /// power-report staleness and stop-source silence as report-only
+    /// flags). The first active
     /// condition supplies the setpoint; lower-priority conditions still
     /// latch and surface once the higher ones clear. A disarmed vessel
     /// always gets `Idle`.
@@ -395,6 +448,23 @@ impl Supervisor {
             power_stale,
         });
 
+        // Stop sources (D-037). Never reported counts as silent: a
+        // stop-on-silence source must be heard before the vessel can arm.
+        let mut stop_silent = false;
+        let mut silence_stop = false;
+        for declared in self.cfg.stop_sources.iter() {
+            let silent = self.stops[stop_index(declared.source)]
+                .last_report
+                .is_none_or(|t| now.saturating_duration_since(t) > self.cfg.claimant_heartbeat);
+            stop_silent |= silent;
+            silence_stop |= silent && declared.stop_on_silence;
+        }
+        self.silence_stop = silence_stop;
+        let stopped = self.stopped();
+        if stopped {
+            self.arming = ArmingState::Disarmed;
+        }
+
         if critical_voltage {
             // The vessel stops actuating entirely; driving on a dying
             // battery ends worse than drifting. Disarming persists after
@@ -402,7 +472,9 @@ impl Supervisor {
             self.arming = ArmingState::Disarmed;
         }
 
-        let failsafe = if critical_voltage {
+        let failsafe = if stopped {
+            Some(FailsafeCause::Stop)
+        } else if critical_voltage {
             Some(FailsafeCause::CriticalVoltage)
         } else if self.position_degraded {
             Some(FailsafeCause::PositionDegraded)
@@ -414,8 +486,8 @@ impl Supervisor {
             None
         };
 
-        // Critical voltage forced Disarmed above, so the first branch also
-        // covers priority 1.
+        // A stop and critical voltage forced Disarmed above, so the first
+        // branch also covers both.
         let setpoint = if self.arming == ArmingState::Disarmed {
             Setpoint::Idle
         } else if self.position_degraded {
@@ -439,6 +511,7 @@ impl Supervisor {
             failsafe,
             low_voltage,
             power_stale,
+            stop_silent,
         }
     }
 }

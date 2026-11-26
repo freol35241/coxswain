@@ -9,8 +9,8 @@ use std::time::Duration;
 use coxswain_contract::{
     BoundedList, ClaimantId, ClaimantPriority, ConnGrantDefault, EffectorConfig, EffectorId,
     EffectorKind, EstimatorConfig, Fossen3DofParams, GeoPoint, GeofenceAction, GeofenceConfig,
-    License, MAX_EFFECTORS, ModelParams, SensorConfig, SensorId, SensorRole, SupervisorConfig,
-    VesselConfig,
+    License, MAX_EFFECTORS, MAX_STOP_SOURCES, ModelParams, SensorConfig, SensorId, SensorRole,
+    StopSource, StopSourceConfig, SupervisorConfig, VesselConfig,
 };
 use coxswain_cyphal::{NODE_ID_MAX, SUBJECT_ID_MAX};
 
@@ -22,7 +22,7 @@ use crate::toml_model::{
 use crate::types::{
     ActuatorFailsafe, ActuatorFunction, ActuatorNodeEntry, BusEntry, BusKind, ChecksumMode,
     CompiledManifest, ConnNodeEntry, EffectorEntry, EffectorOutput, FixedStr32, Nmea0183Quirks,
-    Nmea2000Quirks, PwmCalibration, RcEntry, SCHEMA_VERSION, SensorEntry,
+    Nmea2000Quirks, PwmCalibration, RcClaimantEntry, RcEntry, SCHEMA_VERSION, SensorEntry,
 };
 
 /// Board profiles (D-016): the ports a manifest may reference. A sensor's
@@ -239,8 +239,8 @@ pub enum ValidateError {
     RcBusWrongKind {
         bus: String,
     },
-    /// Two of `[rc]`'s four channel fields (kill/takeover/surge/yaw) name
-    /// the same channel.
+    /// Two of `[rc]`'s channel fields (kill, and takeover/surge/yaw under
+    /// `[rc.claimant]`) name the same channel.
     RcDuplicateChannel {
         channel: u16,
     },
@@ -250,12 +250,12 @@ pub enum ValidateError {
     },
     /// `[rc].switch_low_us` is not strictly below `switch_high_us`.
     RcSwitchBoundsInverted,
-    /// `[rc].max_surge_n` or `max_yaw_nm` is not strictly positive and
+    /// `[rc.claimant].max_surge_n` or `max_yaw_nm` is not strictly positive and
     /// finite.
     RcMaximumNotPositive {
         field: &'static str,
     },
-    /// `[rc].claimant` names a `ClaimantId` with no matching `[[claimant]]`
+    /// `[rc.claimant].id` names a `ClaimantId` with no matching `[[claimant]]`
     /// entry, so the RC would silently fall to the default priority 0 instead
     /// of its intended preemption priority (D-025).
     RcClaimantUnknown {
@@ -529,7 +529,10 @@ impl std::fmt::Display for ValidateError {
                 write!(f, "rc: switch_low_us must be strictly below switch_high_us")
             }
             Self::RcMaximumNotPositive { field } => {
-                write!(f, "rc.{field} must be strictly positive and finite")
+                write!(
+                    f,
+                    "rc.claimant.{field} must be strictly positive and finite"
+                )
             }
             Self::RcClaimantUnknown { claimant } => {
                 write!(
@@ -883,6 +886,7 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         ),
         geofence: build_geofence(m.supervisor.geofence.as_ref())?,
         claimant_priorities: claimant_priorities(&m.claimants)?,
+        stop_sources: stop_sources(m.rc.as_ref()),
     };
 
     // Blob tables and the per-sensor trust declarations.
@@ -1113,6 +1117,20 @@ fn id_list(
 /// D-025: `id` is authored directly, not compiler-assigned (see
 /// `ClaimantToml`'s doc comment), so this is a straight copy plus the
 /// capacity check every other blob table gets.
+/// The declared stop sources (D-037). An `[rc]` table always declares its
+/// kill channel as one; Keelson `safety_state` joins with its consumer.
+fn stop_sources(rc: Option<&RcToml>) -> BoundedList<StopSourceConfig, MAX_STOP_SOURCES> {
+    let mut sources = BoundedList::new();
+    if let Some(rc) = rc {
+        // One source, one slot: MAX_STOP_SOURCES has a slot per variant.
+        let _ = sources.push(StopSourceConfig {
+            source: StopSource::Rc,
+            stop_on_silence: rc.stop_on_silence,
+        });
+    }
+    sources
+}
+
 fn claimant_priorities(
     claimants: &[ClaimantToml],
 ) -> Result<BoundedList<ClaimantPriority, 8>, ValidateError> {
@@ -1914,14 +1932,14 @@ fn pwm_calibration(id: &str, p: &PwmCalibrationToml) -> Result<PwmCalibration, V
     })
 }
 
-/// Compiles `[rc]` (D-025): the vessel's RC hand controller, absent when the
-/// manifest declares none (`[rc]` is optional and, being a single TOML
-/// table rather than an array-of-tables, at most one by construction).
-/// `bus` must reference a declared `crsf_uart` bus; `claimant` must name a
-/// declared `[[claimant]]` id; the four channel fields must be distinct and
-/// each below CRSF's channel count; `switch_low_us` must be strictly below
-/// `switch_high_us`; both force/moment maxima must be strictly positive and
-/// finite.
+/// Compiles `[rc]` (D-025, D-037): the vessel's RC hand controller, absent
+/// when the manifest declares none (`[rc]` is optional and, being a single
+/// TOML table rather than an array-of-tables, at most one by construction).
+/// `bus` must reference a declared `crsf_uart` bus; the channel fields in
+/// use must be distinct and each below CRSF's channel count; `switch_low_us`
+/// must be strictly below `switch_high_us`. With `[rc.claimant]`, its `id`
+/// must name a declared `[[claimant]]` and both force/moment maxima must be
+/// strictly positive and finite.
 fn build_rc(
     rc: Option<&RcToml>,
     bus_by_id: &HashMap<&str, &BusToml>,
@@ -1942,21 +1960,20 @@ fn build_rc(
         });
     }
 
-    // The RC's priority lives in [[claimant]], keyed by this id (D-025). An id
-    // with no entry there is not priority 0 by intent, it is an authoring slip:
-    // the RC would silently lose preemption to whatever outranks 0.
-    if !claimant_ids.contains(&rc.claimant) {
-        return Err(ValidateError::RcClaimantUnknown {
-            claimant: rc.claimant,
-        });
+    if let Some(c) = &rc.claimant {
+        // The RC's priority lives in [[claimant]], keyed by this id (D-025).
+        // An id with no entry there is not priority 0 by intent, it is an
+        // authoring slip: the RC would silently lose preemption to whatever
+        // outranks 0.
+        if !claimant_ids.contains(&c.id) {
+            return Err(ValidateError::RcClaimantUnknown { claimant: c.id });
+        }
     }
 
-    let channels = [
-        rc.kill_channel,
-        rc.takeover_channel,
-        rc.surge_channel,
-        rc.yaw_channel,
-    ];
+    let mut channels = vec![rc.kill_channel];
+    if let Some(c) = &rc.claimant {
+        channels.extend([c.takeover_channel, c.surge_channel, c.yaw_channel]);
+    }
     for &channel in &channels {
         if channel >= RC_CHANNEL_COUNT {
             return Err(ValidateError::RcChannelOutOfRange { channel });
@@ -1973,26 +1990,31 @@ fn build_rc(
         return Err(ValidateError::RcSwitchBoundsInverted);
     }
 
-    for (field, value) in [
-        ("max_surge_n", rc.max_surge_n),
-        ("max_yaw_nm", rc.max_yaw_nm),
-    ] {
-        if !(value.is_finite() && value > 0.0) {
-            return Err(ValidateError::RcMaximumNotPositive { field });
+    let claimant = match &rc.claimant {
+        None => None,
+        Some(c) => {
+            for (field, value) in [("max_surge_n", c.max_surge_n), ("max_yaw_nm", c.max_yaw_nm)] {
+                if !(value.is_finite() && value > 0.0) {
+                    return Err(ValidateError::RcMaximumNotPositive { field });
+                }
+            }
+            Some(RcClaimantEntry {
+                id: c.id,
+                takeover_channel: c.takeover_channel,
+                surge_channel: c.surge_channel,
+                yaw_channel: c.yaw_channel,
+                stick_deadband_us: c.stick_deadband_us,
+                max_surge_n: c.max_surge_n,
+                max_yaw_nm: c.max_yaw_nm,
+            })
         }
-    }
+    };
 
     Ok(Some(RcEntry {
         bus: fx("rc.bus", &rc.bus)?,
-        claimant: rc.claimant,
         kill_channel: rc.kill_channel,
-        takeover_channel: rc.takeover_channel,
-        surge_channel: rc.surge_channel,
-        yaw_channel: rc.yaw_channel,
         switch_low_us: rc.switch_low_us,
         switch_high_us: rc.switch_high_us,
-        stick_deadband_us: rc.stick_deadband_us,
-        max_surge_n: rc.max_surge_n,
-        max_yaw_nm: rc.max_yaw_nm,
+        claimant,
     }))
 }

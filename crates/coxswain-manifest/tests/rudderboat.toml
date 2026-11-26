@@ -6,7 +6,7 @@
 # ============================================================
 
 [manifest]
-schema_version = 8
+schema_version = 9
 vessel_id      = "se-rise-rudderboat-01"
 name           = "Rudderboat"
 revision       = 1
@@ -118,13 +118,16 @@ us_max    = 1900
 
 [rc]
 bus                = "rc_link"
-claimant           = 1
 kill_channel       = 4
+switch_low_us      = 1300
+switch_high_us     = 1700
+stop_on_silence    = true
+
+[rc.claimant]
+id                 = 1
 takeover_channel   = 5
 surge_channel      = 2
 yaw_channel        = 3
-switch_low_us      = 1300
-switch_high_us     = 1700
 stick_deadband_us  = 12
 max_surge_n        = 150.0
 max_yaw_nm         = 60.0

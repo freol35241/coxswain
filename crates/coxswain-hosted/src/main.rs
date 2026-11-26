@@ -20,7 +20,7 @@ use std::time::{Instant, SystemTime};
 
 use coxswain_contract::{
     ClaimantId, EffectorKind, GeoPoint, License, Measurement, ModelParams, PowerStatus, SensorId,
-    SensorRole, Setpoint, Timestamp, VesselState,
+    SensorRole, Setpoint, StopSource, Timestamp, VesselState,
 };
 use coxswain_crsf::{FrameReader, ParseOutcome};
 use coxswain_cyphal::{NodeId, Priority, SubjectId};
@@ -29,7 +29,7 @@ use coxswain_drivers::cyphal_actuator::{CyphalActuatorBackend, CyphalEffector, C
 use coxswain_drivers::gnss0183::{self, Gnss0183Driver};
 use coxswain_drivers::output::{ActuatorSink, OutputBackend, OutputFrame};
 use coxswain_drivers::rc::{self, RcAdapter};
-use coxswain_hosted::{ArmError, ClaimError, Core, TickOutput};
+use coxswain_hosted::{ArmError, ClaimError, Core, FailsafeCause, TickOutput};
 use coxswain_keelson::{CommandServer, ConnEvent, ConnReplyResult, TelemetryPublisher};
 use coxswain_manifest::{BusKind, ChecksumMode, EffectorOutput, Nmea0183Quirks, SensorEntry};
 use coxswain_n2k::{DecodeError, FastPacketAssembler, Outcome};
@@ -217,6 +217,7 @@ fn arm_reply(result: Result<(), ArmError>) -> ConnReplyResult {
         Err(ArmError::PositionDegraded) => ConnReplyResult::RefusedPosition,
         Err(ArmError::VoltageLow) => ConnReplyResult::RefusedVoltage,
         Err(ArmError::PowerStale) => ConnReplyResult::RefusedPowerStale,
+        Err(ArmError::Stopped) => ConnReplyResult::RefusedStop,
     }
 }
 
@@ -776,38 +777,35 @@ fn build_cyphal_backend(
     )
 }
 
-/// Applies one parsed CRSF frame's events to the core (D-025). Kill maps to
-/// disarm, re-issued every frame while engaged (dead-man doctrine: cheap,
-/// idempotent, and the caller's choice per coxswain-drivers::rc's doc
-/// comment); takeover maps to request/release_conn; Effort doubles as both
-/// the setpoint and the claimant heartbeat.
+/// Applies one parsed CRSF frame's events to the core. Kill is a stop
+/// source (D-037): its level goes to the supervisor on every channel frame,
+/// which disarms whoever holds the conn. Takeover maps to
+/// request/release_conn and Effort doubles as both the setpoint and the
+/// claimant heartbeat (D-025); the adapter only emits those when `[rc]`
+/// declares a claimant, so `rc_id` is `None` exactly when they cannot occur.
 fn apply_rc_events(
     core: &mut Core,
-    rc_id: ClaimantId,
+    rc_id: Option<ClaimantId>,
     now: Timestamp,
     events: &[rc::Event],
-    kill_engaged: &mut bool,
 ) {
     for event in events {
-        match *event {
-            rc::Event::KillEngaged => *kill_engaged = true,
-            rc::Event::KillReleased => *kill_engaged = false,
-            rc::Event::TakeoverEngaged => {
-                let _ = core.request_conn(rc_id, now);
+        match (*event, rc_id) {
+            (rc::Event::Kill(engaged), _) => core.stop_report(StopSource::Rc, engaged, now),
+            (rc::Event::TakeoverEngaged, Some(id)) => {
+                let _ = core.request_conn(id, now);
             }
-            rc::Event::TakeoverReleased => {
-                let _ = core.release_conn(rc_id);
+            (rc::Event::TakeoverReleased, Some(id)) => {
+                let _ = core.release_conn(id);
             }
-            rc::Event::Effort(demand) => {
-                core.set_setpoint(rc_id, Setpoint::DirectEffort(demand));
+            (rc::Event::Effort(demand), Some(id)) => {
+                core.set_setpoint(id, Setpoint::DirectEffort(demand));
                 // The Effort stream doubles as the RC claimant's heartbeat,
                 // same convention as a Keelson setpoint stream.
-                let _ = core.heartbeat(rc_id, now);
+                let _ = core.heartbeat(id, now);
             }
+            (_, None) => {}
         }
-    }
-    if *kill_engaged {
-        let _ = core.disarm(rc_id);
     }
 }
 
@@ -1273,16 +1271,18 @@ fn run() -> Result<(), String> {
             FrameReader::new(),
             RcAdapter::new(rc::Config {
                 kill_channel: rc_entry.kill_channel as usize,
-                takeover_channel: rc_entry.takeover_channel as usize,
-                surge_channel: rc_entry.surge_channel as usize,
-                yaw_channel: rc_entry.yaw_channel as usize,
                 switch_low_us: rc_entry.switch_low_us,
                 switch_high_us: rc_entry.switch_high_us,
-                stick_deadband_us: rc_entry.stick_deadband_us,
-                max_surge_n: rc_entry.max_surge_n,
-                max_yaw_nm: rc_entry.max_yaw_nm,
+                claimant: rc_entry.claimant.map(|c| rc::ClaimantConfig {
+                    takeover_channel: c.takeover_channel as usize,
+                    surge_channel: c.surge_channel as usize,
+                    yaw_channel: c.yaw_channel as usize,
+                    stick_deadband_us: c.stick_deadband_us,
+                    max_surge_n: c.max_surge_n,
+                    max_yaw_nm: c.max_yaw_nm,
+                }),
             }),
-            ClaimantId(rc_entry.claimant),
+            rc_entry.claimant.map(|c| ClaimantId(c.id)),
         ));
     }
     // Each mapped actuator_uart bus is bidirectional (D-021 "command-then-
@@ -1365,18 +1365,24 @@ fn run() -> Result<(), String> {
         );
     }
 
-    let mut core = Core::new(&manifest.config);
+    // With no RC link opened (`--sim`), the RC stop source declared in the
+    // manifest does not exist in this run; judging its silence would only
+    // ever read as a dead transmitter.
+    let mut config = manifest.config;
+    if rc_link.is_none() {
+        config.supervisor.stop_sources = coxswain_contract::BoundedList::new();
+    }
+    let mut core = Core::new(&config);
     // Register the RC claimant at boot with its manifest-authored id
     // (`[rc].claimant`, the rudderboat example's `[[claimant]] name = "rc"`),
     // same as any other claimant needs registering before it can request the
     // conn. Only when the link actually opened (`rc_link` is `None` in sim
     // mode, same as `actuator_links` stays empty there): nothing to register
     // for otherwise.
-    if let Some((_, _, _, rc_id)) = &rc_link {
+    if let Some((_, _, _, Some(rc_id))) = &rc_link {
         core.register(*rc_id, now_ts(&boot))
             .map_err(|e| format!("rc claimant {}: {e:?}", rc_id.0))?;
     }
-    let mut rc_kill_engaged = false;
 
     // Two interfaces (D-035), both always opened here: telemetry carries no
     // authority; the command server is the only path from above to
@@ -1563,21 +1569,14 @@ fn run() -> Result<(), String> {
             }
         }
 
-        // Real RC: drain CRSF bytes into complete frames, apply their
-        // events to the core (D-025), and re-issue disarm every frame while
-        // kill stays engaged (dead-man doctrine).
+        // Real RC: drain CRSF bytes into complete frames and apply their
+        // events to the core (D-025, D-037).
         if let Some((rx, reader, adapter, rc_id)) = &mut rc_link {
             while let Ok((byte, _acquired_at)) = rx.try_recv() {
                 match reader.push(byte) {
                     Some(Ok(ParseOutcome::Frame(frame))) => {
                         let events = adapter.process(frame);
-                        apply_rc_events(
-                            &mut core,
-                            *rc_id,
-                            now,
-                            events.as_slice(),
-                            &mut rc_kill_engaged,
-                        );
+                        apply_rc_events(&mut core, *rc_id, now, events.as_slice());
                     }
                     Some(Err(e)) if !driver_error_logged => {
                         eprintln!("coxswain-hosted: CRSF frame rejected (continuing): {e:?}");
@@ -1784,9 +1783,11 @@ fn run() -> Result<(), String> {
                     &out.health,
                     &out.directive.conn,
                     out.directive.arming,
-                    coxswain_keelson::PowerHealth {
+                    coxswain_keelson::SupervisorHealth {
                         low_voltage: out.directive.low_voltage,
                         power_stale: out.directive.power_stale,
+                        stopped: out.directive.failsafe == Some(FailsafeCause::Stop),
+                        stop_silent: out.directive.stop_silent,
                     },
                     coxswain_keelson::IoHealth {
                         actuation: &actuation,

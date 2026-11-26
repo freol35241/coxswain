@@ -11,8 +11,8 @@
 use coxswain_allocation::Allocator;
 use coxswain_contract::{
     ActuatorCommand, ActuatorOutputs, ArmingState, ClaimantId, ConnState, EstimatorHealth,
-    ForceDemand, GuidanceReference, Measurement, PowerStatus, Setpoint, Timestamp, VesselConfig,
-    VesselState,
+    ForceDemand, GuidanceReference, Measurement, PowerStatus, Setpoint, StopSource, Timestamp,
+    VesselConfig, VesselState,
 };
 use coxswain_estimator::Estimator;
 use coxswain_guidance::Guidance;
@@ -112,6 +112,11 @@ impl Core {
 
     pub fn disarm(&mut self, id: ClaimantId) -> Result<(), ArmError> {
         self.supervisor.disarm(id)
+    }
+
+    /// A stop source's current state (D-037), on every frame it delivers.
+    pub fn stop_report(&mut self, source: StopSource, engaged: bool, now: Timestamp) {
+        self.supervisor.stop_report(source, engaged, now);
     }
 
     // Data plane.

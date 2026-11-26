@@ -7,7 +7,7 @@ use coxswain_contract::{
     AUTONOMY, ArmingState, BodyVelocity, BoundedList, ClaimantId, ClaimantPriority,
     ConnGrantDefault, ConnState, EstimatorConfig, EstimatorHealth, Fossen3DofParams, GeoPoint,
     GeofenceAction, GeofenceConfig, HealthLevel, ModelParams, Pose, PowerStatus, Setpoint,
-    SupervisorConfig, Timestamp, VesselConfig, VesselState,
+    StopSource, StopSourceConfig, SupervisorConfig, Timestamp, VesselConfig, VesselState,
 };
 use coxswain_supervisor::{
     ArmError, ClaimError, Directive, FailsafeCause, MAX_CLAIMANTS, Supervisor,
@@ -92,6 +92,7 @@ fn config_with_fence(grant: ConnGrantDefault, fence: GeofenceConfig) -> VesselCo
             power_stale_after: Duration::from_millis(POWER_STALE_MS),
             geofence: fence,
             claimant_priorities: BoundedList::new(),
+            stop_sources: BoundedList::new(),
         },
         effectors: BoundedList::new(),
     }
@@ -596,6 +597,7 @@ fn critical_voltage_forces_disarm_and_it_sticks() {
             failsafe: Some(FailsafeCause::CriticalVoltage),
             low_voltage: true,
             power_stale: false,
+            stop_silent: false,
         }
     );
     // Voltage recovery does not re-arm; that is the holder's call.
@@ -690,6 +692,7 @@ fn position_degraded_idles_but_stays_armed() {
             failsafe: Some(FailsafeCause::PositionDegraded),
             low_voltage: false,
             power_stale: false,
+            stop_silent: false,
         }
     );
     // Recovery: the holder's setpoint passes through again.
@@ -721,6 +724,7 @@ fn geofence_hold_station_keeps_at_breach_point() {
             failsafe: Some(FailsafeCause::GeofenceBreach),
             low_voltage: false,
             power_stale: false,
+            stop_silent: false,
         }
     );
 }
@@ -793,6 +797,7 @@ fn claimant_lost_station_keeps_on_own_authority() {
             failsafe: Some(FailsafeCause::ClaimantLost),
             low_voltage: false,
             power_stale: false,
+            stop_silent: false,
         }
     );
 }
@@ -818,6 +823,7 @@ fn low_voltage_reports_only_and_blocks_arming() {
             failsafe: None,
             low_voltage: true,
             power_stale: false,
+            stop_silent: false,
         }
     );
     // While low voltage holds, a disarmed vessel cannot re-arm.
@@ -858,6 +864,7 @@ fn disarmed_vessel_always_idles() {
             failsafe: None,
             low_voltage: false,
             power_stale: false,
+            stop_silent: false,
         }
     );
     // Conditions still evaluate and report while disarmed, but the setpoint
@@ -927,6 +934,7 @@ fn armed_vessel_unaffected_by_power_staleness_apart_from_the_flag() {
             failsafe: None,
             low_voltage: false,
             power_stale: true,
+            stop_silent: false,
         }
     );
 }
@@ -1117,6 +1125,7 @@ fn run_pair(hi: Cond, lo: Cond) {
         // staleness; every report here arrives fresh at `now` (`pw`'s own
         // doc comment).
         power_stale: false,
+        stop_silent: false,
     };
     assert_eq!(d, expected, "pair {hi:?} + {lo:?}");
 }
@@ -1327,6 +1336,7 @@ fn release_while_armed_latches_claimant_lost() {
             failsafe: Some(FailsafeCause::ClaimantLost),
             low_voltage: false,
             power_stale: false,
+            stop_silent: false,
         }
     );
 }
@@ -1347,6 +1357,7 @@ fn release_while_disarmed_is_clean() {
             failsafe: None,
             low_voltage: false,
             power_stale: false,
+            stop_silent: false,
         }
     );
 }
@@ -1400,4 +1411,152 @@ fn disabled_or_degenerate_geofence_never_breaches() {
         Some(cruise()),
     );
     assert_eq!(d.failsafe, None);
+}
+
+// ------------------------------------------------------------------- stops
+
+/// AUTONOMY holds the conn and is armed, with the RC kill declared as a stop
+/// source (D-037). The declaring tick reports the source released, so it
+/// starts heard.
+fn armed_with_rc_stop(stop_on_silence: bool) -> Supervisor {
+    let mut cfg = config(ConnGrantDefault::Autonomy, GeofenceAction::Hold);
+    cfg.supervisor
+        .stop_sources
+        .push(StopSourceConfig {
+            source: StopSource::Rc,
+            stop_on_silence,
+        })
+        .unwrap();
+    let mut sup = Supervisor::new(&cfg);
+    sup.heartbeat(AUTONOMY, ts(0)).unwrap();
+    sup.stop_report(StopSource::Rc, false, ts(0));
+    nominal_tick(&mut sup, ts(0));
+    sup.arm(AUTONOMY).unwrap();
+    sup
+}
+
+#[test]
+fn stop_disarms_whoever_holds_the_conn() {
+    // No stop source declared: a stop is honored from any source anyway.
+    let mut sup = armed(GeofenceAction::Hold);
+    sup.stop_report(StopSource::Rc, true, ts(10));
+    // At once, not at the next tick.
+    assert_eq!(sup.arming(), ArmingState::Disarmed);
+    sup.heartbeat(AUTONOMY, ts(100)).unwrap();
+    let d = nominal_tick(&mut sup, ts(100));
+    assert_eq!(d.failsafe, Some(FailsafeCause::Stop));
+    assert_eq!(d.setpoint, Setpoint::Idle);
+    // The conn is untouched: a stop is not a claim.
+    assert_eq!(d.conn, ConnState::Held(AUTONOMY));
+    assert!(!d.stop_silent);
+}
+
+#[test]
+fn arm_refused_under_stop_and_release_rearms_nothing() {
+    let mut sup = armed_with_rc_stop(false);
+    sup.stop_report(StopSource::Rc, true, ts(10));
+    assert_eq!(sup.arm(AUTONOMY), Err(ArmError::Stopped));
+    // Holder-only still comes first.
+    sup.register(OTHER, ts(10)).unwrap();
+    assert_eq!(sup.arm(OTHER), Err(ArmError::NotHolder));
+
+    sup.stop_report(StopSource::Rc, false, ts(20));
+    sup.heartbeat(AUTONOMY, ts(100)).unwrap();
+    let d = nominal_tick(&mut sup, ts(100));
+    assert_eq!(d.failsafe, None);
+    assert_eq!(d.arming, ArmingState::Disarmed);
+    sup.arm(AUTONOMY).unwrap();
+}
+
+#[test]
+fn stop_outranks_critical_voltage() {
+    let mut sup = armed(GeofenceAction::Hold);
+    sup.stop_report(StopSource::Rc, true, ts(10));
+    sup.heartbeat(AUTONOMY, ts(100)).unwrap();
+    let d = sup.tick(
+        ts(100),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(100), V_CRIT),
+        Some(cruise()),
+    );
+    assert_eq!(d.failsafe, Some(FailsafeCause::Stop));
+    sup.stop_report(StopSource::Rc, false, ts(110));
+    let d = sup.tick(
+        ts(200),
+        &nominal(),
+        Some(&state_at(inside())),
+        &pw(ts(200), V_CRIT),
+        Some(cruise()),
+    );
+    assert_eq!(d.failsafe, Some(FailsafeCause::CriticalVoltage));
+}
+
+#[test]
+fn silence_warns_and_stops_nothing_unless_declared() {
+    let mut sup = armed_with_rc_stop(false);
+    sup.stop_report(StopSource::Rc, false, ts(500));
+    sup.heartbeat(AUTONOMY, ts(HB_MS)).unwrap();
+    let d = nominal_tick(&mut sup, ts(HB_MS));
+    assert!(!d.stop_silent);
+
+    // Silent past the window: a warning, still armed, no cause.
+    sup.heartbeat(AUTONOMY, ts(500 + HB_MS + 1)).unwrap();
+    let d = nominal_tick(&mut sup, ts(500 + HB_MS + 1));
+    assert!(d.stop_silent);
+    assert_eq!(d.failsafe, None);
+    assert_eq!(d.arming, ArmingState::Armed);
+}
+
+#[test]
+fn never_heard_is_silent() {
+    let mut cfg = config(ConnGrantDefault::Autonomy, GeofenceAction::Hold);
+    cfg.supervisor
+        .stop_sources
+        .push(StopSourceConfig {
+            source: StopSource::Rc,
+            stop_on_silence: true,
+        })
+        .unwrap();
+    let mut sup = Supervisor::new(&cfg);
+    sup.heartbeat(AUTONOMY, ts(0)).unwrap();
+    let d = nominal_tick(&mut sup, ts(0));
+    assert!(d.stop_silent);
+    assert_eq!(d.failsafe, Some(FailsafeCause::Stop));
+    assert_eq!(sup.arm(AUTONOMY), Err(ArmError::Stopped));
+
+    sup.stop_report(StopSource::Rc, false, ts(10));
+    nominal_tick(&mut sup, ts(10));
+    sup.arm(AUTONOMY).unwrap();
+}
+
+#[test]
+fn stop_on_silence_disarms_and_resuming_rearms_nothing() {
+    let mut sup = armed_with_rc_stop(true);
+    sup.heartbeat(AUTONOMY, ts(HB_MS + 1)).unwrap();
+    let d = nominal_tick(&mut sup, ts(HB_MS + 1));
+    assert!(d.stop_silent);
+    assert_eq!(d.failsafe, Some(FailsafeCause::Stop));
+    assert_eq!(d.arming, ArmingState::Disarmed);
+    assert_eq!(d.conn, ConnState::Held(AUTONOMY));
+
+    sup.stop_report(StopSource::Rc, false, ts(HB_MS + 50));
+    sup.heartbeat(AUTONOMY, ts(HB_MS + 100)).unwrap();
+    let d = nominal_tick(&mut sup, ts(HB_MS + 100));
+    assert!(!d.stop_silent);
+    assert_eq!(d.failsafe, None);
+    assert_eq!(d.arming, ArmingState::Disarmed);
+}
+
+#[test]
+fn engaged_stop_holds_through_silence() {
+    // Going silent while engaged releases nothing, even when silence alone
+    // would only warn.
+    let mut sup = armed_with_rc_stop(false);
+    sup.stop_report(StopSource::Rc, true, ts(10));
+    sup.heartbeat(AUTONOMY, ts(10 * HB_MS)).unwrap();
+    let d = nominal_tick(&mut sup, ts(10 * HB_MS));
+    assert!(d.stop_silent);
+    assert_eq!(d.failsafe, Some(FailsafeCause::Stop));
+    assert_eq!(sup.arm(AUTONOMY), Err(ArmError::Stopped));
 }
