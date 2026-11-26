@@ -518,8 +518,8 @@ impl KeelsonBusOutput {
         effectors: Vec<BusEffector>,
     ) -> Result<Self, Error> {
         let subject_of = |k: BusEffectorKind| match k {
-            BusEffectorKind::Rudder => subject::RUDDER_ANGLE_SETPOINT_DEG,
-            BusEffectorKind::Thruster => subject::THRUST_SETPOINT_NEWTON,
+            BusEffectorKind::Rudder => subject::RUDDER_ANGLE_DEG_SETPOINT,
+            BusEffectorKind::Thruster => subject::THRUST_NEWTON_SETPOINT,
         };
         let mut liveliness = vec![
             session
@@ -611,8 +611,8 @@ impl KeelsonBusPeer {
         let mut subscribers = Vec::new();
         for &(name, kind) in effectors {
             let subj = match kind {
-                BusEffectorKind::Rudder => subject::RUDDER_ANGLE_SETPOINT_DEG,
-                BusEffectorKind::Thruster => subject::THRUST_SETPOINT_NEWTON,
+                BusEffectorKind::Rudder => subject::RUDDER_ANGLE_DEG_SETPOINT,
+                BusEffectorKind::Thruster => subject::THRUST_NEWTON_SETPOINT,
             };
             let key = keys::pubsub_key(base_path, entity, subj, &keys::device_source_id(name));
             let tx = tx.clone();

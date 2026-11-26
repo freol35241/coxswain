@@ -219,9 +219,10 @@ this before freezing far-end firmware.
       schema v8, compiler check, `keelson-bus` feature, release-build
       refusal, rig test with an external plant over zenoh, SIL image and
       compose file.
-- [ ] Propose upstream to Keelson: `yaw_rate_accuracy_degps`,
-      `speed_over_ground_accuracy_knots`, `course_over_ground_accuracy_deg`,
-      `rudder_angle_setpoint_deg`, `thrust_setpoint_newton` (D-034).
+- [ ] Retire coxswain-specific subjects as Keelson registers them (D-034):
+      the three accuracy subjects (proposed in keelson #449) and
+      `rudder_angle_deg_setpoint` (asked for on keelson #328). Move the pin
+      past 0.6.0-pre.19 when a release has `thrust_newton_setpoint`.
 - [ ] D-035 code split: telemetry publisher and command server from
       `VesselEndpoint`, opened separately; an observer client beside
       `ClaimantClient`; conformance tests against the vendored Keelson protos.
