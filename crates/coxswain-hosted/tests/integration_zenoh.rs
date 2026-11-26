@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use coxswain_contract::{ClaimantId, GeoPoint, Setpoint};
-use coxswain_keelson::{ClaimantClient, ConnReplyResult};
+use coxswain_keelson::{ClaimantClient, ConnReplyResult, Observer, StateUpdate};
 use coxswain_model::LocalFrame;
 use zenoh::Wait;
 
@@ -477,6 +477,33 @@ fn grant_revoke_failsafe_end_to_end() {
 
 /// D-008 as an assertion: kill the router mid-scenario and the vessel holds
 /// station on its own authority without missing a tick deadline.
+/// Fused state goes out under the `coxswain` producer, as
+/// `coxswain/estimator`, so a Keelson consumer can attribute it to the
+/// producer whose liveliness tokens the vessel declares.
+#[test]
+fn fused_state_is_published_under_the_coxswain_producer() {
+    let h = Harness::spawn("fused_source");
+    let mut observer = Observer::new(h.client_session(), BASE_PATH, VESSEL_ID);
+    let rx = observer.subscribe_state().unwrap();
+    let deadline = Instant::now() + BRING_UP;
+    let (mut position, mut heading) = (false, false);
+    while !(position && heading) {
+        assert!(
+            Instant::now() < deadline,
+            "no fused state under coxswain/estimator (position {position}, heading {heading})"
+        );
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(StateUpdate::Position { source_id, .. }) if source_id == "coxswain/estimator" => {
+                position = true;
+            }
+            Ok(StateUpdate::Heading { source_id, .. }) if source_id == "coxswain/estimator" => {
+                heading = true;
+            }
+            _ => {}
+        }
+    }
+}
+
 #[test]
 fn d008_kill_zenohd_vessel_holds_station() {
     let mut h = Harness::spawn("d008");

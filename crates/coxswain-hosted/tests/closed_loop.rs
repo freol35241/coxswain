@@ -12,8 +12,8 @@ use core::time::Duration;
 use coxswain_contract::{
     ArmingState, BoundedList, ClaimantId, ClaimantPriority, ConnGrantDefault, ConnState,
     EffectorConfig, EffectorId, EffectorKind, EstimatorConfig, ForceDemand, Fossen3DofParams,
-    GeoPoint, GeofenceAction, GeofenceConfig, License, ModelParams, PowerStatus, SensorConfig,
-    SensorId, SensorRole, Setpoint, SupervisorConfig, Timestamp, VesselConfig,
+    GeoPoint, GeofenceAction, GeofenceConfig, GuidanceReference, License, ModelParams, PowerStatus,
+    SensorConfig, SensorId, SensorRole, Setpoint, SupervisorConfig, Timestamp, VesselConfig,
 };
 use coxswain_hosted::{ArmError, Core, FailsafeCause, TickOutput};
 use coxswain_model::LocalFrame;
@@ -106,6 +106,7 @@ fn config(geofence: GeofenceConfig) -> VesselConfig {
                 priority: 100,
             }])
             .unwrap(),
+            stop_sources: BoundedList::new(),
         },
         effectors: BoundedList::new(),
     }
@@ -310,6 +311,27 @@ fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
 /// Scenario 1: the conn holder stops heartbeating mid-transit. The conn is
 /// revoked within claimant_heartbeat plus one tick and the vessel comes back
 /// to its position at detection and stays.
+// D-036: the reference is what guidance closed on, and empty whenever
+// guidance did not run.
+#[test]
+fn reference_only_while_armed() {
+    let mut h = Harness::new(no_fence());
+    h.connect();
+    h.core.set_setpoint(TELEOP, north(1.5));
+    assert_eq!(h.step().reference, GuidanceReference::default());
+    h.core.arm(TELEOP).unwrap();
+    let out = h.step();
+    assert_eq!(
+        out.reference,
+        GuidanceReference {
+            heading_rad: Some(0.0),
+            surge_mps: Some(1.5),
+        }
+    );
+    h.core.disarm(TELEOP).unwrap();
+    assert_eq!(h.step().reference, GuidanceReference::default());
+}
+
 #[test]
 fn claimant_lost_revokes_and_holds() {
     let mut h = Harness::new(no_fence());

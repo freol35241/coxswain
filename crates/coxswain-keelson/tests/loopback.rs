@@ -9,7 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use coxswain_contract::{
     BodyVelocity, ClaimantId, GeoPoint, Pose, Setpoint, Timestamp, VesselState,
 };
-use coxswain_keelson::{ClaimantClient, ConnEvent, ConnReplyResult, StateUpdate, VesselEndpoint};
+use coxswain_keelson::{
+    ClaimantClient, CommandServer, ConnEvent, ConnReplyResult, Observer, StateUpdate,
+    TelemetryPublisher,
+};
 use zenoh::Wait;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,7 +33,8 @@ fn isolated_session() -> zenoh::Session {
 #[test]
 fn claimant_grant_flow_and_streams() {
     let session = isolated_session();
-    let mut vessel = VesselEndpoint::new(session.clone(), "cox_test", "loopback").unwrap();
+    let mut command = CommandServer::new(&session, "cox_test", "loopback").unwrap();
+    let telemetry = TelemetryPublisher::new(&session, "cox_test", "loopback").unwrap();
 
     let state = VesselState {
         t: Timestamp::from_nanos(0),
@@ -57,7 +61,7 @@ fn claimant_grant_flow_and_streams() {
     let loop_stop = stop.clone();
     let loop_thread = std::thread::spawn(move || {
         while !loop_stop.load(Ordering::Relaxed) {
-            for (event, handle) in vessel.poll() {
+            for (event, handle) in command.poll() {
                 match event {
                     ConnEvent::Setpoint(id, sp) => {
                         let _ = setpoint_tx.send((id, sp));
@@ -72,19 +76,20 @@ fn claimant_grant_flow_and_streams() {
                         } else {
                             ConnReplyResult::RegistryFull
                         };
-                        vessel.reply(handle.unwrap(), result);
+                        command.reply(handle.unwrap(), result);
                     }
                 }
             }
-            vessel
+            telemetry
                 .publish_state(SystemTime::now(), &state, "coxswain")
                 .unwrap();
             std::thread::sleep(Duration::from_millis(20));
         }
     });
 
-    let mut claimant = ClaimantClient::new(session.clone(), "cox_test", "loopback", ClaimantId(7));
-    let state_rx = claimant.subscribe_state().unwrap();
+    let claimant = ClaimantClient::new(session.clone(), "cox_test", "loopback", ClaimantId(7));
+    let mut observer = Observer::new(session.clone(), "cox_test", "loopback");
+    let state_rx = observer.subscribe_state().unwrap();
 
     // Grant flow.
     assert_eq!(claimant.register().unwrap(), ConnReplyResult::Ok);

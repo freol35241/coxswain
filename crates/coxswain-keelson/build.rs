@@ -9,6 +9,7 @@ fn main() {
                 "protos/Envelope.proto",
                 "protos/payloads/Primitives.proto",
                 "protos/payloads/EntityHealth.proto",
+                "protos/payloads/LocationFixQuality.proto",
                 "protos/payloads/foxglove/LocationFix.proto",
                 "protos/coxswain_conn.proto",
             ],

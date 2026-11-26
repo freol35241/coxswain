@@ -51,6 +51,8 @@ pub struct MetaToml {
 pub struct ConnNodeToml {
     pub board: String,
     pub watchdog_ms: u32,
+    /// Required, no default: declaring the promise is the point (D-034).
+    pub self_sufficient: bool,
 }
 
 /// The body frame's named reference point (D-033): a descriptive label, e.g.
@@ -79,6 +81,7 @@ pub enum BusKindToml {
     ActuatorUart,
     Pwm,
     CrsfUart,
+    Keelson,
 }
 
 #[derive(Copy, Clone, Deserialize)]
@@ -113,6 +116,14 @@ pub struct BusToml {
     pub uart: Option<BusSerialToml>,
     pub actuator_uart: Option<BusSerialToml>,
     pub crsf_uart: Option<BusSerialToml>,
+    pub keelson: Option<BusKeelsonToml>,
+}
+
+/// `[bus.keelson]` (D-034): the entity the bus's traffic lives under.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BusKeelsonToml {
+    pub entity: String,
 }
 
 #[derive(Deserialize)]
@@ -417,23 +428,31 @@ pub struct SupervisorToml {
     pub geofence: Option<GeofenceToml>,
 }
 
-/// The vessel's RC hand controller (D-025): claimant declaration, channel
-/// mapping, and stick/switch shaping, field for field with
-/// `coxswain_drivers::rc::Config` (plus `bus` and `claimant`, which the
-/// driver config does not carry). `claimant` is authored directly, same
-/// out-of-band-agreement convention as `[[claimant]].id` (D-025): it is the
-/// runtime `ClaimantId` the RC adapter registers with, not compiler-assigned.
+/// The vessel's RC hand controller (D-025, D-037): the kill channel, a stop
+/// source, and an optional `[rc.claimant]` sub-table for takeover and manual
+/// helm. Field for field with `coxswain_drivers::rc::Config`, plus `bus` and
+/// `stop_on_silence`, which is required: trust is declared.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RcToml {
     pub bus: String,
-    pub claimant: u16,
     pub kill_channel: u16,
+    pub switch_low_us: u16,
+    pub switch_high_us: u16,
+    pub stop_on_silence: bool,
+    pub claimant: Option<RcClaimantToml>,
+}
+
+/// `[rc.claimant]`. `id` is authored directly, same out-of-band-agreement
+/// convention as `[[claimant]].id` (D-025): it is the runtime `ClaimantId`
+/// the RC adapter registers with, not compiler-assigned.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RcClaimantToml {
+    pub id: u16,
     pub takeover_channel: u16,
     pub surge_channel: u16,
     pub yaw_channel: u16,
-    pub switch_low_us: u16,
-    pub switch_high_us: u16,
     pub stick_deadband_us: u16,
     pub max_surge_n: f64,
     pub max_yaw_nm: f64,

@@ -20,7 +20,7 @@ use std::time::{Instant, SystemTime};
 
 use coxswain_contract::{
     ClaimantId, EffectorKind, GeoPoint, License, Measurement, ModelParams, PowerStatus, SensorId,
-    SensorRole, Setpoint, Timestamp, VesselState,
+    SensorRole, Setpoint, StopSource, Timestamp, VesselState,
 };
 use coxswain_crsf::{FrameReader, ParseOutcome};
 use coxswain_cyphal::{NodeId, Priority, SubjectId};
@@ -29,8 +29,8 @@ use coxswain_drivers::cyphal_actuator::{CyphalActuatorBackend, CyphalEffector, C
 use coxswain_drivers::gnss0183::{self, Gnss0183Driver};
 use coxswain_drivers::output::{ActuatorSink, OutputBackend, OutputFrame};
 use coxswain_drivers::rc::{self, RcAdapter};
-use coxswain_hosted::{ArmError, ClaimError, Core, TickOutput};
-use coxswain_keelson::{ConnEvent, ConnReplyResult, VesselEndpoint};
+use coxswain_hosted::{ArmError, ClaimError, Core, FailsafeCause, TickOutput};
+use coxswain_keelson::{CommandServer, ConnEvent, ConnReplyResult, TelemetryPublisher};
 use coxswain_manifest::{BusKind, ChecksumMode, EffectorOutput, Nmea0183Quirks, SensorEntry};
 use coxswain_n2k::{DecodeError, FastPacketAssembler, Outcome};
 use coxswain_nmea0183::Quirks as Nmea0183ParserQuirks;
@@ -38,9 +38,12 @@ use coxswain_sim::{GnssModel, HeadingModel, Simulator, YawRateModel};
 use zenoh::Wait;
 
 mod can;
+#[cfg(feature = "keelson-bus")]
+mod keelson_bus;
 mod recorder;
 mod sd_notify;
 mod serial;
+mod stall_watchdog;
 mod udp;
 
 const TICK: Duration = Duration::from_millis(100);
@@ -214,6 +217,7 @@ fn arm_reply(result: Result<(), ArmError>) -> ConnReplyResult {
         Err(ArmError::PositionDegraded) => ConnReplyResult::RefusedPosition,
         Err(ArmError::VoltageLow) => ConnReplyResult::RefusedVoltage,
         Err(ArmError::PowerStale) => ConnReplyResult::RefusedPowerStale,
+        Err(ArmError::Stopped) => ConnReplyResult::RefusedStop,
     }
 }
 
@@ -454,13 +458,36 @@ fn parse_n2k_sources(raw: &str) -> SourceFilter {
     )
 }
 
+/// Raw pass-through source ids by compiler-assigned sensor id:
+/// `coxswain/<sensor name>` (Keelson 0.6 §2.1.1). Built once at boot; the
+/// numeric id never reaches the bus.
+fn raw_source_ids(sensors: &[SensorEntry]) -> HashMap<u16, String> {
+    sensors
+        .iter()
+        .map(|s| {
+            (
+                s.id.0,
+                coxswain_keelson::keys::device_source_id(s.name.as_str()),
+            )
+        })
+        .collect()
+}
+
+/// A measurement's raw source id. Every measurement comes from a manifest
+/// sensor, so the fallback is unreachable in practice; it keeps a bug
+/// visible on the bus rather than a panic in the loop.
+fn raw_source_id(ids: &HashMap<u16, String>, sensor: SensorId) -> &str {
+    ids.get(&sensor.0)
+        .map_or("coxswain/unknown_sensor", String::as_str)
+}
+
 /// One sensor's manifest-declared N2K filter: which PGNs belong to it
 /// (`Nmea2000Quirks::pgns`) and which source addresses it accepts. Several
 /// enrichment sensors can share one physical CAN bus (example.toml's
 /// "instruments" bus), each selecting its own slice of the traffic.
 struct Nmea2000SensorFilter {
-    /// The sensor's authored id, used as the Keelson source_id its decoded
-    /// values publish under.
+    /// The Keelson source_id its decoded values publish under: producer
+    /// `coxswain`, then the sensor's authored id.
     source_id: String,
     pgns: Vec<u32>,
     sources: SourceFilter,
@@ -483,7 +510,7 @@ fn nmea2000_sensors(bus_id: &str, sensors: &[SensorEntry]) -> Vec<Nmea2000Sensor
         .filter_map(|s| {
             let quirks = s.nmea2000?;
             Some(Nmea2000SensorFilter {
-                source_id: s.name.as_str().to_string(),
+                source_id: coxswain_keelson::keys::device_source_id(s.name.as_str()),
                 pgns: quirks.pgns.as_slice().to_vec(),
                 sources: parse_n2k_sources(quirks.sources.as_str()),
             })
@@ -750,38 +777,35 @@ fn build_cyphal_backend(
     )
 }
 
-/// Applies one parsed CRSF frame's events to the core (D-025). Kill maps to
-/// disarm, re-issued every frame while engaged (dead-man doctrine: cheap,
-/// idempotent, and the caller's choice per coxswain-drivers::rc's doc
-/// comment); takeover maps to request/release_conn; Effort doubles as both
-/// the setpoint and the claimant heartbeat.
+/// Applies one parsed CRSF frame's events to the core. Kill is a stop
+/// source (D-037): its level goes to the supervisor on every channel frame,
+/// which disarms whoever holds the conn. Takeover maps to
+/// request/release_conn and Effort doubles as both the setpoint and the
+/// claimant heartbeat (D-025); the adapter only emits those when `[rc]`
+/// declares a claimant, so `rc_id` is `None` exactly when they cannot occur.
 fn apply_rc_events(
     core: &mut Core,
-    rc_id: ClaimantId,
+    rc_id: Option<ClaimantId>,
     now: Timestamp,
     events: &[rc::Event],
-    kill_engaged: &mut bool,
 ) {
     for event in events {
-        match *event {
-            rc::Event::KillEngaged => *kill_engaged = true,
-            rc::Event::KillReleased => *kill_engaged = false,
-            rc::Event::TakeoverEngaged => {
-                let _ = core.request_conn(rc_id, now);
+        match (*event, rc_id) {
+            (rc::Event::Kill(engaged), _) => core.stop_report(StopSource::Rc, engaged, now),
+            (rc::Event::TakeoverEngaged, Some(id)) => {
+                let _ = core.request_conn(id, now);
             }
-            rc::Event::TakeoverReleased => {
-                let _ = core.release_conn(rc_id);
+            (rc::Event::TakeoverReleased, Some(id)) => {
+                let _ = core.release_conn(id);
             }
-            rc::Event::Effort(demand) => {
-                core.set_setpoint(rc_id, Setpoint::DirectEffort(demand));
+            (rc::Event::Effort(demand), Some(id)) => {
+                core.set_setpoint(id, Setpoint::DirectEffort(demand));
                 // The Effort stream doubles as the RC claimant's heartbeat,
                 // same convention as a Keelson setpoint stream.
-                let _ = core.heartbeat(rc_id, now);
+                let _ = core.heartbeat(id, now);
             }
+            (_, None) => {}
         }
-    }
-    if *kill_engaged {
-        let _ = core.disarm(rc_id);
     }
 }
 
@@ -797,6 +821,20 @@ fn run() -> Result<(), String> {
     let manifest =
         coxswain_manifest::read(&blob, &pubkey).map_err(|e| format!("{}: {e}", args.manifest))?;
     let hash = coxswain_manifest::manifest_hash(&blob);
+    // D-034: a release build runs only manifests that declare themselves
+    // self-sufficient. The manifest cannot guard against being deployed to
+    // the wrong place; the binary can.
+    #[cfg(not(feature = "keelson-bus"))]
+    if !manifest.conn_node.self_sufficient {
+        return Err(format!(
+            "{}: declares self_sufficient = false; this build runs only self-sufficient \
+             manifests (D-034). Test setups use a build with --features keelson-bus",
+            args.manifest
+        ));
+    }
+    // Opened before any bus is wired: a keelson bus rides this session too
+    // (D-034). The Keelson adapter takes a clone further down.
+    let session = open_session(&args)?;
 
     let boot = Instant::now();
     let now_ts = |boot: &Instant| Timestamp::from_nanos(boot.elapsed().as_nanos() as u64);
@@ -814,7 +852,29 @@ fn run() -> Result<(), String> {
         b.kind == BusKind::Nmea0183Udp
             && nmea0183_wiring(b.id.as_str(), manifest.sensors.as_slice()).is_some()
     });
-    let sim_enabled = args.sim || (args.ports.is_empty() && !udp_gnss_wired);
+    // A keelson bus carrying sensors or effectors is real I/O in the same
+    // sense (D-034), on a build that can wire it. Without the feature such a
+    // bus can only hold enrichment sensors (the compiler guarantees it for a
+    // self-sufficient manifest) and is left unwired below.
+    let keelson_carrying: Vec<&str> = manifest
+        .buses
+        .iter()
+        .filter(|b| {
+            b.kind == BusKind::Keelson
+                && (manifest.sensors.iter().any(|s| s.bus == b.id)
+                    || manifest.effectors.iter().any(|e| e.bus == b.id))
+        })
+        .map(|b| b.id.as_str())
+        .collect();
+    let keelson_wired = cfg!(feature = "keelson-bus") && !keelson_carrying.is_empty();
+    if args.sim && keelson_wired {
+        return Err(format!(
+            "--sim with keelson buses carrying sensors or effectors ({}): two plants would \
+             feed one estimator (D-034)",
+            keelson_carrying.join(", ")
+        ));
+    }
+    let sim_enabled = args.sim || (args.ports.is_empty() && !udp_gnss_wired && !keelson_wired);
     let mut sim: Option<Simulator> = if sim_enabled {
         // This profile's simulator backend needs a plant; a
         // constant_velocity manifest has no physics to run forward, so it
@@ -896,6 +956,12 @@ fn run() -> Result<(), String> {
             .iter()
             .find(|b| b.id.as_str() == bus_id)
             .ok_or_else(|| format!("--port {bus_id}=...: no such bus in the manifest"))?;
+        if bus.kind == BusKind::Keelson {
+            return Err(format!(
+                "--port {bus_id}=...: a keelson bus needs no --port; the manifest specifies it \
+                 fully (D-034)"
+            ));
+        }
         if !matches!(
             bus.kind,
             BusKind::Nmea0183Uart
@@ -939,6 +1005,11 @@ fn run() -> Result<(), String> {
     if !sim_enabled {
         for bus in manifest.buses.iter() {
             if port_map.contains_key(bus.id.as_str()) {
+                continue;
+            }
+            if bus.kind == BusKind::Keelson {
+                // Needs no --port (D-034); wired by the keelson block below,
+                // or warned unwired on a build without the feature.
                 continue;
             }
             if bus.kind == BusKind::Nmea0183Udp {
@@ -1200,16 +1271,18 @@ fn run() -> Result<(), String> {
             FrameReader::new(),
             RcAdapter::new(rc::Config {
                 kill_channel: rc_entry.kill_channel as usize,
-                takeover_channel: rc_entry.takeover_channel as usize,
-                surge_channel: rc_entry.surge_channel as usize,
-                yaw_channel: rc_entry.yaw_channel as usize,
                 switch_low_us: rc_entry.switch_low_us,
                 switch_high_us: rc_entry.switch_high_us,
-                stick_deadband_us: rc_entry.stick_deadband_us,
-                max_surge_n: rc_entry.max_surge_n,
-                max_yaw_nm: rc_entry.max_yaw_nm,
+                claimant: rc_entry.claimant.map(|c| rc::ClaimantConfig {
+                    takeover_channel: c.takeover_channel as usize,
+                    surge_channel: c.surge_channel as usize,
+                    yaw_channel: c.yaw_channel as usize,
+                    stick_deadband_us: c.stick_deadband_us,
+                    max_surge_n: c.max_surge_n,
+                    max_yaw_nm: c.max_yaw_nm,
+                }),
             }),
-            ClaimantId(rc_entry.claimant),
+            rc_entry.claimant.map(|c| ClaimantId(c.id)),
         ));
     }
     // Each mapped actuator_uart bus is bidirectional (D-021 "command-then-
@@ -1282,22 +1355,44 @@ fn run() -> Result<(), String> {
         .collect();
     let mut actuation_diverged = vec![false; manifest.effectors.as_slice().len()];
 
-    let mut core = Core::new(&manifest.config);
+    #[cfg(feature = "keelson-bus")]
+    let mut keelson_links = keelson_bus::open_links(&session, &manifest, boot)?;
+    #[cfg(not(feature = "keelson-bus"))]
+    for bus_id in &keelson_carrying {
+        eprintln!(
+            "coxswain-hosted: keelson bus {bus_id:?} carries enrichment only and this build has \
+             no keelson-bus feature; not wired"
+        );
+    }
+
+    // With no RC link opened (`--sim`), the RC stop source declared in the
+    // manifest does not exist in this run; judging its silence would only
+    // ever read as a dead transmitter.
+    let mut config = manifest.config;
+    if rc_link.is_none() {
+        config.supervisor.stop_sources = coxswain_contract::BoundedList::new();
+    }
+    let mut core = Core::new(&config);
     // Register the RC claimant at boot with its manifest-authored id
     // (`[rc].claimant`, the rudderboat example's `[[claimant]] name = "rc"`),
     // same as any other claimant needs registering before it can request the
     // conn. Only when the link actually opened (`rc_link` is `None` in sim
     // mode, same as `actuator_links` stays empty there): nothing to register
     // for otherwise.
-    if let Some((_, _, _, rc_id)) = &rc_link {
+    if let Some((_, _, _, Some(rc_id))) = &rc_link {
         core.register(*rc_id, now_ts(&boot))
             .map_err(|e| format!("rc claimant {}: {e:?}", rc_id.0))?;
     }
-    let mut rc_kill_engaged = false;
 
-    let session = open_session(&args)?;
-    let mut endpoint = VesselEndpoint::new(session, "keelson", manifest.vessel_id.as_str())
-        .map_err(|e| format!("keelson endpoint: {e}"))?;
+    // Two interfaces (D-035), both always opened here: telemetry carries no
+    // authority; the command server is the only path from above to
+    // actuation.
+    let telemetry = TelemetryPublisher::new(&session, "keelson", manifest.vessel_id.as_str())
+        .map_err(|e| format!("keelson telemetry: {e}"))?;
+    let mut command = CommandServer::new(&session, "keelson", manifest.vessel_id.as_str())
+        .map_err(|e| format!("keelson command interface: {e}"))?;
+
+    let raw_sources = raw_source_ids(manifest.sensors.as_slice());
 
     // Boot complete (manifest verified, buses mapped, zenoh session up):
     // tell systemd, if it's listening (`$NOTIFY_SOCKET` unset otherwise, the
@@ -1305,10 +1400,18 @@ fn run() -> Result<(), String> {
     // exactly this before treating the unit as started.
     let mut notifier = sd_notify::Notifier::from_env();
     notifier.ready();
+    // Armed after boot so manifest checks and session setup never count as
+    // a stall; the first beat lands within one tick.
+    let heartbeat = stall_watchdog::spawn(
+        stall_watchdog::STALL_TIMEOUT,
+        stall_watchdog::abort_on_stall,
+    );
 
     // Publish failures must not stop the loop; log the first error kind once
     // so a dead router does not flood stderr at 10 Hz.
     let mut publish_error_logged = false;
+    // Same single-shot treatment for the stdout status line.
+    let mut status_error_logged = false;
     let publish = |r: Result<(), coxswain_keelson::Error>, logged: &mut bool| {
         if let Err(e) = r
             && !*logged
@@ -1352,6 +1455,7 @@ fn run() -> Result<(), String> {
         // and covers the board itself; this one exists today and only
         // covers the Linux process.
         notifier.watchdog(tick_start);
+        heartbeat.beat();
         if let Some(prev) = prev_tick_start {
             interval_max = interval_max.max(tick_start - prev);
         }
@@ -1361,7 +1465,7 @@ fn run() -> Result<(), String> {
 
         // Claimant events first, so a setpoint sent before this tick steers
         // this tick.
-        for (event, handle) in endpoint.poll() {
+        for (event, handle) in command.poll() {
             let result = match event {
                 ConnEvent::Register(id) => claim_reply(core.register(id, now)),
                 ConnEvent::RequestConn(id) => claim_reply(core.request_conn(id, now)),
@@ -1377,7 +1481,7 @@ fn run() -> Result<(), String> {
                 }
             };
             if let Some(handle) = handle {
-                endpoint.reply(handle, result);
+                command.reply(handle, result);
             }
         }
 
@@ -1390,7 +1494,7 @@ fn run() -> Result<(), String> {
             for m in sim.step(dt) {
                 ingest_measurement(&mut core, &mut ingest_error_logged, &m);
                 publish(
-                    endpoint.publish_raw(wall, &m, &format!("raw/{}", m.sensor.0)),
+                    telemetry.publish_raw(wall, &m, raw_source_id(&raw_sources, m.sensor)),
                     &mut publish_error_logged,
                 );
             }
@@ -1398,6 +1502,33 @@ fn run() -> Result<(), String> {
                 t: now,
                 voltage_v: sim.voltage(),
             });
+        }
+
+        // Keelson buses (D-034): measurements take the same ingest/publish
+        // path as any driver's; voltage feeds the supervisor's power intake.
+        #[cfg(feature = "keelson-bus")]
+        for link in &mut keelson_links {
+            for input in link.input.poll() {
+                match input {
+                    coxswain_keelson::BusInput::Measurement(m) => {
+                        ingest_measurement(&mut core, &mut ingest_error_logged, &m);
+                        publish(
+                            telemetry.publish_raw(wall, &m, raw_source_id(&raw_sources, m.sensor)),
+                            &mut publish_error_logged,
+                        );
+                    }
+                    coxswain_keelson::BusInput::Power { t, voltage_v } => {
+                        core.power(PowerStatus { t, voltage_v });
+                    }
+                }
+            }
+            if !link.dropped_logged && link.input.dropped() > 0 {
+                eprintln!(
+                    "coxswain-hosted: keelson bus {:?}: malformed samples dropped (continuing)",
+                    link.bus_id
+                );
+                link.dropped_logged = true;
+            }
         }
 
         // Real GNSS-over-0183: drain whatever bytes the reader threads
@@ -1420,7 +1551,11 @@ fn run() -> Result<(), String> {
                         for m in batch.iter() {
                             ingest_measurement(&mut core, &mut ingest_error_logged, m);
                             publish(
-                                endpoint.publish_raw(wall, m, &format!("raw/{}", m.sensor.0)),
+                                telemetry.publish_raw(
+                                    wall,
+                                    m,
+                                    raw_source_id(&raw_sources, m.sensor),
+                                ),
                                 &mut publish_error_logged,
                             );
                         }
@@ -1434,21 +1569,14 @@ fn run() -> Result<(), String> {
             }
         }
 
-        // Real RC: drain CRSF bytes into complete frames, apply their
-        // events to the core (D-025), and re-issue disarm every frame while
-        // kill stays engaged (dead-man doctrine).
+        // Real RC: drain CRSF bytes into complete frames and apply their
+        // events to the core (D-025, D-037).
         if let Some((rx, reader, adapter, rc_id)) = &mut rc_link {
             while let Ok((byte, _acquired_at)) = rx.try_recv() {
                 match reader.push(byte) {
                     Some(Ok(ParseOutcome::Frame(frame))) => {
                         let events = adapter.process(frame);
-                        apply_rc_events(
-                            &mut core,
-                            *rc_id,
-                            now,
-                            events.as_slice(),
-                            &mut rc_kill_engaged,
-                        );
+                        apply_rc_events(&mut core, *rc_id, now, events.as_slice());
                     }
                     Some(Err(e)) if !driver_error_logged => {
                         eprintln!("coxswain-hosted: CRSF frame rejected (continuing): {e:?}");
@@ -1554,7 +1682,7 @@ fn run() -> Result<(), String> {
                         for sensor in &link.sensors {
                             if sensor.matches(pgn, decoded.source_address) {
                                 publish(
-                                    endpoint.publish_n2k(wall, message, &sensor.source_id),
+                                    telemetry.publish_n2k(wall, message, &sensor.source_id),
                                     &mut publish_error_logged,
                                 );
                             }
@@ -1608,55 +1736,102 @@ fn run() -> Result<(), String> {
                     .write_outputs(outputs.values.as_slice(), &mut sink);
             }
         }
+        // Keelson bus effectors (D-034): one setpoint per effector per tick,
+        // zero demand included, same doctrine as the links above.
+        #[cfg(feature = "keelson-bus")]
+        for link in &keelson_links {
+            if let (Some(output), Some(outputs)) = (&link.output, out.outputs.as_ref()) {
+                publish(
+                    output.publish(wall, outputs.values.as_slice()),
+                    &mut publish_error_logged,
+                );
+            }
+        }
 
         if let Some(state) = &out.state {
             publish(
-                endpoint.publish_state(wall, state, "estimator"),
+                telemetry.publish_state(
+                    wall,
+                    state,
+                    &coxswain_keelson::keys::device_source_id("estimator"),
+                ),
                 &mut publish_error_logged,
             );
         }
+        publish(
+            telemetry.publish_reference(wall, &out.reference),
+            &mut publish_error_logged,
+        );
 
         let elapsed = boot.elapsed();
         tick_max = tick_max.max(tick_start.elapsed());
         if elapsed >= next_status {
+            #[cfg(feature = "keelson-bus")]
+            let std_sources: Vec<(String, coxswain_keelson::StdSource)> = keelson_links
+                .iter()
+                .flat_map(|l| l.input.std_sources().iter().cloned())
+                .collect();
+            #[cfg(not(feature = "keelson-bus"))]
+            let std_sources: Vec<(String, coxswain_keelson::StdSource)> = Vec::new();
             let actuation: Vec<(&str, bool)> = actuation_effectors
                 .iter()
                 .map(|(i, name)| (name.as_str(), actuation_diverged[*i]))
                 .collect();
             publish(
-                endpoint.publish_health(
+                telemetry.publish_health(
                     wall,
                     &out.health,
                     &out.directive.conn,
                     out.directive.arming,
-                    coxswain_keelson::PowerHealth {
+                    coxswain_keelson::SupervisorHealth {
                         low_voltage: out.directive.low_voltage,
                         power_stale: out.directive.power_stale,
+                        stopped: out.directive.failsafe == Some(FailsafeCause::Stop),
+                        stop_silent: out.directive.stop_silent,
                     },
-                    &actuation,
+                    coxswain_keelson::IoHealth {
+                        actuation: &actuation,
+                        std_sources: &std_sources,
+                    },
                 ),
                 &mut publish_error_logged,
             );
             publish(
-                endpoint.publish_conn_state(wall, &out.directive.conn, out.directive.arming),
+                telemetry.publish_conn_state(wall, &out.directive.conn, out.directive.arming),
                 &mut publish_error_logged,
             );
             publish(
-                endpoint.publish_manifest_info(wall, hash, manifest.revision),
+                telemetry.publish_manifest_info(
+                    wall,
+                    hash,
+                    manifest.revision,
+                    manifest.conn_node.self_sufficient,
+                    if sim_enabled {
+                        coxswain_keelson::IoSource::Sim
+                    } else {
+                        coxswain_keelson::IoSource::Buses
+                    },
+                ),
                 &mut publish_error_logged,
             );
             // Rust's stdout is line-buffered; each line lands whole in the
-            // test's pipe reader.
-            println!(
-                "{}",
-                status_line(
-                    now.as_nanos() as f64 / 1e9,
-                    &out,
-                    out.state.as_ref(),
-                    tick_max,
-                    interval_max,
-                )
+            // test's pipe reader. Written, not println!: println! panics on a
+            // closed stdout, and the status line is evidence, not control, so
+            // a reader going away must not take the loop with it (same
+            // doctrine as `publish` above).
+            let line = status_line(
+                now.as_nanos() as f64 / 1e9,
+                &out,
+                out.state.as_ref(),
+                tick_max,
+                interval_max,
             );
+            if let Err(e) = writeln!(std::io::stdout(), "{line}")
+                && !status_error_logged
+            {
+                eprintln!("coxswain-hosted: status line not written (continuing): {e}");
+                status_error_logged = true;
+            }
             tick_max = Duration::ZERO;
             interval_max = Duration::ZERO;
             next_status += STATUS_PERIOD;
@@ -1744,7 +1919,7 @@ mod tests {
         ];
         let filters = nmea2000_sensors("instruments", &sensors);
         assert_eq!(filters.len(), 1);
-        assert_eq!(filters[0].source_id, "n2k_wind");
+        assert_eq!(filters[0].source_id, "coxswain/n2k_wind");
         assert_eq!(filters[0].pgns, vec![130306]);
     }
 
@@ -1761,6 +1936,18 @@ mod tests {
             ..Default::default()
         }];
         assert!(nmea2000_sensors("instruments", &sensors).is_empty());
+    }
+
+    #[test]
+    fn raw_source_ids_use_the_authored_name_not_the_numeric_id() {
+        let sensors = [SensorEntry {
+            id: SensorId(4),
+            name: FixedStr32::new("gnss_main").unwrap(),
+            ..Default::default()
+        }];
+        let ids = raw_source_ids(&sensors);
+        assert_eq!(raw_source_id(&ids, SensorId(4)), "coxswain/gnss_main");
+        assert_eq!(raw_source_id(&ids, SensorId(9)), "coxswain/unknown_sensor");
     }
 
     #[test]
@@ -1789,8 +1976,14 @@ mod tests {
         ];
         let filters = nmea2000_sensors("instruments", &sensors);
         assert_eq!(filters.len(), 2);
-        let wind = filters.iter().find(|f| f.source_id == "n2k_wind").unwrap();
-        let depth = filters.iter().find(|f| f.source_id == "n2k_depth").unwrap();
+        let wind = filters
+            .iter()
+            .find(|f| f.source_id == "coxswain/n2k_wind")
+            .unwrap();
+        let depth = filters
+            .iter()
+            .find(|f| f.source_id == "coxswain/n2k_depth")
+            .unwrap();
         assert!(wind.matches(130306, 5));
         assert!(!wind.matches(128267, 5));
         assert!(depth.matches(128267, 5));

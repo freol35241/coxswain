@@ -145,6 +145,7 @@ fn config() -> VesselConfig {
                 ring: BoundedList::new(),
             },
             claimant_priorities: BoundedList::new(),
+            stop_sources: BoundedList::new(),
         },
         effectors: BoundedList::from_slice(&esc_and_rudder()).unwrap(),
     }

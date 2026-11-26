@@ -1,0 +1,45 @@
+# Docker deployment of coxswain-hosted on a conn node. Placeholders
+# (manifest, pubkey, devices, --port mappings) are per-vessel commissioning
+# data, as in ../coxswain.service, whose bus ids this mirrors.
+#
+# Watchdog: Docker restarts only a process that exited. The binary's own
+# stall watchdog (crates/coxswain-hosted/src/stall_watchdog.rs) aborts it
+# when the control loop stops ticking, and `restart: always` brings it
+# back. Set "live-restore": true in /etc/docker/daemon.json so a dockerd
+# restart does not take the control loop down with it.
+services:
+  coxswain:
+    image: coxswain-hosted
+    build:
+      context: ../..
+      dockerfile: contrib/docker/Dockerfile
+    restart: always
+    # Without an init, the binary is PID 1 and the kernel drops signals it
+    # has no handler for: `docker stop` waits out its timeout and abort()
+    # only lands via glibc's fallback. tini restores ordinary semantics.
+    init: true
+    # SocketCAN interfaces live in the host network namespace, and Docker's
+    # NAT would rewrite the source addresses that 0183-over-UDP pinning
+    # checks (D-014). Zenoh/Keelson rides the same host stack.
+    network_mode: host
+    volumes:
+      - /etc/coxswain:/etc/coxswain:ro
+    # by-id paths survive USB re-enumeration; the right side is what
+    # --port names below.
+    devices:
+      - /dev/serial/by-id/REPLACE-gnss:/dev/gnss
+      - /dev/serial/by-id/REPLACE-actuator-bridge:/dev/actuator
+      - /dev/serial/by-id/REPLACE-rc:/dev/rc
+    command:
+      - --manifest
+      - /etc/coxswain/vessel.cxmanifest
+      - --pubkey
+      - /etc/coxswain/vessel.pubkey
+      - --port
+      - gnss_serial=/dev/gnss
+      - --port
+      - actuator_bridge=/dev/actuator
+      - --port
+      - rc_link=/dev/rc
+      # - --connect
+      # - tcp/<companion-computer>:7447   # Keelson/zenoh, optional

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use coxswain_cyphal::{
     MessageId, NodeId, Priority, SubjectId, decode_single_frame, encode_single_frame,
 };
-use coxswain_keelson::{ClaimantClient, HealthUpdate};
+use coxswain_keelson::{HealthUpdate, Observer};
 use zenoh::Wait;
 
 const SEED: &[u8] = include_bytes!("../../coxswain-manifest/tests/test_key.seed");
@@ -306,7 +306,7 @@ impl Drop for FrameSender {
 
 const MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 7
+schema_version = 9
 vessel_id      = "cx-cyphal-rig-01"
 name           = "Cyphal CAN Rig"
 revision       = 1
@@ -316,6 +316,7 @@ date           = "2026-07-14"
 [conn_node]
 board       = "hosted"
 watchdog_ms = 250
+self_sufficient = true
 
 [[bus]]
 id       = "ctrl"
@@ -505,13 +506,12 @@ fn commands_out_and_feedback_and_power_reach_health() {
         .expect("spawn coxswain-hosted");
     wait_for_boot(vessel.stdout.take().unwrap());
 
-    let mut session_client = ClaimantClient::new(
+    let mut observer = Observer::new(
         zenoh::open(client_config(&endpoint)).wait().unwrap(),
         BASE_PATH,
         VESSEL_ID,
-        coxswain_contract::ClaimantId(99),
     );
-    let health_rx = session_client.subscribe_health().unwrap();
+    let health_rx = observer.subscribe_health().unwrap();
 
     // Phase 1: the vessel emits command frames on the command subject from the
     // conn node, ~10 Hz, whether or not it is armed (dead-man doctrine). Read

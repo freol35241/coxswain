@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use coxswain_keelson::{ClaimantClient, StateUpdate};
+use coxswain_keelson::{Observer, StateUpdate};
 use zenoh::Wait;
 
 const SEED: &[u8] = include_bytes!("../../coxswain-manifest/tests/test_key.seed");
@@ -193,7 +193,7 @@ fn pack_can_id(priority: u8, pgn: u32, source_address: u8) -> u32 {
 
 /// PGN 127250 Vessel Heading payload, reference always True (0): the only
 /// reference this rig's manifest sensor maps to a subject this test can
-/// observe (`heading_true_north_deg`, via `ClaimantClient::subscribe_state`).
+/// observe (`heading_true_north_deg`, via `Observer::subscribe_state`).
 fn vessel_heading_payload(heading_deg: f64) -> [u8; 8] {
     let heading_raw = (heading_deg.to_radians() / 1e-4).round() as i32;
     let mut out = [0u8; 8];
@@ -427,7 +427,7 @@ impl Drop for FrameSender {
 
 const MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 7
+schema_version = 9
 vessel_id      = "cx-can-rig-01"
 name           = "CAN Desk Rig"
 revision       = 1
@@ -437,6 +437,7 @@ date           = "2026-07-12"
 [conn_node]
 board       = "hosted"
 watchdog_ms = 250
+self_sufficient = true
 
 [[bus]]
 id      = "instruments"
@@ -608,13 +609,8 @@ fn heading_pinning_and_gnss_fast_packet() {
     wait_for_boot(vessel.stdout.take().unwrap());
 
     let session = zenoh::open(client_config(&endpoint)).wait().unwrap();
-    let mut claimant = ClaimantClient::new(
-        session,
-        BASE_PATH,
-        VESSEL_ID,
-        coxswain_contract::ClaimantId(99),
-    );
-    let state_rx = claimant.subscribe_state().unwrap();
+    let mut observer = Observer::new(session, BASE_PATH, VESSEL_ID);
+    let state_rx = observer.subscribe_state().unwrap();
 
     // Trusted (source 10, pinned) and spoofed (source 20, unpinned) heading
     // senders, both faster than the vessel's own 100 ms tick so a leak
@@ -650,7 +646,7 @@ fn heading_pinning_and_gnss_fast_packet() {
                 source_id,
                 heading_deg,
                 ..
-            } if source_id == "n2k_heading" => {
+            } if source_id == "coxswain/n2k_heading" => {
                 heading_values.push(heading_deg);
             }
             StateUpdate::Position {
@@ -658,7 +654,7 @@ fn heading_pinning_and_gnss_fast_packet() {
                 lat_deg,
                 lon_deg,
                 ..
-            } if source_id == "n2k_position" => {
+            } if source_id == "coxswain/n2k_position" => {
                 position = Some((lat_deg, lon_deg));
             }
             _ => {}

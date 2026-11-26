@@ -15,7 +15,9 @@ member.
 
 1. **Self-sufficiency.** Coxswain must sense, decide, and actuate with nothing
    above the conn node alive. No control-path dependency on the companion
-   computer, Keelson, or shore. Anything upward is enrichment.
+   computer, Keelson, or shore. Anything upward is enrichment. A manifest
+   that declares itself self-sufficient must be, and only such manifests run
+   on a release build (D-034).
 2. **The supervisor owns the conn.** Exactly one command source holds authority
    at a time. Every source (autonomy, teleoperator, future GCS) is a claimant
    that must be granted the conn. Authority is data, not architecture.
@@ -58,6 +60,9 @@ member.
 - Rust for everything in this repo. Analysis and tuning notebooks live
   elsewhere (Python is fine there, not here).
 - License: Apache 2.0.
+- Vocabulary (bus, sensor interface, output backend, claimant, telemetry
+  receiver, the three meanings of Keelson) is fixed in docs/glossary.md. Use
+  those words in code, docs, and comments.
 
 ## Build and test
 

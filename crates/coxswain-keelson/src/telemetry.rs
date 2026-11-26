@@ -1,142 +1,120 @@
-//! The vessel side: publishes coxswain streams and serves the conn RPCs.
-//!
-//! Zenoh callbacks push into an mpsc channel; the hosted loop drains it with
-//! [`VesselEndpoint::poll`] once per tick and answers RPCs through the
-//! [`ReplyHandle`] each event carries. Authority decisions stay in the
-//! supervisor; this adapter only moves bytes.
+//! Telemetry: everything Coxswain publishes for receivers (D-035). State,
+//! raw streams, health, conn state, manifest info, and guidance references.
+//! No identity, no registration, no authority; losing a receiver changes
+//! nothing.
 
-use std::sync::mpsc::{self, Receiver};
 use std::time::SystemTime;
 
 use coxswain_contract::{
-    ArmingState, ClaimantId, ConnState, EstimatorHealth, HealthLevel, Measurement, MeasurementKind,
-    Setpoint, VesselState,
+    ArmingState, ConnState, EstimatorHealth, GuidanceReference, HealthLevel, Measurement,
+    MeasurementKind, VesselState,
 };
-use prost::Message;
 use zenoh::Wait;
-use zenoh::pubsub::Subscriber;
-use zenoh::query::{Query, Queryable};
+use zenoh::liveliness::LivelinessToken;
 
-use crate::ConnReplyResult;
-use crate::convert::{heading_deg, ned_cov_to_enu, open, seal, setpoint_from_proto, wall_to_proto};
+use crate::bus::StdSource;
+use crate::convert::{heading_deg, ned_cov_to_enu, seal, wall_to_proto};
 use crate::error::Error;
 use crate::keys::{self, COXSWAIN, subject};
 use crate::proto::{coxswain as pb, foxglove, keelson};
 
-/// What a claimant asked for. Setpoints double as heartbeats.
-// The size skew is the contract Setpoint's inline waypoint list; the same
-// allowance, for the same reason, as on the contract enum itself.
-#[allow(clippy::large_enum_variant)]
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum ConnEvent {
-    Register(ClaimantId),
-    RequestConn(ClaimantId),
-    ReleaseConn(ClaimantId),
-    Arm(ClaimantId),
-    Disarm(ClaimantId),
-    Setpoint(ClaimantId, Setpoint),
+/// The I/O side of the health telemetry, bundled for the same reason as
+/// [`SupervisorHealth`]. `actuation` is one `(effector name, diverged)` pair per
+/// Cyphal effector (D-029); `std_sources` is one `(<sensor>/<quantity>,
+/// source)` pair per keelson bus quantity (D-034). Either may be empty.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct IoHealth<'a> {
+    pub actuation: &'a [(&'a str, bool)],
+    pub std_sources: &'a [(String, StdSource)],
 }
 
-/// Owns the pending zenoh query of one RPC. Dropping it unanswered lets the
-/// query time out on the claimant side; the channel it rode in on is the
-/// bound on how many can be pending.
-pub struct ReplyHandle {
-    query: Query,
-}
-
-/// One claimant event and, for RPCs, the handle to answer it with.
-pub type Event = (ConnEvent, Option<ReplyHandle>);
-
-/// The supervisor's report-only power flags for the health telemetry (D-024):
-/// bus voltage below the low-voltage bound, and the power report gone stale.
-/// Bundled so `publish_health` stays within a sane argument count.
+/// Where measurements come from, published with the manifest identity so a
+/// consumer can tell a simulated vessel from a real one (D-034).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct PowerHealth {
+pub enum IoSource {
+    /// The manifest's buses, real or keelson.
+    Buses,
+    /// The in-process plant (`--sim`).
+    Sim,
+}
+
+impl IoSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Buses => "buses",
+            Self::Sim => "sim",
+        }
+    }
+}
+
+/// The supervisor's flags for the health telemetry: bus voltage below the
+/// low-voltage bound and the power report gone stale (D-024), a stop in
+/// force and a stop source gone silent (D-037). Bundled so `publish_health`
+/// stays within a sane argument count.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SupervisorHealth {
     pub low_voltage: bool,
     pub power_stale: bool,
+    pub stopped: bool,
+    pub stop_silent: bool,
 }
 
-pub struct VesselEndpoint {
+/// Every subject this publisher can publish under the `coxswain` producer.
+/// Keelson 0.6 §5.2: a static-capability source declares a subject token for
+/// each at session open, whether or not this vessel will ever produce it.
+/// tests/conformance.rs checks it against what the `put` calls below reach.
+const PUBLISHED_SUBJECTS: [&str; 16] = [
+    subject::LOCATION_FIX,
+    subject::HEADING_TRUE_NORTH_DEG,
+    subject::YAW_RATE_DEGPS,
+    subject::SPEED_OVER_GROUND_KNOTS,
+    subject::COURSE_OVER_GROUND_DEG,
+    subject::HEADING_MAGNETIC_DEG,
+    subject::TRUE_WIND_SPEED_MPS,
+    subject::TRUE_WIND_ANGLE_DEG,
+    subject::APPARENT_WIND_SPEED_MPS,
+    subject::APPARENT_WIND_ANGLE_DEG,
+    subject::DEPTH_BELOW_TRANSDUCER_M,
+    subject::ENTITY_HEALTH,
+    subject::CONN_STATE,
+    subject::MANIFEST,
+    subject::HEADING_TRUE_NORTH_DEG_SETPOINT,
+    subject::SPEED_OVER_GROUND_KNOTS_SETPOINT,
+];
+
+pub struct TelemetryPublisher {
     session: zenoh::Session,
     base_path: String,
     entity_id: String,
-    events: Receiver<Event>,
-    // Held so the declarations stay alive for the lifetime of the endpoint.
-    _queryables: Vec<Queryable<()>>,
-    _setpoint_sub: Subscriber<()>,
+    // Held so the tokens stay alive for the lifetime of the publisher.
+    _liveliness: Vec<LivelinessToken>,
 }
 
-impl VesselEndpoint {
-    /// Declares queryables for
-    /// `@rpc/{conn_register,conn_request,conn_release,vehicle_arm,vehicle_disarm}/coxswain`
-    /// and a subscriber on `pubsub/setpoint/*`.
-    pub fn new(session: zenoh::Session, base_path: &str, entity_id: &str) -> Result<Self, Error> {
-        let (tx, events) = mpsc::channel();
-
-        type EventFn = fn(ClaimantId) -> ConnEvent;
-        let procedures: [(&str, EventFn); 5] = [
-            ("conn_register", ConnEvent::Register),
-            ("conn_request", ConnEvent::RequestConn),
-            ("conn_release", ConnEvent::ReleaseConn),
-            ("vehicle_arm", ConnEvent::Arm),
-            ("vehicle_disarm", ConnEvent::Disarm),
-        ];
-        let mut queryables = Vec::with_capacity(procedures.len());
-        for (procedure, event) in procedures {
-            let key = keys::rpc_key(base_path, entity_id, procedure, COXSWAIN);
-            let tx = tx.clone();
-            let queryable = session
-                .declare_queryable(key)
-                .callback(move |query| match decode_conn_request(&query) {
-                    Ok(id) => {
-                        // Send failure means the endpoint is gone; the query
-                        // then times out on the claimant side.
-                        let _ = tx.send((event(id), Some(ReplyHandle { query })));
-                    }
-                    // A malformed request never reaches the supervisor.
-                    Err(_) => send_reply(&query, ConnReplyResult::Error),
-                })
-                .wait()?;
-            queryables.push(queryable);
+impl TelemetryPublisher {
+    /// Declares the source-level token for the `coxswain` producer and one
+    /// subject token per [`PUBLISHED_SUBJECTS`] (Keelson 0.6 §5.1, §5.2).
+    pub fn new(session: &zenoh::Session, base_path: &str, entity_id: &str) -> Result<Self, Error> {
+        let mut liveliness = Vec::with_capacity(1 + PUBLISHED_SUBJECTS.len());
+        liveliness.push(
+            session
+                .liveliness()
+                .declare_token(keys::source_token_key(base_path, entity_id, COXSWAIN))
+                .wait()?,
+        );
+        for subj in PUBLISHED_SUBJECTS {
+            liveliness.push(
+                session
+                    .liveliness()
+                    .declare_token(keys::pubsub_key(base_path, entity_id, subj, COXSWAIN))
+                    .wait()?,
+            );
         }
-
-        let setpoint_key = keys::pubsub_key(base_path, entity_id, subject::SETPOINT, "*");
-        let setpoint_sub = session
-            .declare_subscriber(setpoint_key)
-            .callback(move |sample| {
-                // Malformed setpoints are dropped: they carry no authority
-                // and a heartbeat only counts when it parses.
-                if let Ok(event) =
-                    decode_setpoint_sample(sample.key_expr().as_str(), &sample.payload().to_bytes())
-                {
-                    let _ = tx.send((event, None));
-                }
-            })
-            .wait()?;
-
         Ok(Self {
-            session,
+            session: session.clone(),
             base_path: base_path.to_string(),
             entity_id: entity_id.to_string(),
-            events,
-            _queryables: queryables,
-            _setpoint_sub: setpoint_sub,
+            _liveliness: liveliness,
         })
-    }
-
-    /// Drain pending claimant events without blocking. RPC events carry a
-    /// [`ReplyHandle`]; setpoints carry none.
-    pub fn poll(&mut self) -> Vec<Event> {
-        let mut out = Vec::new();
-        while let Ok(pair) = self.events.try_recv() {
-            out.push(pair);
-        }
-        out
-    }
-
-    /// Answer one RPC with the supervisor's verdict.
-    pub fn reply(&self, handle: ReplyHandle, result: ConnReplyResult) {
-        send_reply(&handle.query, result);
     }
 
     fn put(&self, subject: &str, source_id: &str, bytes: Vec<u8>) -> Result<(), Error> {
@@ -167,6 +145,35 @@ impl VesselEndpoint {
             source_id,
             seal(t_wall, &heading),
         )
+    }
+
+    /// Guidance references in force (D-036), under `coxswain/guidance`. Call
+    /// every tick: a subject with no reference is skipped, so silence on it
+    /// means none is in force (Keelson's `_setpoint` rule); the subject
+    /// tokens stay up regardless.
+    pub fn publish_reference(
+        &self,
+        t_wall: SystemTime,
+        r: &GuidanceReference,
+    ) -> Result<(), Error> {
+        let source_id = keys::device_source_id("guidance");
+        if let Some(psi) = r.heading_rad {
+            let msg = timestamped_float(t_wall, heading_deg(psi));
+            self.put(
+                subject::HEADING_TRUE_NORTH_DEG_SETPOINT,
+                &source_id,
+                seal(t_wall, &msg),
+            )?;
+        }
+        if let Some(u) = r.surge_mps {
+            let msg = timestamped_float(t_wall, u * MPS_TO_KNOTS);
+            self.put(
+                subject::SPEED_OVER_GROUND_KNOTS_SETPOINT,
+                &source_id,
+                seal(t_wall, &msg),
+            )?;
+        }
+        Ok(())
     }
 
     /// Raw measurement pass-through. `t_wall` is the caller's wall-clock
@@ -391,26 +398,36 @@ impl VesselEndpoint {
 
     /// `entity_health`: estimator level and staleness, plus conn and arming
     /// as supervisor checks.
-    /// `actuation` is one `(effector name, diverged)` pair per Cyphal effector
-    /// (D-029/D-010): a non-empty slice adds an `actuation` source to the
+    /// `io.actuation` is one `(effector name, diverged)` pair per Cyphal
+    /// effector (D-029/D-010): a non-empty slice adds an `actuation` source to the
     /// published health, degraded when any effector's last command-then-report
     /// comparison diverged. Empty for a vessel with no Cyphal actuation.
     /// `power` carries the supervisor's report-only power flags (D-024): they
     /// surface as a `power` subject under the supervisor source so a claimant
     /// can observe bus voltage health without arming.
+    /// `io.std_sources` is one `(<sensor>/<quantity>, source)` pair per keelson
+    /// bus quantity (D-034): a non-empty slice adds a `keelson_bus` source
+    /// with a `std` check saying whether the last std was measured or a driver
+    /// default. Both are nominal; the check is information, not a fault.
     pub fn publish_health(
         &self,
         t_wall: SystemTime,
         h: &EstimatorHealth,
         conn: &ConnState,
         arming: ArmingState,
-        power: PowerHealth,
-        actuation: &[(&str, bool)],
+        flags: SupervisorHealth,
+        io: IoHealth<'_>,
     ) -> Result<(), Error> {
-        let PowerHealth {
+        let IoHealth {
+            actuation,
+            std_sources,
+        } = io;
+        let SupervisorHealth {
             low_voltage,
             power_stale,
-        } = power;
+            stopped,
+            stop_silent,
+        } = flags;
         let estimator = keelson::SourceHealth {
             name: "estimator".to_string(),
             level: health_level(h.level) as i32,
@@ -455,6 +472,28 @@ impl VesselEndpoint {
                 },
             ],
         };
+        let stop_level = if stopped || stop_silent {
+            degraded
+        } else {
+            nominal
+        };
+        let stop_subject = keelson::SubjectHealth {
+            name: "stop".to_string(),
+            level: stop_level,
+            measured_publication_rate_hz: 0.0,
+            checks: vec![
+                keelson::CheckResult {
+                    name: "stop".to_string(),
+                    level: if stopped { degraded } else { nominal },
+                    detail: if stopped { "engaged" } else { "released" }.to_string(),
+                },
+                keelson::CheckResult {
+                    name: "stop_source".to_string(),
+                    level: if stop_silent { degraded } else { nominal },
+                    detail: if stop_silent { "silent" } else { "heard" }.to_string(),
+                },
+            ],
+        };
         let supervisor = keelson::SourceHealth {
             name: "supervisor".to_string(),
             level: nominal,
@@ -477,6 +516,7 @@ impl VesselEndpoint {
                     ],
                 },
                 power_subject,
+                stop_subject,
             ],
         };
         let mut sources = vec![estimator, supervisor];
@@ -505,6 +545,31 @@ impl VesselEndpoint {
             sources.push(keelson::SourceHealth {
                 name: "actuation".to_string(),
                 level: level_of(actuation.iter().any(|(_, d)| *d)),
+                subjects,
+            });
+        }
+        if !std_sources.is_empty() {
+            let nominal = keelson::HealthLevel::HealthNominal as i32;
+            let subjects = std_sources
+                .iter()
+                .map(|(label, source)| keelson::SubjectHealth {
+                    name: label.clone(),
+                    level: nominal,
+                    measured_publication_rate_hz: 0.0,
+                    checks: vec![keelson::CheckResult {
+                        name: "std".to_string(),
+                        level: nominal,
+                        detail: match source {
+                            StdSource::Measured => "measured",
+                            StdSource::Defaulted => "defaulted",
+                        }
+                        .to_string(),
+                    }],
+                })
+                .collect();
+            sources.push(keelson::SourceHealth {
+                name: "keelson_bus".to_string(),
+                level: nominal,
                 subjects,
             });
         }
@@ -537,50 +602,25 @@ impl VesselEndpoint {
     }
 
     /// Coxswain-specific `manifest` subject, published so the manifest
-    /// identity is in telemetry from the first heartbeat.
+    /// identity is in telemetry from the first heartbeat. It carries the
+    /// declared self-sufficiency promise and the measurement source next to
+    /// the hash (D-034).
     pub fn publish_manifest_info(
         &self,
         t_wall: SystemTime,
         sha256: [u8; 32],
         revision: u32,
+        self_sufficient: bool,
+        io_source: IoSource,
     ) -> Result<(), Error> {
         let msg = pb::ManifestInfo {
             sha256: sha256.to_vec(),
             revision,
+            self_sufficient,
+            io_source: io_source.as_str().to_string(),
         };
         self.put(subject::MANIFEST, COXSWAIN, seal(t_wall, &msg))
     }
-}
-
-fn decode_conn_request(query: &Query) -> Result<ClaimantId, Error> {
-    let payload = query
-        .payload()
-        .ok_or(Error::Protocol("rpc without payload"))?;
-    let (_enclosed_at, inner) = open(&payload.to_bytes())?;
-    let request = pb::ConnRequest::decode(inner.as_slice())?;
-    let id = u16::try_from(request.claimant_id)
-        .map_err(|_| Error::Protocol("claimant id out of u16 range"))?;
-    Ok(ClaimantId(id))
-}
-
-fn decode_setpoint_sample(key: &str, payload: &[u8]) -> Result<ConnEvent, Error> {
-    let source_id = key.rsplit('/').next().unwrap_or("");
-    let claimant = keys::parse_claimant_source_id(source_id)
-        .ok_or(Error::Protocol("setpoint source_id is not a claimant"))?;
-    let (_enclosed_at, inner) = open(payload)?;
-    let msg = pb::SetpointMsg::decode(inner.as_slice())?;
-    Ok(ConnEvent::Setpoint(claimant, setpoint_from_proto(&msg)?))
-}
-
-fn send_reply(query: &Query, result: ConnReplyResult) {
-    let msg = pb::ConnReply {
-        result: result as i32,
-    };
-    // Replies originate at this edge, so they are stamped here.
-    let bytes = seal(SystemTime::now(), &msg);
-    let key = query.key_expr().clone();
-    // A failed reply means the querier is already gone; nothing to do.
-    let _ = query.reply(key, bytes).wait();
 }
 
 fn location_fix(

@@ -169,7 +169,7 @@ fn origin() -> GeoPoint {
 /// self-documenting without inventing a second indirection just for tests.
 const MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 7
+schema_version = 9
 vessel_id      = "cx-desk-rig-01"
 name           = "Desk Rig"
 revision       = 1
@@ -179,6 +179,7 @@ date           = "2026-07-11"
 [conn_node]
 board       = "hosted"
 watchdog_ms = 250
+self_sufficient = true
 
 [[bus]]
 id       = "gnss0183"
@@ -249,13 +250,16 @@ license = "inner_loop"
 
 [rc]
 bus                = "rc0"
-claimant           = 1
 kill_channel       = 4
+switch_low_us      = 1300
+switch_high_us     = 1700
+stop_on_silence    = false
+
+[rc.claimant]
+id                 = 1
 takeover_channel   = 5
 surge_channel      = 2
 yaw_channel        = 3
-switch_low_us      = 1300
-switch_high_us     = 1700
 stick_deadband_us  = 12
 max_surge_n        = 150.0
 max_yaw_nm         = 60.0
@@ -317,7 +321,7 @@ fn build_blob() -> (Vec<u8>, String) {
 /// (this scenario only needs teleop's DirectEffort path).
 const RUDDERBOAT_MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 7
+schema_version = 9
 vessel_id      = "cx-desk-rig-rudderboat-01"
 name           = "Desk Rig Rudderboat"
 revision       = 1
@@ -327,6 +331,7 @@ date           = "2026-07-11"
 [conn_node]
 board       = "hosted"
 watchdog_ms = 250
+self_sufficient = true
 
 [[bus]]
 id       = "gnss0183"
@@ -1194,20 +1199,65 @@ fn rc_authority_rig() {
         rpc("request_conn", || teleop.request_conn()),
         ConnReplyResult::Ok
     );
-    let deadline = Instant::now() + BRING_UP;
-    loop {
-        match rpc("arm", || teleop.arm()) {
-            ConnReplyResult::Ok => break,
-            ConnReplyResult::RefusedEstimator | ConnReplyResult::RefusedPosition => {}
-            other => panic!("arm refused: {other:?}"),
+    // Teleop heartbeats (an Idle setpoint stream) until RC takes over, so
+    // the kill below meets a live holder that is not RC.
+    let heartbeat_stop = Arc::new(AtomicBool::new(false));
+    let heartbeat = {
+        let stop = heartbeat_stop.clone();
+        let session = zenoh::open(client_config(&endpoint)).wait().unwrap();
+        let client = ClaimantClient::new(session, "keelson", "cx-desk-rig-01", ClaimantId(7));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = client.publish_setpoint(&Setpoint::Idle);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        })
+    };
+    let arm_teleop = || {
+        let deadline = Instant::now() + BRING_UP;
+        loop {
+            match rpc("arm", || teleop.arm()) {
+                ConnReplyResult::Ok => break,
+                ConnReplyResult::RefusedEstimator | ConnReplyResult::RefusedPosition => {}
+                other => panic!("arm refused: {other:?}"),
+            }
+            assert!(Instant::now() < deadline, "teleop arm never succeeded");
+            std::thread::sleep(Duration::from_millis(200));
         }
-        assert!(Instant::now() < deadline, "teleop arm never succeeded");
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    };
+    arm_teleop();
     let armed = wait_for(&status_rx, BRING_UP, "armed under teleop", |s| {
         s.armed && s.conn == "held:7"
     });
     println!("rc authority: teleop armed at t={:.1}s", armed.t_s);
+
+    // Kill while teleop holds the conn (D-037): the stop disarms whoever
+    // holds it and leaves the conn where it was. While it was RC's own
+    // holder-only disarm, this kill did nothing.
+    rc.set(KILL_CHANNEL, SWITCH_HIGH_US);
+    let stopped = wait_for(
+        &status_rx,
+        Duration::from_secs(5),
+        "stop under teleop",
+        |s| !s.armed && s.failsafe.as_deref() == Some("Stop"),
+    );
+    assert_eq!(stopped.conn, "held:7", "a stop must not move the conn");
+    assert_eq!(rpc("arm", || teleop.arm()), ConnReplyResult::RefusedStop);
+    rc.set(KILL_CHANNEL, SWITCH_LOW_US);
+    let released = wait_for(&status_rx, Duration::from_secs(5), "stop released", |s| {
+        s.failsafe.is_none()
+    });
+    assert!(!released.armed, "releasing a stop re-arms nothing");
+    arm_teleop();
+    wait_for(&status_rx, BRING_UP, "re-armed under teleop", |s| {
+        s.armed && s.conn == "held:7"
+    });
+    println!(
+        "rc authority: kill stopped teleop's vessel and released at t={:.1}s",
+        released.t_s
+    );
+    heartbeat_stop.store(true, Ordering::Relaxed);
+    heartbeat.join().unwrap();
 
     // Takeover switch high: RC's manifest-declared priority (100) preempts
     // teleop (priority 0, unlisted) per D-025, and arming survives the
@@ -1267,10 +1317,11 @@ fn rc_authority_rig() {
         cxout_latency.as_millis(),
         disarmed.t_s
     );
+    assert_eq!(disarmed.conn, "held:1", "a stop must not move the conn");
 
-    // Kill release with takeover still held: the RC claimant's link (its
-    // Effort stream, which doubles as its heartbeat) resumes, so the conn
-    // stays held and ClaimantLost never latches. Thrust does not resume:
+    // Kill release with takeover still held: the RC claimant's Effort
+    // stream, its heartbeat, ran zeroed through the stop (D-037), so the
+    // conn stays held and ClaimantLost never latches. Thrust does not resume:
     // the RC adapter has no arm event (D-025's kill/disarm-first sequencing
     // never modeled RC re-arming itself), so nothing re-arms the vessel and
     // it correctly stays safely disarmed until some claimant re-arms it.

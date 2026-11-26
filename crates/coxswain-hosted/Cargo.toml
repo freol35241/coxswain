@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# The keelson bus kind (D-034): sensors and effectors over zenoh, for SIL and
+# mixed bench setups. Off in release builds, which also refuse any manifest
+# declaring self_sufficient = false.
+keelson-bus = []
+
 [dependencies]
 coxswain-contract = { path = "../coxswain-contract" }
 coxswain-estimator = { path = "../coxswain-estimator" }
@@ -38,8 +44,8 @@ coxswain-n2k = { path = "../coxswain-n2k" }
 # --record-nmea's raw-log format (recorder.rs); the same JSONL format
 # cxconvert reads, so today's capture is this evening's replay regression.
 coxswain-replay = { path = "../coxswain-replay" }
-# Session construction only; same 1.9 line the keelson crate pins.
-zenoh = "1.9"
+# Session construction only; same 1.10 line the keelson crate pins.
+zenoh = "1.10"
 # Raw termios for real serial ports (serial.rs); already a transitive
 # dependency via zenoh, promoted to direct since this crate now calls it.
 libc = "0.2"
@@ -50,3 +56,7 @@ libc = "0.2"
 coxswain-model = { path = "../coxswain-model" }
 # The integration tests compile the example vessel manifest themselves.
 coxswain-manifest = { path = "../coxswain-manifest", features = ["std"] }
+
+[[test]]
+name = "keelson_bus_rig"
+required-features = ["keelson-bus"]

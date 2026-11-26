@@ -55,6 +55,7 @@ fn config() -> VesselConfig {
                 ring: BoundedList::new(),
             },
             claimant_priorities: BoundedList::new(),
+            stop_sources: BoundedList::new(),
         },
         effectors: BoundedList::new(),
     }

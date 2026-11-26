@@ -135,6 +135,8 @@ Bring-up transports per D-021. Chosen for time-to-water, superseded in Phase 7.
 - [x] RC receiver driver crate: CRSF frame parser (SBUS fallback if the
       hardware dictates), strict, fuzzed like the 0183 parser (D-025).
 - [x] RC kill channel: switch position mapped to disarm at the conn node.
+      (Superseded by D-037: the kill is a stop, not the RC claimant's
+      disarm.)
       Lands before RC can hold the conn (D-025 sequencing).
 - [x] Claimant priority and preemption in the supervisor; priority declared
       per claimant in the manifest (v0.3). Direct-effort Setpoint variant in
@@ -189,7 +191,7 @@ this before freezing far-end firmware.
       the CyphalActuatorBackend, and the hosted integration. Schema v4->5 gave
       effectors a per-bus-kind output; hosted `can.rs` gained a write path
       (D-011's transmit exception); divergence and bus voltage reach the
-      published health, observed via `ClaimantClient::subscribe_health`;
+      published health, observed via `ClaimantClient::subscribe_health`, now `Observer`;
       vcan-tested in CI (`cyphal_can_rig.rs`). Node-local failsafe/heartbeat
       for a Cyphal effector waits for the actuator firmware, Phase 9.)
 - [x] GNSS covariance and fix status over NMEA 0183 (the vendor-neutral path):
@@ -212,6 +214,34 @@ this before freezing far-end firmware.
       checked, plus hosted SocketCAN wiring end to end, vcan-tested in CI.)
 - [x] 0183-over-UDP bus: listen socket, source_ip pinning enforcement,
       enrichment cap when unpinned.
+- [x] Keelson 0.6.0-pre.19 migration: protos, zenoh 1.10.1, source ids as
+      `coxswain/<sensor>`, liveliness tokens. Conn RPC keys deliberately
+      unchanged (open question, tied to D-035).
+- [x] Keelson bus kind and the declared self-sufficiency promise (D-034):
+      schema v8, compiler check, `keelson-bus` feature, release-build
+      refusal, rig test with an external plant over zenoh, SIL image and
+      compose file.
+- [x] Guidance references published as Keelson setpoints (D-036):
+      `heading_true_north_deg_setpoint`, `speed_over_ground_knots_setpoint`
+      under `coxswain/guidance`, silent when none is in force.
+- [ ] Retire coxswain-specific subjects as Keelson registers them (D-034):
+      the three accuracy subjects (proposed in keelson #449) and
+      `rudder_angle_deg_setpoint` (asked for on keelson #328). Move the pin
+      past 0.6.0-pre.19 when a release has `thrust_newton_setpoint`.
+- [x] D-035 code split: `TelemetryPublisher` and `CommandServer` from
+      `VesselEndpoint`, opened separately; `Observer` beside `ClaimantClient`;
+      conformance tests against the vendored Keelson registry and keyspace.
+- [ ] Serve Keelson's conn interface once Keelson merges one (#399), with its
+      RPC keys; `vehicle_navigation/v1` and `vehicle_lifecycle/v1` as the
+      calling station's claimant operations (D-035).
+- [ ] `coxswain-manifest` subcommand deriving a SIL manifest from a vessel
+      manifest, if hand-kept variants turn out to drift (D-034).
+- [x] Stops as a supervisor input (D-037): the RC kill disarms whoever holds
+      the conn, `REFUSED_STOP` while engaged, declared `stop_on_silence`,
+      optional `[rc.claimant]`, schema v9.
+- [ ] Keelson `safety_state` as an external stop source once keelson #332
+      merges (D-037): adapter consumer, manifest declaration, and the
+      compiler rule counting stop-on-silence on it against `self_sufficient`.
 
 ## Phase 8: Conn node firmware (reference deployment)
 

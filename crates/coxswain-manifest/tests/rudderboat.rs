@@ -5,8 +5,8 @@
 
 use core::time::Duration;
 
-use coxswain_contract::{EffectorConfig, EffectorId, EffectorKind};
-use coxswain_manifest::{CompileError, EffectorOutput, RcEntry, ValidateError};
+use coxswain_contract::{EffectorConfig, EffectorId, EffectorKind, StopSource, StopSourceConfig};
+use coxswain_manifest::{CompileError, EffectorOutput, RcClaimantEntry, RcEntry, ValidateError};
 
 const RUDDERBOAT: &str = include_str!("rudderboat.toml");
 
@@ -35,7 +35,7 @@ fn expect_invalid(source: &str) -> ValidateError {
 fn rudderboat_compiles_and_roundtrips() {
     let manifest = coxswain_manifest::compile(RUDDERBOAT).expect("rudderboat compiles");
     assert_eq!(manifest.vessel_id.as_str(), "se-rise-rudderboat-01");
-    assert_eq!(manifest.schema_version, 7);
+    assert_eq!(manifest.schema_version, 9);
     assert_eq!(manifest.buses.len(), 3);
     assert_eq!(manifest.sensors.len(), 2);
     assert_eq!(manifest.actuator_nodes.len(), 0);
@@ -48,24 +48,34 @@ fn rudderboat_compiles_and_roundtrips() {
         Duration::from_millis(4000)
     );
 
-    // [rc] (D-025): the hand controller, field for field with
-    // coxswain-drivers::rc::Config, plus bus and claimant.
+    // [rc] (D-025, D-037): the hand controller, field for field with
+    // coxswain-drivers::rc::Config, plus bus. Its kill is a declared stop
+    // source in the supervisor config.
     let rc = manifest.rc.expect("rudderboat declares [rc]");
     assert_eq!(
         rc,
         RcEntry {
             bus: coxswain_manifest::FixedStr32::new("rc_link").unwrap(),
-            claimant: 1,
             kill_channel: 4,
-            takeover_channel: 5,
-            surge_channel: 2,
-            yaw_channel: 3,
             switch_low_us: 1300,
             switch_high_us: 1700,
-            stick_deadband_us: 12,
-            max_surge_n: 150.0,
-            max_yaw_nm: 60.0,
+            claimant: Some(RcClaimantEntry {
+                id: 1,
+                takeover_channel: 5,
+                surge_channel: 2,
+                yaw_channel: 3,
+                stick_deadband_us: 12,
+                max_surge_n: 150.0,
+                max_yaw_nm: 60.0,
+            }),
         }
+    );
+    assert_eq!(
+        manifest.config.supervisor.stop_sources.as_slice(),
+        &[StopSourceConfig {
+            source: StopSource::Rc,
+            stop_on_silence: true,
+        }]
     );
 
     let expected = [
@@ -392,16 +402,41 @@ fn rejects_rc_nonpositive_maximum() {
     );
 }
 
-// [rc].claimant must name a declared [[claimant]] entry (D-025). Rudderboat's
-// [rc] uses claimant = 1, declared as [[claimant]] id = 1; point it at an id no
-// claimant declares and the RC would silently drop to priority 0.
+// [rc.claimant].id must name a declared [[claimant]] entry (D-025).
+// Rudderboat's uses id = 1, declared as [[claimant]] id = 1; point it at an id
+// no claimant declares and the RC would silently drop to priority 0.
 #[test]
 fn rejects_rc_claimant_without_entry() {
-    let src = patched("claimant           = 1", "claimant           = 7");
+    let src = patched("id                 = 1", "id                 = 7");
     assert_eq!(
         expect_invalid(&src),
         ValidateError::RcClaimantUnknown { claimant: 7 }
     );
+}
+
+// stop_on_silence is required, never defaulted (D-037).
+#[test]
+fn rejects_rc_without_stop_on_silence() {
+    let src = patched("stop_on_silence    = true\n", "");
+    assert!(matches!(
+        coxswain_manifest::compile(&src),
+        Err(CompileError::Toml(_))
+    ));
+}
+
+// [rc] without [rc.claimant] is kill only (D-037): it compiles, the kill is
+// still a stop source, and the claimant channels are free again.
+#[test]
+fn rc_without_claimant_is_kill_only() {
+    let start = RUDDERBOAT.find("[rc.claimant]").unwrap();
+    let end = start + RUDDERBOAT[start..].find("\n\n").unwrap();
+    let src = format!("{}{}", &RUDDERBOAT[..start], &RUDDERBOAT[end + 2..]);
+    let src = patched_from(&src, "kill_channel       = 4", "kill_channel       = 5");
+    let manifest = coxswain_manifest::compile(&src).unwrap();
+    let rc = manifest.rc.unwrap();
+    assert_eq!(rc.claimant, None);
+    assert_eq!(rc.kill_channel, 5);
+    assert_eq!(manifest.config.supervisor.stop_sources.len(), 1);
 }
 
 // D-029: effectors and [[actuator_node]] are mutually exclusive. Rudderboat

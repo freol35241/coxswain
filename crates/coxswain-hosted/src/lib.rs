@@ -11,7 +11,8 @@
 use coxswain_allocation::Allocator;
 use coxswain_contract::{
     ActuatorCommand, ActuatorOutputs, ArmingState, ClaimantId, ConnState, EstimatorHealth,
-    ForceDemand, Measurement, PowerStatus, Setpoint, Timestamp, VesselConfig, VesselState,
+    ForceDemand, GuidanceReference, Measurement, PowerStatus, Setpoint, StopSource, Timestamp,
+    VesselConfig, VesselState,
 };
 use coxswain_estimator::Estimator;
 use coxswain_guidance::Guidance;
@@ -31,6 +32,9 @@ pub struct TickOutput {
     pub health: EstimatorHealth,
     pub directive: Directive,
     pub outputs: Option<ActuatorOutputs>,
+    /// The references guidance closed on (D-036); empty when guidance did
+    /// not run (disarmed, or no state estimate).
+    pub reference: GuidanceReference,
 }
 
 /// The composed core: one estimator, one guidance, one supervisor, driven by
@@ -110,6 +114,11 @@ impl Core {
         self.supervisor.disarm(id)
     }
 
+    /// A stop source's current state (D-037), on every frame it delivers.
+    pub fn stop_report(&mut self, source: StopSource, engaged: bool, now: Timestamp) {
+        self.supervisor.stop_report(source, engaged, now);
+    }
+
     // Data plane.
 
     pub fn ingest(&mut self, m: &Measurement) -> Result<(), Rejection> {
@@ -153,13 +162,19 @@ impl Core {
         let directive =
             self.supervisor
                 .tick(now, &health, state.as_ref(), &self.power, holder_setpoint);
-        let demand = match (directive.arming, &state) {
-            (ArmingState::Armed, Some(s)) => self.guidance.tick(&directive.setpoint, s),
-            _ => ForceDemand {
-                surge_n: 0.0,
-                sway_n: 0.0,
-                yaw_nm: 0.0,
-            },
+        let (demand, reference) = match (directive.arming, &state) {
+            (ArmingState::Armed, Some(s)) => (
+                self.guidance.tick(&directive.setpoint, s),
+                self.guidance.reference(),
+            ),
+            _ => (
+                ForceDemand {
+                    surge_n: 0.0,
+                    sway_n: 0.0,
+                    yaw_nm: 0.0,
+                },
+                GuidanceReference::default(),
+            ),
         };
         // Allocation (D-026): the effector table cannot always deliver the
         // demanded tau exactly (saturation, an underactuated hull), so
@@ -196,6 +211,7 @@ impl Core {
             health,
             directive,
             outputs,
+            reference,
         }
     }
 }

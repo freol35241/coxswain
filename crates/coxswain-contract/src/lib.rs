@@ -21,15 +21,15 @@ pub use actuator::{ActuatorCommand, ActuatorFeedback, ForceDemand};
 pub use bounded::{BoundedList, CapacityError};
 pub use config::{
     ClaimantPriority, ConnGrantDefault, EstimatorConfig, Fossen3DofParams, GeofenceAction,
-    GeofenceConfig, License, ModelParams, SensorConfig, SensorId, SensorRole, SupervisorConfig,
-    VesselConfig,
+    GeofenceConfig, License, MAX_STOP_SOURCES, ModelParams, SensorConfig, SensorId, SensorRole,
+    StopSource, StopSourceConfig, SupervisorConfig, VesselConfig,
 };
 pub use conn::{AUTONOMY, ArmingState, ClaimantId, ConnState};
 pub use effector::{
     ActuationCapability, ActuatorOutputs, EffectorConfig, EffectorId, EffectorKind, MAX_EFFECTORS,
 };
 pub use geo::GeoPoint;
-pub use guidance::Setpoint;
+pub use guidance::{GuidanceReference, Setpoint};
 pub use health::{EstimatorHealth, HealthLevel};
 pub use measurement::{GnssFixMode, Measurement, MeasurementKind};
 pub use power::PowerStatus;

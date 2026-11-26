@@ -118,7 +118,7 @@ fn hdt_sentence(heading_deg: f64) -> String {
 /// listen port, chosen fresh per test.
 const MANIFEST_TEMPLATE: &str = r#"
 [manifest]
-schema_version = 7
+schema_version = 9
 vessel_id      = "cx-udp-rig-01"
 name           = "UDP Desk Rig"
 revision       = 1
@@ -128,6 +128,7 @@ date           = "2026-07-11"
 [conn_node]
 board       = "hosted"
 watchdog_ms = 250
+self_sufficient = true
 
 [[bus]]
 id          = "udp0183"

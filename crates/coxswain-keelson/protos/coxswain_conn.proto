@@ -28,6 +28,8 @@ message ConnReply {
     REFUSED_POSITION = 8;
     ERROR = 9;
     REFUSED_POWER_STALE = 10;
+    // A stop source is engaged (D-037).
+    REFUSED_STOP = 11;
   }
   Result result = 1;
 }
@@ -88,4 +90,9 @@ message ConnStateMsg {
 message ManifestInfo {
   bytes sha256 = 1;
   uint32 revision = 2;
+  // The declared self-sufficiency promise (D-034).
+  bool self_sufficient = 3;
+  // Where measurements come from: "buses" (the manifest's buses) or "sim"
+  // (the in-process plant).
+  string io_source = 4;
 }

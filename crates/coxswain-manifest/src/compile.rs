@@ -9,8 +9,8 @@ use std::time::Duration;
 use coxswain_contract::{
     BoundedList, ClaimantId, ClaimantPriority, ConnGrantDefault, EffectorConfig, EffectorId,
     EffectorKind, EstimatorConfig, Fossen3DofParams, GeoPoint, GeofenceAction, GeofenceConfig,
-    License, MAX_EFFECTORS, ModelParams, SensorConfig, SensorId, SensorRole, SupervisorConfig,
-    VesselConfig,
+    License, MAX_EFFECTORS, MAX_STOP_SOURCES, ModelParams, SensorConfig, SensorId, SensorRole,
+    StopSource, StopSourceConfig, SupervisorConfig, VesselConfig,
 };
 use coxswain_cyphal::{NODE_ID_MAX, SUBJECT_ID_MAX};
 
@@ -22,7 +22,7 @@ use crate::toml_model::{
 use crate::types::{
     ActuatorFailsafe, ActuatorFunction, ActuatorNodeEntry, BusEntry, BusKind, ChecksumMode,
     CompiledManifest, ConnNodeEntry, EffectorEntry, EffectorOutput, FixedStr32, Nmea0183Quirks,
-    Nmea2000Quirks, PwmCalibration, RcEntry, SCHEMA_VERSION, SensorEntry,
+    Nmea2000Quirks, PwmCalibration, RcClaimantEntry, RcEntry, SCHEMA_VERSION, SensorEntry,
 };
 
 /// Board profiles (D-016): the ports a manifest may reference. A sensor's
@@ -151,6 +151,28 @@ pub enum ValidateError {
         sensor: String,
         bus: String,
     },
+    /// A `keelson` bus must author `[bus.keelson] entity` (D-034).
+    KeelsonEntityMissing {
+        bus: String,
+    },
+    /// A `keelson` bus's entity must not be the vessel's own (D-034): the
+    /// vessel entity carries Coxswain's telemetry, which would be ingested.
+    KeelsonEntityIsVessel {
+        bus: String,
+    },
+    /// The `keelson` bus kind exists only on the hosted profile (D-034).
+    KeelsonBusNotHosted {
+        bus: String,
+    },
+    /// `self_sufficient = true`, but this inner_loop sensor or effector sits
+    /// on an external bus (D-034).
+    SelfSufficiencyViolated {
+        culprit: String,
+        bus: String,
+    },
+    /// `self_sufficient = false`, but no inner_loop sensor or effector sits on
+    /// an external bus (D-034): the declaration must match exactly.
+    SelfSufficiencyUnderclaimed,
     BadSourceIp {
         bus: String,
         ip: String,
@@ -217,8 +239,8 @@ pub enum ValidateError {
     RcBusWrongKind {
         bus: String,
     },
-    /// Two of `[rc]`'s four channel fields (kill/takeover/surge/yaw) name
-    /// the same channel.
+    /// Two of `[rc]`'s channel fields (kill, and takeover/surge/yaw under
+    /// `[rc.claimant]`) name the same channel.
     RcDuplicateChannel {
         channel: u16,
     },
@@ -228,12 +250,12 @@ pub enum ValidateError {
     },
     /// `[rc].switch_low_us` is not strictly below `switch_high_us`.
     RcSwitchBoundsInverted,
-    /// `[rc].max_surge_n` or `max_yaw_nm` is not strictly positive and
+    /// `[rc.claimant].max_surge_n` or `max_yaw_nm` is not strictly positive and
     /// finite.
     RcMaximumNotPositive {
         field: &'static str,
     },
-    /// `[rc].claimant` names a `ClaimantId` with no matching `[[claimant]]`
+    /// `[rc.claimant].id` names a `ClaimantId` with no matching `[[claimant]]`
     /// entry, so the RC would silently fall to the default priority 0 instead
     /// of its intended preemption priority (D-025).
     RcClaimantUnknown {
@@ -410,7 +432,7 @@ impl std::fmt::Display for ValidateError {
                 write!(
                     f,
                     "effector {effector:?} references bus {bus:?}, which is not an output bus \
-                     (actuator_uart, pwm, or cyphal_can)"
+                     (actuator_uart, pwm, cyphal_can, or keelson)"
                 )
             }
             Self::DuplicateEffectorChannel { bus, channel } => {
@@ -447,6 +469,39 @@ impl std::fmt::Display for ValidateError {
                      strictly positive"
                 )
             }
+            Self::KeelsonEntityMissing { bus } => {
+                write!(
+                    f,
+                    "bus {bus:?}: kind \"keelson\" needs [bus.keelson] entity (D-034)"
+                )
+            }
+            Self::KeelsonEntityIsVessel { bus } => {
+                write!(
+                    f,
+                    "bus {bus:?}: [bus.keelson] entity is the vessel's own; it would ingest \
+                     Coxswain's own telemetry (D-034)"
+                )
+            }
+            Self::KeelsonBusNotHosted { bus } => {
+                write!(
+                    f,
+                    "bus {bus:?}: kind \"keelson\" exists only on the hosted profile (D-034)"
+                )
+            }
+            Self::SelfSufficiencyViolated { culprit, bus } => {
+                write!(
+                    f,
+                    "[conn_node] self_sufficient = true, but {culprit:?} sits on external bus \
+                     {bus:?} (D-034)"
+                )
+            }
+            Self::SelfSufficiencyUnderclaimed => {
+                write!(
+                    f,
+                    "[conn_node] self_sufficient = false, but no inner_loop sensor or effector \
+                     sits on an external bus; the declaration must match (D-034)"
+                )
+            }
             Self::PwmBusOnHosted { bus } => {
                 write!(
                     f,
@@ -474,7 +529,10 @@ impl std::fmt::Display for ValidateError {
                 write!(f, "rc: switch_low_us must be strictly below switch_high_us")
             }
             Self::RcMaximumNotPositive { field } => {
-                write!(f, "rc.{field} must be strictly positive and finite")
+                write!(
+                    f,
+                    "rc.claimant.{field} must be strictly positive and finite"
+                )
             }
             Self::RcClaimantUnknown { claimant } => {
                 write!(
@@ -625,6 +683,25 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         // authored. Checked before node-id collection so a stray Cyphal
         // sub-table cannot masquerade as a claim.
         bus_subtable_guard(bus)?;
+        // D-034, ahead of the port checks: a keelson bus names no physical
+        // port, so its own errors are the ones worth reporting.
+        if bus.kind == BusKindToml::Keelson {
+            if board != BOARD_HOSTED {
+                return Err(ValidateError::KeelsonBusNotHosted {
+                    bus: bus.id.clone(),
+                });
+            }
+            let Some(keelson) = bus.keelson.as_ref() else {
+                return Err(ValidateError::KeelsonEntityMissing {
+                    bus: bus.id.clone(),
+                });
+            };
+            if keelson.entity == m.manifest.vessel_id {
+                return Err(ValidateError::KeelsonEntityIsVessel {
+                    bus: bus.id.clone(),
+                });
+            }
+        }
         if !port_allowed(&bus.port) {
             return Err(ValidateError::PortNotOnProfile {
                 owner: bus.id.clone(),
@@ -632,7 +709,9 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
                 board: board.to_string(),
             });
         }
-        if !ports.insert(&bus.port) {
+        // A keelson bus claims no physical port; several may name the same
+        // placeholder ("zenoh").
+        if bus.kind != BusKindToml::Keelson && !ports.insert(&bus.port) {
             return Err(ValidateError::DuplicatePort {
                 port: bus.port.clone(),
             });
@@ -807,6 +886,7 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         ),
         geofence: build_geofence(m.supervisor.geofence.as_ref())?,
         claimant_priorities: claimant_priorities(&m.claimants)?,
+        stop_sources: stop_sources(m.rc.as_ref()),
     };
 
     // Blob tables and the per-sensor trust declarations.
@@ -875,7 +955,10 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         };
         if !matches!(
             bus.kind,
-            BusKindToml::ActuatorUart | BusKindToml::Pwm | BusKindToml::CyphalCan
+            BusKindToml::ActuatorUart
+                | BusKindToml::Pwm
+                | BusKindToml::CyphalCan
+                | BusKindToml::Keelson
         ) {
             return Err(ValidateError::EffectorBusWrongKind {
                 effector: e.id.clone(),
@@ -962,6 +1045,8 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         }
     }
 
+    self_sufficiency(m, &bus_by_id)?;
+
     let rc = build_rc(m.rc.as_ref(), &bus_by_id, &claimant_ids)?;
 
     Ok(CompiledManifest {
@@ -972,6 +1057,7 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
         conn_node: ConnNodeEntry {
             board: fx("conn_node.board", board)?,
             watchdog_ms: m.conn_node.watchdog_ms,
+            self_sufficient: m.conn_node.self_sufficient,
         },
         config: VesselConfig {
             sensors: sensor_configs,
@@ -1031,6 +1117,20 @@ fn id_list(
 /// D-025: `id` is authored directly, not compiler-assigned (see
 /// `ClaimantToml`'s doc comment), so this is a straight copy plus the
 /// capacity check every other blob table gets.
+/// The declared stop sources (D-037). An `[rc]` table always declares its
+/// kill channel as one; Keelson `safety_state` joins with its consumer.
+fn stop_sources(rc: Option<&RcToml>) -> BoundedList<StopSourceConfig, MAX_STOP_SOURCES> {
+    let mut sources = BoundedList::new();
+    if let Some(rc) = rc {
+        // One source, one slot: MAX_STOP_SOURCES has a slot per variant.
+        let _ = sources.push(StopSourceConfig {
+            source: StopSource::Rc,
+            stop_on_silence: rc.stop_on_silence,
+        });
+    }
+    sources
+}
+
 fn claimant_priorities(
     claimants: &[ClaimantToml],
 ) -> Result<BoundedList<ClaimantPriority, 8>, ValidateError> {
@@ -1238,6 +1338,7 @@ fn bus_subtable(kind: BusKindToml) -> Option<&'static str> {
         BusKindToml::Uart => Some("uart"),
         BusKindToml::ActuatorUart => Some("actuator_uart"),
         BusKindToml::CrsfUart => Some("crsf_uart"),
+        BusKindToml::Keelson => Some("keelson"),
         BusKindToml::Spi | BusKindToml::I2c | BusKindToml::Pwm => None,
     }
 }
@@ -1254,6 +1355,7 @@ fn bus_subtable_guard(bus: &BusToml) -> Result<(), ValidateError> {
         ("uart", bus.uart.is_some()),
         ("actuator_uart", bus.actuator_uart.is_some()),
         ("crsf_uart", bus.crsf_uart.is_some()),
+        ("keelson", bus.keelson.is_some()),
     ] {
         if present && expected != Some(sub) {
             return Err(ValidateError::BusSubtableUnexpected {
@@ -1319,6 +1421,7 @@ fn bus_entry(bus: &BusToml) -> Result<BusEntry, ValidateError> {
             BusKindToml::ActuatorUart => BusKind::ActuatorUart,
             BusKindToml::Pwm => BusKind::Pwm,
             BusKindToml::CrsfUart => BusKind::CrsfUart,
+            BusKindToml::Keelson => BusKind::Keelson,
         },
         port: fx("bus.port", &bus.port)?,
         rate: bitrate
@@ -1341,7 +1444,58 @@ fn bus_entry(bus: &BusToml) -> Result<BusEntry, ValidateError> {
         },
         listen_only,
         node_id,
+        entity: match bus.keelson.as_ref() {
+            Some(k) => fx("bus.keelson.entity", &k.entity)?,
+            None => FixedStr32::empty(),
+        },
     })
+}
+
+/// Whether a bus's path runs through something that can sit above the conn
+/// node (D-034): evaluated per bus from kind, segment, and pinning. A
+/// `keelson` bus always does; `nmea0183_udp` does unless it is pinned on the
+/// conn segment (D-014); every other kind terminates at the conn node.
+fn bus_is_external(bus: &BusToml) -> bool {
+    match bus.kind {
+        BusKindToml::Keelson => true,
+        BusKindToml::Nmea0183Udp => {
+            let udp = bus.nmea0183_udp.as_ref();
+            let pinned = udp.is_some_and(|u| u.source_ip.is_some());
+            let conn = udp.and_then(|u| u.segment.as_deref()) == Some("conn");
+            !(pinned && conn)
+        }
+        _ => false,
+    }
+}
+
+/// D-034: `[conn_node] self_sufficient` must equal "no inner_loop sensor and
+/// no effector on an external bus", exactly. Enrichment sensors do not count.
+/// Unknown bus references are reported by the table checks, not here.
+fn self_sufficiency(
+    m: &ManifestToml,
+    bus_by_id: &HashMap<&str, &BusToml>,
+) -> Result<(), ValidateError> {
+    let external = |bus_id: &str| bus_by_id.get(bus_id).is_some_and(|b| bus_is_external(b));
+    let culprit = m
+        .sensors
+        .iter()
+        .filter(|s| s.license == LicenseToml::InnerLoop && external(&s.bus))
+        .map(|s| (&s.id, &s.bus))
+        .chain(
+            m.effectors
+                .iter()
+                .filter(|e| external(&e.bus))
+                .map(|e| (&e.id, &e.bus)),
+        )
+        .next();
+    match (m.conn_node.self_sufficient, culprit) {
+        (true, Some((id, bus))) => Err(ValidateError::SelfSufficiencyViolated {
+            culprit: id.clone(),
+            bus: bus.clone(),
+        }),
+        (false, None) => Err(ValidateError::SelfSufficiencyUnderclaimed),
+        _ => Ok(()),
+    }
 }
 
 /// A Cyphal node id or subject id must fit its wire range (D-029). The
@@ -1665,6 +1819,22 @@ fn effector_output(
                 report_tolerance,
             })
         }
+        // D-034: the effector's name is the source id; nothing to wire.
+        BusKindToml::Keelson => {
+            for (field, present) in [
+                ("channel", o.channel.is_some()),
+                ("pwm", o.pwm.is_some()),
+                ("node_id", o.node_id.is_some()),
+                ("command_subject", o.command_subject.is_some()),
+                ("feedback_subject", o.feedback_subject.is_some()),
+                ("report_tolerance", o.report_tolerance.is_some()),
+            ] {
+                if present {
+                    return Err(unexpected(field));
+                }
+            }
+            Ok(EffectorOutput::Keelson)
+        }
         _ => unreachable!("effector_output called only for output bus kinds"),
     }
 }
@@ -1762,14 +1932,14 @@ fn pwm_calibration(id: &str, p: &PwmCalibrationToml) -> Result<PwmCalibration, V
     })
 }
 
-/// Compiles `[rc]` (D-025): the vessel's RC hand controller, absent when the
-/// manifest declares none (`[rc]` is optional and, being a single TOML
-/// table rather than an array-of-tables, at most one by construction).
-/// `bus` must reference a declared `crsf_uart` bus; `claimant` must name a
-/// declared `[[claimant]]` id; the four channel fields must be distinct and
-/// each below CRSF's channel count; `switch_low_us` must be strictly below
-/// `switch_high_us`; both force/moment maxima must be strictly positive and
-/// finite.
+/// Compiles `[rc]` (D-025, D-037): the vessel's RC hand controller, absent
+/// when the manifest declares none (`[rc]` is optional and, being a single
+/// TOML table rather than an array-of-tables, at most one by construction).
+/// `bus` must reference a declared `crsf_uart` bus; the channel fields in
+/// use must be distinct and each below CRSF's channel count; `switch_low_us`
+/// must be strictly below `switch_high_us`. With `[rc.claimant]`, its `id`
+/// must name a declared `[[claimant]]` and both force/moment maxima must be
+/// strictly positive and finite.
 fn build_rc(
     rc: Option<&RcToml>,
     bus_by_id: &HashMap<&str, &BusToml>,
@@ -1790,21 +1960,20 @@ fn build_rc(
         });
     }
 
-    // The RC's priority lives in [[claimant]], keyed by this id (D-025). An id
-    // with no entry there is not priority 0 by intent, it is an authoring slip:
-    // the RC would silently lose preemption to whatever outranks 0.
-    if !claimant_ids.contains(&rc.claimant) {
-        return Err(ValidateError::RcClaimantUnknown {
-            claimant: rc.claimant,
-        });
+    if let Some(c) = &rc.claimant {
+        // The RC's priority lives in [[claimant]], keyed by this id (D-025).
+        // An id with no entry there is not priority 0 by intent, it is an
+        // authoring slip: the RC would silently lose preemption to whatever
+        // outranks 0.
+        if !claimant_ids.contains(&c.id) {
+            return Err(ValidateError::RcClaimantUnknown { claimant: c.id });
+        }
     }
 
-    let channels = [
-        rc.kill_channel,
-        rc.takeover_channel,
-        rc.surge_channel,
-        rc.yaw_channel,
-    ];
+    let mut channels = vec![rc.kill_channel];
+    if let Some(c) = &rc.claimant {
+        channels.extend([c.takeover_channel, c.surge_channel, c.yaw_channel]);
+    }
     for &channel in &channels {
         if channel >= RC_CHANNEL_COUNT {
             return Err(ValidateError::RcChannelOutOfRange { channel });
@@ -1821,26 +1990,31 @@ fn build_rc(
         return Err(ValidateError::RcSwitchBoundsInverted);
     }
 
-    for (field, value) in [
-        ("max_surge_n", rc.max_surge_n),
-        ("max_yaw_nm", rc.max_yaw_nm),
-    ] {
-        if !(value.is_finite() && value > 0.0) {
-            return Err(ValidateError::RcMaximumNotPositive { field });
+    let claimant = match &rc.claimant {
+        None => None,
+        Some(c) => {
+            for (field, value) in [("max_surge_n", c.max_surge_n), ("max_yaw_nm", c.max_yaw_nm)] {
+                if !(value.is_finite() && value > 0.0) {
+                    return Err(ValidateError::RcMaximumNotPositive { field });
+                }
+            }
+            Some(RcClaimantEntry {
+                id: c.id,
+                takeover_channel: c.takeover_channel,
+                surge_channel: c.surge_channel,
+                yaw_channel: c.yaw_channel,
+                stick_deadband_us: c.stick_deadband_us,
+                max_surge_n: c.max_surge_n,
+                max_yaw_nm: c.max_yaw_nm,
+            })
         }
-    }
+    };
 
     Ok(Some(RcEntry {
         bus: fx("rc.bus", &rc.bus)?,
-        claimant: rc.claimant,
         kill_channel: rc.kill_channel,
-        takeover_channel: rc.takeover_channel,
-        surge_channel: rc.surge_channel,
-        yaw_channel: rc.yaw_channel,
         switch_low_us: rc.switch_low_us,
         switch_high_us: rc.switch_high_us,
-        stick_deadband_us: rc.stick_deadband_us,
-        max_surge_n: rc.max_surge_n,
-        max_yaw_nm: rc.max_yaw_nm,
+        claimant,
     }))
 }

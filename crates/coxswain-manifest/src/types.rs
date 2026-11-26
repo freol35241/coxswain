@@ -20,12 +20,17 @@ use serde::{Deserialize, Serialize};
 /// (D-030): discriminant-gated fields nest in named sub-tables and both
 /// position notations become a single `pos`. Bumped 6 -> 7 for the dedicated
 /// `[geometry]` section (D-033): the body-frame `origin` label moves off
-/// `[estimator]`, which does not own the frame. The blob layout is unchanged
-/// in every case; the bump is forced by the authored shape so a v(n) reader
+/// `[estimator]`, which does not own the frame. Bumped 7 -> 8 for the
+/// `keelson` bus kind with its `entity`, the keelson effector output, and the
+/// declared `[conn_node] self_sufficient` promise (D-034); unlike the earlier
+/// bumps this one also changes the blob layout. Bumped 8 -> 9 for the RC
+/// kill as a declared stop source with its required `stop_on_silence`, and
+/// the RC claimant moved to an optional `[rc.claimant]` (D-037). Otherwise the bump is forced
+/// by the authored shape so a v(n) reader
 /// rejects a v(n+1) manifest and vice versa. Deliberate: pre-release, so old
 /// readers simply reject new blobs and new readers reject old ones, no
 /// migration path needed.
-pub const SCHEMA_VERSION: u16 = 7;
+pub const SCHEMA_VERSION: u16 = 9;
 
 /// Fixed-capacity UTF-8 string, zero-padded. Exists so the blob needs no
 /// allocator; 32 bytes fits every identifier the schema doc uses.
@@ -83,6 +88,9 @@ pub enum BusKind {
     /// The RC receiver link (D-025): CRSF/ELRS at its real 420000 baud rate,
     /// termios2/BOTHER territory on Linux (not a POSIX `Bxxxx` rate).
     CrsfUart,
+    /// Sensors and effectors carried over zenoh as Keelson messages under a
+    /// separate entity (D-034). Always external by path class; hosted only.
+    Keelson,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -110,6 +118,9 @@ pub struct BusEntry {
     /// The conn node's own Cyphal node id on this bus, for a `cyphal_can` bus
     /// the conn node transmits on (D-029). `None` for every other bus kind.
     pub node_id: Option<u16>,
+    /// The Keelson entity a `keelson` bus's traffic lives under (D-034),
+    /// never the vessel's own. Empty for every other bus kind.
+    pub entity: FixedStr32,
 }
 
 // Dead-tail filler for BoundedList only; the values carry no meaning. Manual
@@ -127,6 +138,7 @@ impl Default for BusEntry {
             checksum: ChecksumMode::Required,
             listen_only: false,
             node_id: None,
+            entity: FixedStr32::empty(),
         }
     }
 }
@@ -276,6 +288,9 @@ pub enum EffectorOutput {
         feedback_subject: u16,
         report_tolerance: f64,
     },
+    /// A per-effector setpoint published on a `keelson` bus (D-034). The
+    /// effector's name is the source id; nothing else to wire.
+    Keelson,
 }
 
 /// What the hosted profile needs to drive one effector's output: which bus,
@@ -308,26 +323,33 @@ impl Default for EffectorEntry {
     }
 }
 
-/// The vessel's RC hand controller (D-025): hosted-profile data, like
-/// `EffectorEntry`, not part of `VesselConfig`. The supervisor never knows
-/// RC from any other claimant (D-025); this table exists only so the
-/// adapter that turns CRSF frames into claimant verbs and setpoints has
-/// somewhere manifest-authored to read its wiring from. Field for field
-/// with `coxswain_drivers::rc::Config`, plus `bus` and `claimant`.
+/// The vessel's RC hand controller (D-025, D-037): hosted-profile data, like
+/// `EffectorEntry`, not part of `VesselConfig`. The kill channel's stop
+/// declaration goes to `SupervisorConfig::stop_sources`; this table is the
+/// adapter's wiring, field for field with `coxswain_drivers::rc::Config`
+/// plus `bus`.
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RcEntry {
     /// References a `BusEntry::id` of kind `crsf_uart`.
     pub bus: FixedStr32,
+    pub kill_channel: u16,
+    pub switch_low_us: u16,
+    pub switch_high_us: u16,
+    /// Absent means kill only.
+    pub claimant: Option<RcClaimantEntry>,
+}
+
+/// The RC claimant function. The supervisor never knows RC from any other
+/// claimant (D-025).
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RcClaimantEntry {
     /// The runtime `ClaimantId` the RC adapter registers as; authored
     /// directly, same out-of-band-agreement convention as
     /// `[[claimant]].id` (D-025).
-    pub claimant: u16,
-    pub kill_channel: u16,
+    pub id: u16,
     pub takeover_channel: u16,
     pub surge_channel: u16,
     pub yaw_channel: u16,
-    pub switch_low_us: u16,
-    pub switch_high_us: u16,
     pub stick_deadband_us: u16,
     pub max_surge_n: f64,
     pub max_yaw_nm: f64,
@@ -339,6 +361,9 @@ pub struct ConnNodeEntry {
     pub board: FixedStr32,
     /// Hardware watchdog kick interval.
     pub watchdog_ms: u32,
+    /// The declared self-sufficiency promise (D-034), checked against the
+    /// buses at compile time. Release builds refuse `false`.
+    pub self_sufficient: bool,
 }
 
 /// The payload of the manifest blob. `config` is what the estimator and

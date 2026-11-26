@@ -232,6 +232,9 @@ and what first water trials actually need), RC as a conn-holding claimant
 second. Manual helm issues direct effort setpoints, a contract Setpoint
 addition; RC bypasses guidance, never the supervisor or arming.
 
+Amended by D-037: the kill channel is a stop source in the supervisor, not
+the RC claimant's `disarm`, and the claimant function is optional per vessel.
+
 ## D-026: Allocation at the conn node from a manifest-declared effector table
 
 Guidance keeps producing generalized tau; a new no_std allocation stage maps
@@ -564,8 +567,360 @@ manifests, and the schema doc. With D-031 this completes the frame story: the
 control path consumes per-sensor offsets, and the manifest declares the frame
 they are measured in.
 
+## D-034: Keelson bus kind and a declared self-sufficiency promise
+
+Status: accepted. `--sim` (D-020) runs the plant inside the process. It cannot
+host a third-party plant, a perception simulator in Keelson land, several
+vessels in one scenario, or a bench where real actuators follow a simulated
+plant. This adds a `keelson` bus kind: sensors on it are fed over zenoh by
+whatever publishes there, effectors on it are rendered to zenoh. It is a bus
+kind like `nmea0183_udp`, not a mode, so it composes with real buses in one
+manifest.
+
+Shape. The bus sits at the same two seams as every other bus: inbound messages
+become contract `Measurement`s through `core.ingest`, outbound values are the
+allocator's per-effector physical outputs, the same slice every output backend
+receives. They are published directly rather than through the no_std
+`OutputBackend`/`OutputFrame` trait, which keeps zenoh out of coxswain-drivers.
+Drivers and parsers are bypassed for sensors on this bus; their own tests and
+the replay harness cover them. Licensing applies unchanged, so an `enrichment`
+sensor on a `keelson` bus is rejected from fusion exactly as on any other bus. A
+`keelson` bus needs no `--port`; the manifest specifies it fully, as for
+`nmea0183_udp`.
+
+Self-sufficiency follows the path, evaluated per bus from its kind, segment, and
+source pinning, not from the protocol. Serial, CAN, SPI, I2C, and PWM buses
+terminate at the conn node. An `nmea0183_udp` bus does when it is on `segment =
+"conn"` with `source_ip` pinned, the condition D-014 already sets for
+`inner_loop`. A `keelson` bus is always external in this entry: its path runs
+through a zenoh router and its publishers cannot be pinned. A router-less,
+pinned zenoh peer on the conn segment would be conn-terminated on the same
+reasoning; classing it so is left to its own decision, and effectors on it would
+still meet D-011. The manifest declares `[conn_node] self_sufficient = true |
+false`, and the compiler requires the declaration to match the manifest exactly:
+`true` if and only if no `inner_loop` sensor and no effector sits on an external
+bus. Enrichment sensors on an external bus do not affect it. A mismatch either
+way is a compile error, so the declared value is never stale.
+
+Why declared and checked rather than inferred: inferring it would let one
+changed bus reference silently downgrade the vessel's guarantee. Declaring it
+makes a downgrade an explicit line in the manifest diff, and the check makes
+intent and content agree, the same pattern as license subset rules (invariant
+4) one level up. The promise is compiled into the signed blob, so the
+commissioning signature approves it and the manifest hash (D-018, D-024)
+records which promise was in force. It is published in health, so operators,
+claimants, and shore can tell a bench rig from a vessel at runtime.
+
+Enforcement at boot. Release builds refuse a manifest with `self_sufficient =
+false`. The `keelson` bus backend and acceptance of such manifests sit behind a
+`keelson-bus` cargo feature on coxswain-hosted, off by default; the release
+image (contrib/docker) builds default features, and a separate image tag
+carries the feature. The manifest cannot protect against being deployed to the
+wrong place; the binary can. Running a non-self-sufficient setup on water stays
+possible, but only by deliberately deploying the test image. H7 release
+firmware refuses the same way; the `keelson` bus kind is hosted-only.
+
+Invariant 1 is amended, not relaxed, for vessels: a manifest that declares
+itself self-sufficient must be, and only such manifests run on a release build.
+CLAUDE.md invariant 1 carries that sentence.
+
+Mixed setups are allowed on test builds: real actuators driven from a
+simulated plant on a bench, or one simulated sensor beside real ones. This
+entry adds no access control for `keelson` buses. Security is assumed at the
+network boundary, as it already is for `nmea0183_udp` (D-014); a zenoh-level
+policy would apply to both and is not designed here.
+
+Effectors on a `keelson` bus are a test-build exception to D-011 and D-027, not
+a revision of them. zenoh pub/sub is the broadcast transport with no authority
+model that D-011 keeps actuator commands off, and nothing on a `keelson` bus
+provides D-027's failsafe path that survives conn-process death. Both hold
+unchanged for every self-sufficient manifest, which by the rule above has no
+effector on an external bus. In a mixed setup, whatever renders a `keelson`
+effector onto real hardware owns that failsafe; Coxswain does not claim it.
+
+Wire. Same zenoh session as the Keelson adapter; one router, no second network
+setup. Payloads are Keelson's well-known subjects and messages, so any
+Keelson-speaking simulator works without a Coxswain-specific schema. Separation
+from telemetry comes from the entity, not the subject: the simulator publishes
+under the entity id the bus declares (`[bus.keelson] entity`), which the
+compiler rejects if it equals the vessel's own, because Coxswain's raw and fused
+telemetry already occupies `location_fix` and the rest under the vessel entity
+and would otherwise be ingested as input. Inbound, the source id is the manifest
+sensor id, the name Keelson 0.6 allows a simulator authoring its own vessel
+(§2.1.2). Outbound, Coxswain is the producer on the bus entity: setpoints go out
+under `coxswain/<effector id>`, and Coxswain declares its liveliness there.
+`coxswain_keelson::KeelsonBusPeer` implements the far side. Coxswain subscribes
+to exact keys derived from the manifest, not wildcards. Message definitions and
+key helpers live in coxswain-keelson; the backend lives in coxswain-hosted.
+
+Mapping, in. `location_fix` (covariance in-message) for GNSS position,
+`location_fix_quality` for fix mode, `heading_true_north_deg` with
+`heading_accuracy_deg`, `yaw_rate_degps`, `speed_over_ground_knots`,
+`course_over_ground_deg`, `battery_voltage_v` for `PowerStatus`. Injection is at
+the measurement level, so a compass sensor arrives as true heading; declination
+is the simulator's concern. Mapping, out: one message per effector per tick,
+rudder angle and thrust setpoint by effector id.
+
+Missing from Keelson, coxswain-specific subjects until upstream has them, in the
+existing `depth_below_transducer_m` manner, then retired:
+`yaw_rate_accuracy_degps`, `speed_over_ground_accuracy_knots`,
+`course_over_ground_accuracy_deg` (following `heading_accuracy_deg`), and
+commanded actuator values, `rudder_angle_deg_setpoint` and
+`thrust_newton_setpoint` (first named `rudder_angle_setpoint_deg` and
+`thrust_setpoint_newton`, renamed to Keelson's `<measurement>_setpoint` rule
+once keelson #316 merged; Keelson dev registers the thrust one, and outputs
+already republish every tick as that rule asks of an executor). Keelson's
+`rudder_angle_deg` means the actual angle
+and `force_newton` is a general force vector; publishing commands on them would
+collide with a simulator's or a later actuator's reported state. The mapping is
+confirmed against Keelson 0.6.0-pre.19, which also vendors `LocationFixQuality`;
+`Decomposed3DVector` is not needed, since thrust goes out as a
+`TimestampedFloat`.
+
+Uncertainty. Keelson carries value and accuracy on separate subjects, and most
+streams have no accuracy subject at all. Each value takes its std from the
+latest accuracy message from the same source id, if that is within `GST_MAX_AGE`
+(1.5 s), the window the 0183 driver already uses to pair GST with GGA; otherwise
+from the default the real driver uses for that measurement kind
+(`NMEA0183_HEADING_STD_RAD`, `SOG_STD_MPS` and the COG derivation from it,
+`fallback_std_m` for position), under the same bound as the driver self-test: a
+default never claims finer precision than a good measured value. A
+`location_fix` with covariance type `UNKNOWN` or an all-zero covariance counts
+as no accuracy; fusing a zero std would treat the fix as perfect. Yaw rate has
+no real driver yet, so it gets one new constant, documented as crude like
+`SOG_STD_MPS`. Fallback is logged once per sensor and published per sensor in
+health (std measured or defaulted), so a test can assert on it. Rejected:
+dropping values without accuracy (no stock Keelson simulator could feed yaw
+rate, SOG, or COG, and the bus would diverge from the real driver path);
+per-sensor std in bus config (configuration D-032 keeps out until system
+identification can fill it).
+
+Timing. Free-running clocks, as with hardware. Coxswain stamps each `keelson`
+bus message on arrival with its own monotonic clock and ignores the simulator's
+time, as it does for serial bytes. The simulator publishes at realistic rates
+and consumes outputs as they arrive. Latency, jitter, and loss reach the
+estimator as they would on a vessel, and a silent simulator trips staleness and
+failsafe like a dead sensor. Runs are not bit-reproducible; reproducibility
+stays with `--sim` and the replay harness. `--sim` refuses a manifest whose
+`keelson` buses carry sensors or effectors: two plants would feed one estimator.
+
+Markers. Health publishes the measurement source in use, `io_source =
+"buses"` or `"sim"` (the in-process plant), next to the self-sufficiency
+promise, so `--sim` gets the same treatment. Arming and conn claims work as
+normal with either source, since testing them is the point.
+
+Rejected: a `--sil` mode mutually exclusive with `--port` (this entry's first
+draft). It made "simulated data never reaches a real actuator" structural, but
+forbade mixed setups and duplicated the bus concept as a mode.
+
+Schema: `schema_version` 7 -> 8 (the bus kind, its `[bus.keelson]` sub-table,
+and `conn_node.self_sufficient`). A SIL variant of a vessel manifest differs in
+bus references and therefore in hash.
+
+Open within this entry: a `coxswain-manifest` subcommand that derives the SIL
+variant from the vessel manifest so the two cannot drift, deferred until the
+first SIL rig shows whether hand-kept variants drift in practice; actuator
+feedback from the simulator (Cyphal-style reports, where its `rudder_angle_deg`
+would come in), deferred until a test needs it; proposing the missing subjects
+upstream to Keelson; and whether a raw-sentence injection mode is worth adding
+to exercise the drivers, deferred with no current case.
+
+## D-035: Coxswain owns its conn; the Keelson adapter implements Keelson's interfaces
+
+Status: accepted. Rewritten after keelson #399, which proposes adopting
+Coxswain's conn design as Keelson's `conn/v1`; the first draft composed the
+supervisor with Keelson's `command_authority` lease, which #399 supersedes.
+
+The conn's semantics are Coxswain's: the supervisor's rules and the contract
+crate's types (`ClaimantId`, `Setpoint`, `ConnState`, `ArmingState`, and the
+claim and arm results). They change only by Coxswain's own decisions. Coxswain
+defines no external wire protocol of its own for them. The Keelson adapter
+implements Keelson's standard interfaces as they stand at the pinned Keelson
+version and translates to and from the contract crate, which invariant 3 and
+D-003 already require of every external interface. Keelson is free to
+standardize whatever it decides; when it changes, only the adapter changes, and
+only when Coxswain moves its pin. The split follows one rule: share vocabulary,
+own contracts. Keelson owns the bus conventions (key shapes, liveliness,
+envelope, naming; D-008 gives it keyspace governance) and the well-known
+subjects, and Coxswain follows them. Coxswain owns its authority semantics.
+Owning one wire format jointly would tie Coxswain's development pace to
+Keelson's.
+
+Translation rules for the adapter:
+
+- Representation, never authority. It converts formats. It never grants,
+  holds, renews, or keeps the conn alive on anyone's behalf (invariant 2). An
+  interface whose semantics the supervisor does not have, such as a lease
+  handed to a named station or a command that should outlive its sender, is
+  refused, not emulated.
+- Served whole. An interface the adapter serves answers every procedure
+  (Keelson's full-interface rule); one with no internal counterpart replies
+  with a typed unsupported result, never silence.
+- Internal-only state, such as `self_sufficient`, `io_source`, and failsafe
+  causes, goes on coxswain-specific subjects or is proposed upstream. Losing
+  detail outbound is acceptable for telemetry, never for authority.
+- Interfaces that act on the vessel are served as the calling station's own
+  claimant operations. A `vehicle_navigation/v1` target becomes that station's
+  setpoint (`StationKeep` or `FollowPath`); `vehicle_lifecycle/v1` arm and
+  disarm become the supervisor's `arm` and `disarm` for its claimant. The
+  supervisor's rules apply unchanged: only the holder may set a setpoint, arm
+  or disarm, and anything else gets a typed refusal. The station keeps its
+  own heartbeat. When it goes silent the conn lapses as for any claimant;
+  the adapter never holds a target on its behalf. A call that cannot be
+  attributed to a registered claimant is refused.
+
+Command and telemetry are separate interfaces in the adapter. A claimant can
+move the vessel and a telemetry receiver cannot; losing a claimant is a
+supervisor event (heartbeat loss, failsafe) and losing a receiver changes
+nothing. A deployment can offer telemetry without command and the reverse, and
+a consumer can observe without anything that can register or claim. The command
+interface is the only path by which anything above the conn node affects
+actuation. Vocabulary per docs/glossary.md.
+
+Whatever Keelson settles for authority among stations (the `command_authority`
+lease, a roles stack, or `conn/v1`), the supervisor stays the only arbiter
+onboard. An external lease or role decides which station above may try, never
+whether its claimant gets the conn, and manifest-declared preemption (D-025)
+applies regardless. Until Keelson settles, the adapter keeps serving the
+current protocol (`coxswain_conn.proto`, the pre-0.6 RPC key shape).
+
+Code consequence, once accepted: `VesselEndpoint` splits into a telemetry
+publisher and a command server, opened separately; an observer client stands
+beside `ClaimantClient` and cannot register or claim; the adapter gets
+conformance tests against the vendored Keelson protos. Serving a Keelson conn
+interface waits for Keelson to merge one. Hosted opens both; neither has a
+switch until a deployment needs one.
+
+## D-036: The vessel publishes its guidance references as Keelson setpoints
+
+Status: accepted. Keelson's `<measurement>_setpoint` rule (keelson #316, dev
+after 0.6.0-pre.19) has the executor, the controller holding a reference,
+publish it, republished while in force and silent when none is. On a Coxswain
+vessel that executor is guidance.
+
+Guidance records the reference it closes on each tick and exposes it through a
+getter: an optional heading and an optional speed, in a small type in
+`coxswain-contract`, so guidance stays no_std and `tick` keeps its signature.
+`Core` carries it in `TickOutput`, empty when disarmed or without a state
+estimate. The adapter publishes it at the tick rate under `coxswain/guidance`:
+
+- `heading_true_north_deg_setpoint`: the heading the yaw loop closes on, in
+  every mode that has one. HeadingSpeed's commanded heading, the near zone's
+  hold heading, the far zone's and reapproach's bearing to the target, and the
+  LOS course in FollowPath. LOS commands a course but the loop closes on
+  heading with crab unmodelled, so the heading subject is the true statement;
+  `course_over_ground_deg_setpoint` would claim a loop that is not closed.
+- `speed_over_ground_knots_setpoint`: the surge reference, where there is one
+  (HeadingSpeed, FollowPath, the approach legs). The loop closes on body surge
+  over ground (the EKF's `u`, GNSS-referenced, no current estimated). SOG
+  equals surge only with no sway, so in a crab the published value understates
+  the SOG the vessel is making. Keelson has no surge subject and STW would be
+  wrong outright (no water-relative speed exists), so SOG is the nearest
+  honest subject and its limit is stated here.
+
+What is in force is the supervisor's directive, not the claimant's setpoint: a
+failsafe or geofence station-keep publishes its own references. Idle,
+DirectEffort, the drift regime, and the near zone's speed have no reference and
+publish nothing on that subject. The subject liveliness tokens stay up
+throughout (Keelson 0.6 §5.2). No yaw-rate setpoint: the heading PD has no
+explicit rate reference. Both subjects are registered on Keelson dev but not
+at the pinned 0.6.0-pre.19, so they are coxswain-specific until the pin moves,
+like `thrust_newton_setpoint` (D-034).
+
+## D-037: A stop is a supervisor input, not a claimant verb; recovery is a declared claimant
+
+Status: accepted. Prompted by keelson #399's decision record (R3, R5, C1, and
+coxswain item 3), and by a defect it names: the RC kill maps to `disarm`,
+which is holder-only, so while any other claimant holds the conn the kill
+switch does nothing.
+
+A stop is a new supervisor input from a declared stop source. While any stop
+source is engaged, the vessel is disarmed whoever holds the conn, `arm` is
+refused, and the failsafe matrix reports `Stop` above every other cause.
+Releasing a stop re-arms nothing: arming is the holder's call afterwards, as
+after critical voltage. The conn is untouched. A stop is not a claim, never
+takes the conn, and the holder keeps it through the stop. This is the
+semantics of Keelson's `safety_state` (keelson #332): not CLEAR means stopped
+and arming refused, and CLEAR permits arming without performing it.
+
+A stop is accepted from any declared source, external ones included, because
+it only removes actuation. Invariant 1 forbids depending on something above
+the conn node, not being stopped by it. Conn-process death is already covered:
+D-027 gives every effector a failsafe path that stops actuation when the
+process dies. So the supervisor's stop covers the live process and D-027 the
+dead one, which is what Keelson's R3 asks of a kill.
+
+Sources, declared in the manifest:
+
+- The RC kill channel, conn-terminated. This replaces today's kill-as-disarm.
+- Keelson `safety_state`, external, through the adapter, once Keelson merges
+  it. Until then the input exists and only RC drives it.
+
+Silence. A stop source that goes silent raises a health warning and stops
+nothing, unless the manifest declares that source stop-on-silence. On an
+external source that declaration makes the control path depend on the bus,
+so the compiler counts it against `self_sufficient` (D-034). Only a manifest
+declaring `self_sufficient = false` may set it there, and release builds
+refuse those. On RC, which is conn-terminated, it is allowed on any manifest:
+stopping on RC link loss is the usual setup for first water trials. The
+declaration is required, never defaulted, as trust is declared.
+
+A source reports its state on every frame it delivers, and the supervisor
+judges silence from that stream. The window is `claimant_heartbeat`, the one
+that already says a link is gone, so there is no new knob. A source never
+heard from counts as silent, so a stop-on-silence source must be heard
+before the vessel can arm. An engaged stop holds until the source reports a
+release: going silent while engaged releases nothing. A `--sim` run opens no
+RC link, so it drops the RC stop source rather than read the missing
+transmitter as a dead one.
+
+RC is a bus with two functions, and this amends D-025. The kill channel is a
+stop source. The claimant function (takeover, manual helm through
+`DirectEffort`) becomes optional per vessel and moves to an `[rc.claimant]`
+sub-table: an `[rc]` table without one is kill only. While kill is engaged
+the RC claimant's effort stream runs zeroed rather than stopping, so a stop
+does not cost RC the conn it holds. Keelson's R3 and R4 (RC never a claimant,
+no remote direct effort) are Keelson's fleet policy. Coxswain keeps the RC
+claimant available because it is the human takeover path that works with
+nothing above the conn node alive, which is D-025's reason and still holds.
+Loss of an RC claimant that holds the conn stays `ClaimantLost`.
+
+Recovery (Keelson's R5) needs no new mechanism. Keelson's safety supervisor
+reaches Coxswain as an ordinary claimant. Its manifest-declared priority ranks
+it above every station (D-025), so it preempts with `request_conn` and streams
+`StationKeep` or `Idle`. Losing it is `ClaimantLost`, like any holder. It
+cannot stop the vessel; a stop goes through `safety_state`. Coxswain's
+in-loop reflexes (critical voltage, position degraded, geofence, claimant
+lost) stay in the supervisor and outrank every claimant, because they must
+work with the bus gone.
+
+Code consequence:
+
+- **Contract and supervisor (no_std).** `StopSource` and its declarations in
+  `SupervisorConfig`, `stop_report`, `FailsafeCause::Stop`, `ArmError::Stopped`
+  (`REFUSED_STOP` on the wire), and `Directive::stop_silent`, which health
+  telemetry carries.
+- **Manifest.** `[rc] stop_on_silence`, required, and the optional
+  `[rc.claimant]`. Schema 9.
+- **Hosted.** The RC kill drives the stop input, and the kill-as-disarm
+  dead-man re-issue is gone.
+- **Later, with keelson #332.** The `safety_state` source: its consumer in
+  the adapter, its manifest declaration, and the compiler rule that counts
+  stop-on-silence on it against `self_sufficient`. The rule has nothing to
+  check until an external stop source exists.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest
   (deferred to the estimator per D-022)
 - Dual-antenna GNSS heading (sensor pairing concept in the schema)
+- Conn RPC keys predate Keelson 0.6's `@rpc/{interface}/{version}/...` shape.
+  They stay until Keelson standardizes a conn interface; the adapter then
+  serves that interface's keys (D-035). Until then no RPC interface
+  liveliness token is declared, since that key is defined by interface and
+  version.
+- Closing the speed loop on SOG rather than surge over ground, for reasons
+  beyond telemetry (D-036): whether it serves path and transit speed tracking
+  better, how it behaves near zero speed and in station keeping, where SOG's
+  direction is ill-defined, and what it does to the Fossen feedforward, which
+  is a surge term.
