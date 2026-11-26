@@ -69,6 +69,13 @@ pub mod subject {
     /// reference, signed along the device's own positive axis. Registered on
     /// Keelson dev after 0.6.0-pre.19; well-known once the pin moves.
     pub const THRUST_NEWTON_SETPOINT: &str = "thrust_newton_setpoint";
+    /// keelson.TimestampedFloat, degrees [0, 360), the true heading the yaw
+    /// loop closes on (D-036). Registered on Keelson dev after 0.6.0-pre.19.
+    pub const HEADING_TRUE_NORTH_DEG_SETPOINT: &str = "heading_true_north_deg_setpoint";
+    /// keelson.TimestampedFloat, knots, the surge reference the speed loop
+    /// closes on, which equals SOG only with no sway (D-036). Registered on
+    /// Keelson dev after 0.6.0-pre.19.
+    pub const SPEED_OVER_GROUND_KNOTS_SETPOINT: &str = "speed_over_ground_knots_setpoint";
     /// keelson.EntityHealth.
     pub const ENTITY_HEALTH: &str = "entity_health";
     /// coxswain.SetpointMsg. Coxswain-specific; the stream doubles as the

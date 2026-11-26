@@ -9,8 +9,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::SystemTime;
 
 use coxswain_contract::{
-    ArmingState, ClaimantId, ConnState, EstimatorHealth, HealthLevel, Measurement, MeasurementKind,
-    Setpoint, VesselState,
+    ArmingState, ClaimantId, ConnState, EstimatorHealth, GuidanceReference, HealthLevel,
+    Measurement, MeasurementKind, Setpoint, VesselState,
 };
 use prost::Message;
 use zenoh::Wait;
@@ -91,7 +91,7 @@ pub struct PowerHealth {
 /// Keelson 0.6 §5.2: a static-capability source declares a subject token for
 /// each at session open, whether or not this vessel will ever produce it.
 /// Keep in step with the `put` calls below.
-const PUBLISHED_SUBJECTS: [&str; 14] = [
+const PUBLISHED_SUBJECTS: [&str; 16] = [
     subject::LOCATION_FIX,
     subject::HEADING_TRUE_NORTH_DEG,
     subject::YAW_RATE_DEGPS,
@@ -106,6 +106,8 @@ const PUBLISHED_SUBJECTS: [&str; 14] = [
     subject::ENTITY_HEALTH,
     subject::CONN_STATE,
     subject::MANIFEST,
+    subject::HEADING_TRUE_NORTH_DEG_SETPOINT,
+    subject::SPEED_OVER_GROUND_KNOTS_SETPOINT,
 ];
 
 pub struct VesselEndpoint {
@@ -240,6 +242,35 @@ impl VesselEndpoint {
             source_id,
             seal(t_wall, &heading),
         )
+    }
+
+    /// Guidance references in force (D-036), under `coxswain/guidance`. Call
+    /// every tick: a subject with no reference is skipped, so silence on it
+    /// means none is in force (Keelson's `_setpoint` rule); the subject
+    /// tokens stay up regardless.
+    pub fn publish_reference(
+        &self,
+        t_wall: SystemTime,
+        r: &GuidanceReference,
+    ) -> Result<(), Error> {
+        let source_id = keys::device_source_id("guidance");
+        if let Some(psi) = r.heading_rad {
+            let msg = timestamped_float(t_wall, heading_deg(psi));
+            self.put(
+                subject::HEADING_TRUE_NORTH_DEG_SETPOINT,
+                &source_id,
+                seal(t_wall, &msg),
+            )?;
+        }
+        if let Some(u) = r.surge_mps {
+            let msg = timestamped_float(t_wall, u * MPS_TO_KNOTS);
+            self.put(
+                subject::SPEED_OVER_GROUND_KNOTS_SETPOINT,
+                &source_id,
+                seal(t_wall, &msg),
+            )?;
+        }
+        Ok(())
     }
 
     /// Raw measurement pass-through. `t_wall` is the caller's wall-clock
