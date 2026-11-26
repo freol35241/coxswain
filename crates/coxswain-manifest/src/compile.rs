@@ -80,6 +80,12 @@ const FOSSEN_FIELDS: [&str; 8] = [
 #[derive(Debug, PartialEq)]
 pub enum ValidateError {
     UnsupportedSchemaVersion(u16),
+    /// `[manifest].keelson_base_path` would not make a well-formed key
+    /// prefix: empty, an empty or `@` chunk, or a zenoh special character
+    /// (D-038).
+    KeelsonBasePathInvalid {
+        base_path: String,
+    },
     UnknownBoard(String),
     PortNotOnProfile {
         owner: String,
@@ -318,6 +324,14 @@ pub enum ValidateError {
 impl std::fmt::Display for ValidateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::KeelsonBasePathInvalid { base_path } => {
+                write!(
+                    f,
+                    "manifest.keelson_base_path {base_path:?} is not a valid key prefix: \
+                     non-empty chunks separated by '/', none starting with '@', and none of \
+                     '*', '$', '?', '#'"
+                )
+            }
             Self::UnsupportedSchemaVersion(v) => {
                 write!(
                     f,
@@ -652,6 +666,17 @@ fn board_ports(board: &str) -> Result<Option<&'static [&'static str]>, ValidateE
         .find(|(name, _)| *name == board)
         .map(|(_, ports)| Some(*ports))
         .ok_or_else(|| ValidateError::UnknownBoard(board.to_string()))
+}
+
+/// Keelson's own default base path.
+const KEELSON_BASE_PATH_DEFAULT: &str = "keelson";
+
+/// Non-empty chunks, none a verbatim (`@`) chunk, no zenoh wildcard or
+/// reserved character.
+fn valid_base_path(base_path: &str) -> bool {
+    base_path.split('/').all(|chunk| {
+        !chunk.is_empty() && !chunk.starts_with('@') && !chunk.contains(['*', '$', '?', '#'])
+    })
 }
 
 fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
@@ -1048,10 +1073,21 @@ fn build(m: &ManifestToml) -> Result<CompiledManifest, ValidateError> {
     self_sufficiency(m, &bus_by_id)?;
 
     let rc = build_rc(m.rc.as_ref(), &bus_by_id, &claimant_ids)?;
+    let base_path = m
+        .manifest
+        .keelson_base_path
+        .as_deref()
+        .unwrap_or(KEELSON_BASE_PATH_DEFAULT);
+    if !valid_base_path(base_path) {
+        return Err(ValidateError::KeelsonBasePathInvalid {
+            base_path: base_path.to_string(),
+        });
+    }
 
     Ok(CompiledManifest {
         schema_version: m.manifest.schema_version,
         vessel_id: fx("manifest.vessel_id", &m.manifest.vessel_id)?,
+        keelson_base_path: fx("manifest.keelson_base_path", base_path)?,
         name: fx("manifest.name", &m.manifest.name)?,
         revision: m.manifest.revision,
         conn_node: ConnNodeEntry {

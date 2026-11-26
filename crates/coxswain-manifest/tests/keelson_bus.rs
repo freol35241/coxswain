@@ -7,7 +7,7 @@ use coxswain_manifest::{BusKind, CompileError, EffectorOutput, ValidateError};
 
 const SIL: &str = r#"
 [manifest]
-schema_version = 9
+schema_version = 10
 vessel_id      = "cx-sil-01"
 name           = "SIL Rig"
 revision       = 1
@@ -77,7 +77,7 @@ critical_voltage_v         = 11.8
 /// carries an enrichment sensor only, which does not touch the promise.
 const ENRICHMENT_ONLY: &str = r#"
 [manifest]
-schema_version = 9
+schema_version = 10
 vessel_id      = "cx-enrich-01"
 name           = "Enrichment Over Keelson"
 revision       = 1

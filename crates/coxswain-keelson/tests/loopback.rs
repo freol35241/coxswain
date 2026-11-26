@@ -69,6 +69,7 @@ fn claimant_grant_flow_and_streams() {
                     ConnEvent::Register(id)
                     | ConnEvent::RequestConn(id)
                     | ConnEvent::ReleaseConn(id)
+                    | ConnEvent::Unregister(id)
                     | ConnEvent::Arm(id)
                     | ConnEvent::Disarm(id) => {
                         let result = if id == ClaimantId(7) {
@@ -94,6 +95,7 @@ fn claimant_grant_flow_and_streams() {
     // Grant flow.
     assert_eq!(claimant.register().unwrap(), ConnReplyResult::Ok);
     assert_eq!(claimant.request_conn().unwrap(), ConnReplyResult::Ok);
+    assert_eq!(claimant.unregister().unwrap(), ConnReplyResult::Ok);
 
     // A refused result passes through untouched.
     let refused = ClaimantClient::new(session.clone(), "cox_test", "loopback", ClaimantId(9));

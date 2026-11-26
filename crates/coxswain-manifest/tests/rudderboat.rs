@@ -35,7 +35,7 @@ fn expect_invalid(source: &str) -> ValidateError {
 fn rudderboat_compiles_and_roundtrips() {
     let manifest = coxswain_manifest::compile(RUDDERBOAT).expect("rudderboat compiles");
     assert_eq!(manifest.vessel_id.as_str(), "se-rise-rudderboat-01");
-    assert_eq!(manifest.schema_version, 9);
+    assert_eq!(manifest.schema_version, 10);
     assert_eq!(manifest.buses.len(), 3);
     assert_eq!(manifest.sensors.len(), 2);
     assert_eq!(manifest.actuator_nodes.len(), 0);

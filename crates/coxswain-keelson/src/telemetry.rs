@@ -6,8 +6,8 @@
 use std::time::SystemTime;
 
 use coxswain_contract::{
-    ArmingState, ConnState, EstimatorHealth, GuidanceReference, HealthLevel, Measurement,
-    MeasurementKind, VesselState,
+    ArmingState, ClaimantId, ConnState, EstimatorHealth, GuidanceReference, HealthLevel,
+    Measurement, MeasurementKind, VesselState,
 };
 use zenoh::Wait;
 use zenoh::liveliness::LivelinessToken;
@@ -48,22 +48,33 @@ impl IoSource {
 }
 
 /// The supervisor's flags for the health telemetry: bus voltage below the
-/// low-voltage bound and the power report gone stale (D-024), a stop in
-/// force and a stop source gone silent (D-037). Bundled so `publish_health`
-/// stays within a sane argument count.
+/// low-voltage bound and the power report gone stale (D-024), the failsafe
+/// cause in force (D-038), and a stop source gone silent (D-037). Bundled so
+/// `publish_health` stays within a sane argument count.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SupervisorHealth {
     pub low_voltage: bool,
     pub power_stale: bool,
-    pub stopped: bool,
+    pub failsafe: pb::Failsafe,
     pub stop_silent: bool,
+}
+
+fn failsafe_detail(f: pb::Failsafe) -> &'static str {
+    match f {
+        pb::Failsafe::None => "none",
+        pb::Failsafe::Stop => "stop",
+        pb::Failsafe::CriticalVoltage => "critical_voltage",
+        pb::Failsafe::PositionDegraded => "position_degraded",
+        pb::Failsafe::GeofenceBreach => "geofence_breach",
+        pb::Failsafe::ClaimantLost => "claimant_lost",
+    }
 }
 
 /// Every subject this publisher can publish under the `coxswain` producer.
 /// Keelson 0.6 §5.2: a static-capability source declares a subject token for
 /// each at session open, whether or not this vessel will ever produce it.
 /// tests/conformance.rs checks it against what the `put` calls below reach.
-const PUBLISHED_SUBJECTS: [&str; 16] = [
+const PUBLISHED_SUBJECTS: [&str; 17] = [
     subject::LOCATION_FIX,
     subject::HEADING_TRUE_NORTH_DEG,
     subject::YAW_RATE_DEGPS,
@@ -77,6 +88,7 @@ const PUBLISHED_SUBJECTS: [&str; 16] = [
     subject::DEPTH_BELOW_TRANSDUCER_M,
     subject::ENTITY_HEALTH,
     subject::CONN_STATE,
+    subject::CONN_EVENT,
     subject::MANIFEST,
     subject::HEADING_TRUE_NORTH_DEG_SETPOINT,
     subject::SPEED_OVER_GROUND_KNOTS_SETPOINT,
@@ -425,9 +437,10 @@ impl TelemetryPublisher {
         let SupervisorHealth {
             low_voltage,
             power_stale,
-            stopped,
+            failsafe,
             stop_silent,
         } = flags;
+        let stopped = failsafe == pb::Failsafe::Stop;
         let estimator = keelson::SourceHealth {
             name: "estimator".to_string(),
             level: health_level(h.level) as i32,
@@ -513,6 +526,15 @@ impl TelemetryPublisher {
                             level: nominal,
                             detail: arming_detail.to_string(),
                         },
+                        keelson::CheckResult {
+                            name: "failsafe".to_string(),
+                            level: if failsafe == pb::Failsafe::None {
+                                nominal
+                            } else {
+                                degraded
+                            },
+                            detail: failsafe_detail(failsafe).to_string(),
+                        },
                     ],
                 },
                 power_subject,
@@ -580,6 +602,33 @@ impl TelemetryPublisher {
             sources,
         };
         self.put(subject::ENTITY_HEALTH, COXSWAIN, seal(t_wall, &msg))
+    }
+
+    /// Coxswain-specific `conn_event` subject (D-038): one per change of
+    /// holder, arming or failsafe cause.
+    pub fn publish_conn_event(
+        &self,
+        t_wall: SystemTime,
+        conn: &ConnState,
+        arming: ArmingState,
+        previous_holder: Option<ClaimantId>,
+        cause: pb::conn_event_msg::Cause,
+        failsafe: pb::Failsafe,
+    ) -> Result<(), Error> {
+        let (held, holder) = match *conn {
+            ConnState::Unheld => (false, 0),
+            ConnState::Held(id) => (true, u32::from(id.0)),
+        };
+        let msg = pb::ConnEventMsg {
+            held,
+            holder,
+            armed: arming == ArmingState::Armed,
+            had_holder: previous_holder.is_some(),
+            previous_holder: previous_holder.map_or(0, |id| u32::from(id.0)),
+            cause: cause as i32,
+            failsafe: failsafe as i32,
+        };
+        self.put(subject::CONN_EVENT, COXSWAIN, seal(t_wall, &msg))
     }
 
     /// Coxswain-specific `conn_state` subject.

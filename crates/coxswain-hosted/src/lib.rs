@@ -18,6 +18,9 @@ use coxswain_estimator::Estimator;
 use coxswain_guidance::Guidance;
 use coxswain_supervisor::{MAX_CLAIMANTS, Supervisor};
 
+mod conn_watch;
+
+pub use conn_watch::{ConnCause, ConnChange, ConnWatch, Trigger};
 pub use coxswain_estimator::Rejection;
 pub use coxswain_supervisor::{ArmError, ClaimError, Directive, FailsafeCause};
 
@@ -104,6 +107,25 @@ impl Core {
 
     pub fn heartbeat(&mut self, id: ClaimantId, now: Timestamp) -> Result<(), ClaimError> {
         self.supervisor.heartbeat(id, now)
+    }
+
+    /// Frees the claimant's registry slot and its staged setpoint (D-038).
+    pub fn unregister(&mut self, id: ClaimantId) -> Result<(), ClaimError> {
+        self.supervisor.unregister(id)?;
+        for slot in &mut self.setpoints {
+            if matches!(slot, Some((c, _)) if *c == id) {
+                *slot = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn conn(&self) -> ConnState {
+        self.supervisor.conn()
+    }
+
+    pub fn arming(&self) -> ArmingState {
+        self.supervisor.arming()
     }
 
     pub fn arm(&mut self, id: ClaimantId) -> Result<(), ArmError> {

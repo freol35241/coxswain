@@ -32,6 +32,7 @@ pub enum ConnEvent {
     Register(ClaimantId),
     RequestConn(ClaimantId),
     ReleaseConn(ClaimantId),
+    Unregister(ClaimantId),
     Arm(ClaimantId),
     Disarm(ClaimantId),
     Setpoint(ClaimantId, Setpoint),
@@ -57,7 +58,7 @@ pub struct CommandServer {
 
 impl CommandServer {
     /// Declares queryables for
-    /// `@rpc/{conn_register,conn_request,conn_release,vehicle_arm,vehicle_disarm}/coxswain`
+    /// `@rpc/{conn_register,conn_request,conn_release,conn_unregister,vehicle_arm,vehicle_disarm}/coxswain`
     /// and a subscriber on `pubsub/setpoint/*`, then the source-level token
     /// for the `coxswain` producer, last, so presence implies the server can
     /// already receive (Keelson 0.6 §5). The telemetry publisher declares the
@@ -68,10 +69,11 @@ impl CommandServer {
         let (tx, events) = mpsc::channel();
 
         type EventFn = fn(ClaimantId) -> ConnEvent;
-        let procedures: [(&str, EventFn); 5] = [
+        let procedures: [(&str, EventFn); 6] = [
             ("conn_register", ConnEvent::Register),
             ("conn_request", ConnEvent::RequestConn),
             ("conn_release", ConnEvent::ReleaseConn),
+            ("conn_unregister", ConnEvent::Unregister),
             ("vehicle_arm", ConnEvent::Arm),
             ("vehicle_disarm", ConnEvent::Disarm),
         ];

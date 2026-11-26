@@ -46,7 +46,7 @@ fn example_compiles_and_roundtrips() {
     assert_eq!(manifest.vessel_id.as_str(), "example-vessel-01");
     assert_eq!(manifest.name.as_str(), "Example");
     assert_eq!(manifest.revision, 7);
-    assert_eq!(manifest.schema_version, 9);
+    assert_eq!(manifest.schema_version, 10);
     assert_eq!(manifest.buses.len(), 6);
     assert_eq!(manifest.sensors.len(), 7);
     assert_eq!(manifest.actuator_nodes.len(), 3);
@@ -466,15 +466,59 @@ fn rejects_inner_loop_on_udp_bus_outside_conn_segment() {
     ));
 }
 
-// Rule 10: schema_version must be 9. A prior-version manifest (schema_version
-// 8) is rejected outright now, same doctrine as every prior bump.
+// Rule 10: schema_version must be 10. A prior-version manifest (schema_version
+// 9) is rejected outright now, same doctrine as every prior bump.
 #[test]
 fn rejects_unknown_schema_version() {
-    let src = patched("schema_version = 9", "schema_version = 8");
+    let src = patched("schema_version = 10", "schema_version = 9");
     assert_eq!(
         expect_invalid(&src),
-        ValidateError::UnsupportedSchemaVersion(8)
+        ValidateError::UnsupportedSchemaVersion(9)
     );
+}
+
+// The Keelson base path defaults to Keelson's own (D-038).
+#[test]
+fn keelson_base_path_defaults_to_keelson() {
+    let manifest = coxswain_manifest::compile(EXAMPLE).unwrap();
+    assert_eq!(manifest.keelson_base_path.as_str(), "keelson");
+}
+
+#[test]
+fn keelson_base_path_is_compiled() {
+    let src = patched(
+        "vessel_id      = \"example-vessel-01\"",
+        "vessel_id      = \"example-vessel-01\"\nkeelson_base_path = \"rise/fleet\"",
+    );
+    let manifest = coxswain_manifest::compile(&src).unwrap();
+    assert_eq!(manifest.keelson_base_path.as_str(), "rise/fleet");
+}
+
+#[test]
+fn rejects_malformed_keelson_base_path() {
+    for bad in [
+        "",
+        "rise/",
+        "/rise",
+        "rise//fleet",
+        "@v0",
+        "rise/*",
+        "a$b",
+        "a?b",
+        "a#b",
+    ] {
+        let src = patched(
+            "vessel_id      = \"example-vessel-01\"",
+            &format!("vessel_id      = \"example-vessel-01\"\nkeelson_base_path = {bad:?}"),
+        );
+        assert_eq!(
+            expect_invalid(&src),
+            ValidateError::KeelsonBasePathInvalid {
+                base_path: bad.to_string()
+            },
+            "{bad:?}"
+        );
+    }
 }
 
 // ------------------------------------------------------------- tampering
@@ -552,10 +596,10 @@ fn wrong_magic_is_rejected() {
 #[test]
 fn wrong_header_version_is_rejected() {
     let mut blob = example_blob();
-    blob[4] = 10;
+    blob[4] = 11;
     assert_eq!(
         coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed())),
-        Err(ReadError::BadVersion(10))
+        Err(ReadError::BadVersion(11))
     );
 }
 

@@ -25,12 +25,13 @@ use serde::{Deserialize, Serialize};
 /// declared `[conn_node] self_sufficient` promise (D-034); unlike the earlier
 /// bumps this one also changes the blob layout. Bumped 8 -> 9 for the RC
 /// kill as a declared stop source with its required `stop_on_silence`, and
-/// the RC claimant moved to an optional `[rc.claimant]` (D-037). Otherwise the bump is forced
+/// the RC claimant moved to an optional `[rc.claimant]` (D-037). Bumped 9 -> 10
+/// for `[manifest] keelson_base_path` (D-038). Otherwise the bump is forced
 /// by the authored shape so a v(n) reader
 /// rejects a v(n+1) manifest and vice versa. Deliberate: pre-release, so old
 /// readers simply reject new blobs and new readers reject old ones, no
 /// migration path needed.
-pub const SCHEMA_VERSION: u16 = 9;
+pub const SCHEMA_VERSION: u16 = 10;
 
 /// Fixed-capacity UTF-8 string, zero-padded. Exists so the blob needs no
 /// allocator; 32 bytes fits every identifier the schema doc uses.
@@ -373,6 +374,9 @@ pub struct ConnNodeEntry {
 pub struct CompiledManifest {
     pub schema_version: u16,
     pub vessel_id: FixedStr32,
+    /// The Keelson base path; with `vessel_id` as the entity, the vessel's
+    /// key prefix (D-038).
+    pub keelson_base_path: FixedStr32,
     pub name: FixedStr32,
     /// Monotonically increasing per vessel.
     pub revision: u32,

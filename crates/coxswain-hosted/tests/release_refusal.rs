@@ -15,7 +15,7 @@ const SEED: &[u8] = include_bytes!("../../coxswain-manifest/tests/test_key.seed"
 
 const SIL_MANIFEST: &str = r#"
 [manifest]
-schema_version = 9
+schema_version = 10
 vessel_id      = "cx-refusal-01"
 name           = "Release Refusal"
 revision       = 1

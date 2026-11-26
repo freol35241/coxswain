@@ -18,12 +18,16 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use coxswain_contract::{ClaimantId, GeoPoint, Setpoint};
-use coxswain_keelson::{ClaimantClient, ConnReplyResult, Observer, StateUpdate};
+use coxswain_contract::{ClaimantId, ConnState, GeoPoint, Setpoint};
+use coxswain_keelson::{
+    ClaimantClient, ConnEventCause, ConnReplyResult, Failsafe, Observer, StateUpdate,
+};
 use coxswain_model::LocalFrame;
 use zenoh::Wait;
 
-const BASE_PATH: &str = "keelson";
+/// Not Keelson's default, so every test here also checks that the manifest's
+/// `keelson_base_path` reaches the keys (D-038).
+const BASE_PATH: &str = "cox_it/fleet";
 const VESSEL_ID: &str = "example-vessel-01";
 const CLAIMANT: ClaimantId = ClaimantId(7);
 
@@ -118,6 +122,12 @@ fn build_blob() -> (Vec<u8>, String) {
     let anchor = "enabled = true";
     assert!(EXAMPLE.contains(anchor), "geofence anchor moved");
     let source = EXAMPLE.replace(anchor, "enabled = false");
+    let id_line = "vessel_id      = \"example-vessel-01\"";
+    assert!(source.contains(id_line), "vessel_id anchor moved");
+    let source = source.replace(
+        id_line,
+        &format!("{id_line}\nkeelson_base_path = \"{BASE_PATH}\""),
+    );
     assert!(source.contains("conn_grant_default      = \"none\""));
     let manifest = coxswain_manifest::compile(&source).expect("patched example compiles");
     let seed: [u8; 32] = SEED.try_into().expect("seed file is 32 bytes");
@@ -480,6 +490,50 @@ fn grant_revoke_failsafe_end_to_end() {
 /// Fused state goes out under the `coxswain` producer, as
 /// `coxswain/estimator`, so a Keelson consumer can attribute it to the
 /// producer whose liveliness tokens the vessel declares.
+/// Conn changes arrive as events with their cause, and an unregistering
+/// holder releases the conn and frees its slot (D-038).
+#[test]
+fn conn_events_and_unregister_end_to_end() {
+    let h = Harness::spawn("events");
+    let mut observer = Observer::new(h.client_session(), BASE_PATH, VESSEL_ID);
+    let events = observer.subscribe_conn_events().unwrap();
+    let (claimant, pump) = bring_up(&h);
+
+    let next = |what: &str| {
+        events
+            .recv_timeout(BRING_UP)
+            .unwrap_or_else(|_| panic!("no conn_event: {what}"))
+    };
+    // bring_up may re-request while the estimator initializes, so skip to
+    // the arming.
+    let armed = loop {
+        let e = next("armed");
+        if e.cause == ConnEventCause::Armed {
+            break e;
+        }
+    };
+    assert_eq!(armed.conn, ConnState::Held(CLAIMANT));
+    assert!(armed.armed);
+
+    assert_eq!(
+        rpc("unregister", || claimant.unregister()),
+        ConnReplyResult::Ok
+    );
+    pump.pause();
+    let gone = next("unregistered");
+    assert_eq!(gone.cause, ConnEventCause::Unregistered);
+    assert_eq!(gone.conn, ConnState::Unheld);
+    assert_eq!(gone.previous_holder, Some(CLAIMANT));
+    // Released while armed: the vessel holds station on its own authority.
+    let lost = next("claimant-lost failsafe");
+    assert_eq!(
+        (lost.cause, lost.failsafe),
+        (ConnEventCause::Failsafe, Failsafe::ClaimantLost)
+    );
+    // The slot is free: the same id can register again.
+    assert_eq!(rpc("register", || claimant.register()), ConnReplyResult::Ok);
+}
+
 #[test]
 fn fused_state_is_published_under_the_coxswain_producer() {
     let h = Harness::spawn("fused_source");

@@ -96,14 +96,26 @@ pub fn open_links(
         if sensors.is_empty() && effectors.is_empty() {
             continue;
         }
-        let input = KeelsonBusInput::new(session, "keelson", entity, sensors, std_defaults(), boot)
-            .map_err(|e| format!("keelson bus {bus_id:?}: {e}"))?;
+        let input = KeelsonBusInput::new(
+            session,
+            manifest.keelson_base_path.as_str(),
+            entity,
+            sensors,
+            std_defaults(),
+            boot,
+        )
+        .map_err(|e| format!("keelson bus {bus_id:?}: {e}"))?;
         let output = if effectors.is_empty() {
             None
         } else {
             Some(
-                KeelsonBusOutput::new(session, "keelson", entity, effectors)
-                    .map_err(|e| format!("keelson bus {bus_id:?}: {e}"))?,
+                KeelsonBusOutput::new(
+                    session,
+                    manifest.keelson_base_path.as_str(),
+                    entity,
+                    effectors,
+                )
+                .map_err(|e| format!("keelson bus {bus_id:?}: {e}"))?,
             )
         };
         links.push(KeelsonBusLink {
