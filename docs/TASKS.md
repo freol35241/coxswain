@@ -222,9 +222,12 @@ this before freezing far-end firmware.
 - [ ] Propose upstream to Keelson: `yaw_rate_accuracy_degps`,
       `speed_over_ground_accuracy_knots`, `course_over_ground_accuracy_deg`,
       `rudder_angle_setpoint_deg`, `thrust_setpoint_newton` (D-034).
-- [ ] D-035 code split, once accepted: telemetry publisher and conn server
-      from `VesselEndpoint`, an observer client beside `ClaimantClient`;
-      conn RPC keys to Keelson 0.6's interface/version shape.
+- [ ] D-035 code split: telemetry publisher and command server from
+      `VesselEndpoint`, opened separately; an observer client beside
+      `ClaimantClient`; conformance tests against the vendored Keelson protos.
+- [ ] Serve Keelson's conn interface once Keelson merges one (#399), with its
+      RPC keys; `vehicle_navigation/v1` and `vehicle_lifecycle/v1` as the
+      calling station's claimant operations (D-035).
 - [ ] `coxswain-manifest` subcommand deriving a SIL manifest from a vessel
       manifest, if hand-kept variants turn out to drift (D-034).
 

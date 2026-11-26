@@ -720,7 +720,7 @@ to exercise the drivers, deferred with no current case.
 
 ## D-035: Coxswain owns its conn; the Keelson adapter implements Keelson's interfaces
 
-Status: proposed. Rewritten after keelson #399, which proposes adopting
+Status: accepted. Rewritten after keelson #399, which proposes adopting
 Coxswain's conn design as Keelson's `conn/v1`; the first draft composed the
 supervisor with Keelson's `command_authority` lease, which #399 supersedes.
 
