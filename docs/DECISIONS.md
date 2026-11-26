@@ -787,6 +787,42 @@ beside `ClaimantClient` and cannot register or claim; the adapter gets
 conformance tests against the vendored Keelson protos. Serving a Keelson conn
 interface waits for Keelson to merge one.
 
+## D-036: The vessel publishes its guidance references as Keelson setpoints
+
+Status: accepted. Keelson's `<measurement>_setpoint` rule (keelson #316, dev
+after 0.6.0-pre.19) has the executor, the controller holding a reference,
+publish it, republished while in force and silent when none is. On a Coxswain
+vessel that executor is guidance.
+
+Guidance records the reference it closes on each tick and exposes it through a
+getter: an optional heading and an optional speed, in a small type in
+`coxswain-contract`, so guidance stays no_std and `tick` keeps its signature.
+`Core` carries it in `TickOutput`, empty when disarmed or without a state
+estimate. The adapter publishes it at the tick rate under source id `guidance`:
+
+- `heading_true_north_deg_setpoint`: the heading the yaw loop closes on, in
+  every mode that has one. HeadingSpeed's commanded heading, the near zone's
+  hold heading, the far zone's and reapproach's bearing to the target, and the
+  LOS course in FollowPath. LOS commands a course but the loop closes on
+  heading with crab unmodelled, so the heading subject is the true statement;
+  `course_over_ground_deg_setpoint` would claim a loop that is not closed.
+- `speed_over_ground_knots_setpoint`: the surge reference, where there is one
+  (HeadingSpeed, FollowPath, the approach legs). The loop closes on body surge
+  over ground (the EKF's `u`, GNSS-referenced, no current estimated). SOG
+  equals surge only with no sway, so in a crab the published value understates
+  the SOG the vessel is making. Keelson has no surge subject and STW would be
+  wrong outright (no water-relative speed exists), so SOG is the nearest
+  honest subject and its limit is stated here.
+
+What is in force is the supervisor's directive, not the claimant's setpoint: a
+failsafe or geofence station-keep publishes its own references. Idle,
+DirectEffort, the drift regime, and the near zone's speed have no reference and
+publish nothing on that subject. The subject liveliness tokens stay up
+throughout (Keelson 0.6 §5.2). No yaw-rate setpoint: the heading PD has no
+explicit rate reference. Both subjects are registered on Keelson dev but not
+at the pinned 0.6.0-pre.19, so they are coxswain-specific until the pin moves,
+like `thrust_newton_setpoint` (D-034).
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest
@@ -797,3 +833,8 @@ interface waits for Keelson to merge one.
   serves that interface's keys (D-035). Until then no RPC interface
   liveliness token is declared, since that key is defined by interface and
   version.
+- Closing the speed loop on SOG rather than surge over ground, for reasons
+  beyond telemetry (D-036): whether it serves path and transit speed tracking
+  better, how it behaves near zero speed and in station keeping, where SOG's
+  direction is ill-defined, and what it does to the Fossen feedforward, which
+  is a surge term.
