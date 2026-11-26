@@ -662,8 +662,12 @@ Missing from Keelson, coxswain-specific subjects until upstream has them, in the
 existing `depth_below_transducer_m` manner, then retired:
 `yaw_rate_accuracy_degps`, `speed_over_ground_accuracy_knots`,
 `course_over_ground_accuracy_deg` (following `heading_accuracy_deg`), and
-commanded actuator values, `rudder_angle_setpoint_deg` and
-`thrust_setpoint_newton`. Keelson's `rudder_angle_deg` means the actual angle
+commanded actuator values, `rudder_angle_deg_setpoint` and
+`thrust_newton_setpoint` (first named `rudder_angle_setpoint_deg` and
+`thrust_setpoint_newton`, renamed to Keelson's `<measurement>_setpoint` rule
+once keelson #316 merged; Keelson dev registers the thrust one, and outputs
+already republish every tick as that rule asks of an executor). Keelson's
+`rudder_angle_deg` means the actual angle
 and `force_newton` is a general force vector; publishing commands on them would
 collide with a simulator's or a later actuator's reported state. The mapping is
 confirmed against Keelson 0.6.0-pre.19, which also vendors `LocationFixQuality`;

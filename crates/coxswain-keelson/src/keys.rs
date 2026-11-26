@@ -60,14 +60,15 @@ pub mod subject {
     pub const SPEED_OVER_GROUND_ACCURACY_KNOTS: &str = "speed_over_ground_accuracy_knots";
     /// keelson.TimestampedFloat, degrees, 1-sigma. Coxswain-specific (D-034).
     pub const COURSE_OVER_GROUND_ACCURACY_DEG: &str = "course_over_ground_accuracy_deg";
-    /// keelson.TimestampedFloat, degrees, commanded. Coxswain-specific
-    /// (D-034): Keelson's `rudder_angle_deg` is the actual angle, and a
-    /// command on it would collide with a reported one.
-    pub const RUDDER_ANGLE_SETPOINT_DEG: &str = "rudder_angle_setpoint_deg";
-    /// keelson.TimestampedFloat, newtons, commanded. Coxswain-specific
-    /// (D-034): Keelson has no thrust subject; `force_newton` is a general
-    /// force vector.
-    pub const THRUST_SETPOINT_NEWTON: &str = "thrust_setpoint_newton";
+    /// keelson.TimestampedFloat, degrees, the rudder angle in force as the
+    /// rudder's reference. Named by Keelson's `<measurement>_setpoint` rule
+    /// (dev, after 0.6.0-pre.19, §2.2) but not yet registered there, so
+    /// coxswain-specific until it is (D-034).
+    pub const RUDDER_ANGLE_DEG_SETPOINT: &str = "rudder_angle_deg_setpoint";
+    /// keelson.TimestampedFloat, newtons, the thrust in force as the device's
+    /// reference, signed along the device's own positive axis. Registered on
+    /// Keelson dev after 0.6.0-pre.19; well-known once the pin moves.
+    pub const THRUST_NEWTON_SETPOINT: &str = "thrust_newton_setpoint";
     /// keelson.EntityHealth.
     pub const ENTITY_HEALTH: &str = "entity_health";
     /// coxswain.SetpointMsg. Coxswain-specific; the stream doubles as the
