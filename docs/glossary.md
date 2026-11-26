@@ -59,8 +59,10 @@ in DECISIONS.md; this file only fixes the vocabulary.
 
 Three different things share the name:
 
-- **Keelson adapter.** `coxswain-keelson`: Coxswain's external interface. It
-  publishes telemetry and serves the claimant protocol.
+- **Keelson adapter.** `coxswain-keelson`: Coxswain's external interface; what
+  Keelson calls a connector. It publishes telemetry and serves the claimant
+  protocol, implementing Keelson's standard interfaces and translating to the
+  contract crate, representation only, never authority (D-035).
 - **Keelson bus.** The `keelson` bus kind (D-034): sensors and effectors carried
   over zenoh. External by path class.
 - **Keelson messages.** The wire format: subjects, payloads, keyspace. Pinned to
