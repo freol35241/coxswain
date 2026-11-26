@@ -718,49 +718,78 @@ would come in), deferred until a test needs it; proposing the missing subjects
 upstream to Keelson; and whether a raw-sentence injection mode is worth adding
 to exercise the drivers, deferred with no current case.
 
-## D-035: Claimants and telemetry receivers are separate interfaces; relation to Keelson command authority
+## D-035: Coxswain owns its conn; the Keelson adapter implements Keelson's interfaces
 
-Status: proposed. Today one type serves both roles on each side. On the vessel,
-`VesselEndpoint` publishes telemetry and serves the conn RPCs and the setpoint
-subscriber. On the client, `ClaimantClient` is also the only way to observe
-state and health, so watching the vessel means holding a claimant's interface.
+Status: accepted. Rewritten after keelson #399, which proposes adopting
+Coxswain's conn design as Keelson's `conn/v1`; the first draft composed the
+supervisor with Keelson's `command_authority` lease, which #399 supersedes.
 
-The roles differ in kind. A claimant can move the vessel; a telemetry receiver
-cannot. Losing a claimant is a supervisor event (heartbeat loss, failsafe);
-losing a receiver changes nothing. A deployment should be able to offer
-telemetry without offering command, and the reverse, and a consumer should be
-able to observe without anything that can register or claim. So: two
-interfaces. The telemetry interface publishes and takes no input. The command
-interface serves the claimant protocol (register, request, arm, setpoints) and
-is the only path by which anything above the conn node affects actuation, as
-invariant 2 already requires. Vocabulary per docs/glossary.md.
+The conn's semantics are Coxswain's: the supervisor's rules and the contract
+crate's types (`ClaimantId`, `Setpoint`, `ConnState`, `ArmingState`, and the
+claim and arm results). They change only by Coxswain's own decisions. Coxswain
+defines no external wire protocol of its own for them. The Keelson adapter
+implements Keelson's standard interfaces as they stand at the pinned Keelson
+version and translates to and from the contract crate, which invariant 3 and
+D-003 already require of every external interface. Keelson is free to
+standardize whatever it decides; when it changes, only the adapter changes, and
+only when Coxswain moves its pin. The split follows one rule: share vocabulary,
+own contracts. Keelson owns the bus conventions (key shapes, liveliness,
+envelope, naming; D-008 gives it keyspace governance) and the well-known
+subjects, and Coxswain follows them. Coxswain owns its authority semantics.
+Owning one wire format jointly would tie Coxswain's development pace to
+Keelson's.
 
-Keelson 0.6 (`protocols/command_authority.yaml`, 0.6.0-pre.19) defines a
-cooperative single-writer lease among remote stations: holder, claimant, and
-observer roles, no arbiter, no seizure, enforcement left to deployment policy.
-It names "the vessel's own veto on accepting remote control"
-`operational_authority`. The two compose without conflict: the lease decides
-which station above may try, the supervisor decides whether that station's
-claimant gets the conn. The supervisor is the vessel's `operational_authority`.
-It does not read the lease as authority; a lease holder still registers and
-claims like any other claimant, and manifest-declared preemption (D-025)
-applies regardless of who holds the lease. Whether Coxswain publishes
-`operational_authority` or observes the lease is left open; neither changes the
-rule above.
+Translation rules for the adapter:
 
-Code consequence, deferred to its own task once accepted: `VesselEndpoint`
-splits into a telemetry publisher and a conn server, each opened separately, and
-an observer client stands beside `ClaimantClient` that can subscribe but cannot
-register or claim. No wire change is implied; the keys already separate the
-two (pubsub telemetry versus the conn RPCs and the setpoint stream).
+- Representation, never authority. It converts formats. It never grants,
+  holds, renews, or keeps the conn alive on anyone's behalf (invariant 2). An
+  interface whose semantics the supervisor does not have, such as a lease
+  handed to a named station or a command that should outlive its sender, is
+  refused, not emulated.
+- Served whole. An interface the adapter serves answers every procedure
+  (Keelson's full-interface rule); one with no internal counterpart replies
+  with a typed unsupported result, never silence.
+- Internal-only state, such as `self_sufficient`, `io_source`, and failsafe
+  causes, goes on coxswain-specific subjects or is proposed upstream. Losing
+  detail outbound is acceptable for telemetry, never for authority.
+- Interfaces that act on the vessel are served as the calling station's own
+  claimant operations. A `vehicle_navigation/v1` target becomes that station's
+  setpoint (`StationKeep` or `FollowPath`); `vehicle_lifecycle/v1` arm and
+  disarm become the supervisor's `arm` and `disarm` for its claimant. The
+  supervisor's rules apply unchanged: only the holder may set a setpoint, arm
+  or disarm, and anything else gets a typed refusal. The station keeps its
+  own heartbeat. When it goes silent the conn lapses as for any claimant;
+  the adapter never holds a target on its behalf. A call that cannot be
+  attributed to a registered claimant is refused.
+
+Command and telemetry are separate interfaces in the adapter. A claimant can
+move the vessel and a telemetry receiver cannot; losing a claimant is a
+supervisor event (heartbeat loss, failsafe) and losing a receiver changes
+nothing. A deployment can offer telemetry without command and the reverse, and
+a consumer can observe without anything that can register or claim. The command
+interface is the only path by which anything above the conn node affects
+actuation. Vocabulary per docs/glossary.md.
+
+Whatever Keelson settles for authority among stations (the `command_authority`
+lease, a roles stack, or `conn/v1`), the supervisor stays the only arbiter
+onboard. An external lease or role decides which station above may try, never
+whether its claimant gets the conn, and manifest-declared preemption (D-025)
+applies regardless. Until Keelson settles, the adapter keeps serving the
+current protocol (`coxswain_conn.proto`, the pre-0.6 RPC key shape).
+
+Code consequence, once accepted: `VesselEndpoint` splits into a telemetry
+publisher and a command server, opened separately; an observer client stands
+beside `ClaimantClient` and cannot register or claim; the adapter gets
+conformance tests against the vendored Keelson protos. Serving a Keelson conn
+interface waits for Keelson to merge one.
 
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest
   (deferred to the estimator per D-022)
 - Dual-antenna GNSS heading (sensor pairing concept in the schema)
-- Conn RPC keys predate Keelson 0.6's `@rpc/{interface}/{version}/...` shape
-  and stay as they are until the D-035 command-interface split, which also
-  decides whether arm and disarm move to Keelson's `vehicle_lifecycle/v1`.
-  Until then no RPC interface liveliness token is declared, since that key is
-  defined by interface and version.
+- Conn RPC keys predate Keelson 0.6's `@rpc/{interface}/{version}/...` shape.
+  They stay until Keelson standardizes a conn interface; the adapter then
+  serves that interface's keys (D-035). Until then no RPC interface
+  liveliness token is declared, since that key is defined by interface and
+  version.
