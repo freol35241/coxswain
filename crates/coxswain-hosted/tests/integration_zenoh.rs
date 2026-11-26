@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use coxswain_contract::{ClaimantId, GeoPoint, Setpoint};
-use coxswain_keelson::{ClaimantClient, ConnReplyResult, StateUpdate};
+use coxswain_keelson::{ClaimantClient, ConnReplyResult, Observer, StateUpdate};
 use coxswain_model::LocalFrame;
 use zenoh::Wait;
 
@@ -483,7 +483,7 @@ fn grant_revoke_failsafe_end_to_end() {
 #[test]
 fn fused_state_is_published_under_the_coxswain_producer() {
     let h = Harness::spawn("fused_source");
-    let mut observer = ClaimantClient::new(h.client_session(), BASE_PATH, VESSEL_ID, ClaimantId(8));
+    let mut observer = Observer::new(h.client_session(), BASE_PATH, VESSEL_ID);
     let rx = observer.subscribe_state().unwrap();
     let deadline = Instant::now() + BRING_UP;
     let (mut position, mut heading) = (false, false);

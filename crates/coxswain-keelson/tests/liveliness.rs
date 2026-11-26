@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use coxswain_contract::{ClaimantId, Setpoint};
-use coxswain_keelson::{ClaimantClient, VesselEndpoint};
+use coxswain_keelson::{ClaimantClient, CommandServer, TelemetryPublisher};
 use zenoh::Wait;
 
 const BASE_PATH: &str = "cox_test";
@@ -43,7 +43,8 @@ fn live_tokens(session: &zenoh::Session) -> Vec<String> {
 #[test]
 fn vessel_and_claimant_advertise_per_keelson_0_6() {
     let session = isolated_session();
-    let _vessel = VesselEndpoint::new(session.clone(), BASE_PATH, ENTITY).unwrap();
+    let _telemetry = TelemetryPublisher::new(&session, BASE_PATH, ENTITY).unwrap();
+    let _command = CommandServer::new(&session, BASE_PATH, ENTITY).unwrap();
     let prefix = format!("{BASE_PATH}/@v0/{ENTITY}");
 
     let tokens = live_tokens(&session);

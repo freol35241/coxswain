@@ -1,4 +1,4 @@
-//! Unit coverage for `VesselEndpoint::publish_n2k`'s PGN-to-subject mapping
+//! Unit coverage for `TelemetryPublisher::publish_n2k`'s PGN-to-subject mapping
 //! (D-011 enrichment publish path): loopback session, no router, same
 //! pattern as loopback.rs's claimant test. Covers the routing/unit-
 //! conversion logic in isolation; coxswain-hosted has its own unit tests for
@@ -9,7 +9,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
-use coxswain_keelson::VesselEndpoint;
+use coxswain_keelson::TelemetryPublisher;
 use coxswain_keelson::keys::{self, subject};
 use coxswain_keelson::proto::{core::Envelope, foxglove, keelson};
 use coxswain_n2k::{
@@ -83,7 +83,7 @@ fn assert_nothing_published(rx: &mpsc::Receiver<keelson::TimestampedFloat>, subj
 }
 
 fn publish(session: &zenoh::Session, message: &Message) {
-    let vessel = VesselEndpoint::new(session.clone(), BASE_PATH, ENTITY).unwrap();
+    let vessel = TelemetryPublisher::new(session, BASE_PATH, ENTITY).unwrap();
     vessel
         .publish_n2k(SystemTime::now(), message, SOURCE)
         .unwrap();

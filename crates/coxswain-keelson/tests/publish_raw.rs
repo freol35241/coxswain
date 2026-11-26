@@ -1,4 +1,4 @@
-//! Unit coverage for `VesselEndpoint::publish_raw`'s three new
+//! Unit coverage for `TelemetryPublisher::publish_raw`'s three new
 //! `MeasurementKind` variants (SOG/COG fusion and covariance/RTK intake):
 //! loopback session, no router, same pattern as n2k_publish.rs's raw
 //! pub/sub checks (deliberately duplicated small helper set rather than
@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use coxswain_contract::{
     GeoPoint, GnssFixMode, GuidanceReference, Measurement, MeasurementKind, SensorId, Timestamp,
 };
-use coxswain_keelson::VesselEndpoint;
+use coxswain_keelson::TelemetryPublisher;
 use coxswain_keelson::keys::{self, subject};
 use coxswain_keelson::proto::{core::Envelope, foxglove, keelson};
 use prost::Message as _;
@@ -60,7 +60,7 @@ fn subscribe<T: prost::Message + Default + Send + 'static>(
 }
 
 fn publish(session: &zenoh::Session, m: &Measurement) {
-    let vessel = VesselEndpoint::new(session.clone(), BASE_PATH, ENTITY).unwrap();
+    let vessel = TelemetryPublisher::new(session, BASE_PATH, ENTITY).unwrap();
     vessel.publish_raw(SystemTime::now(), m, SOURCE).unwrap();
 }
 
@@ -170,7 +170,7 @@ fn reference_publishes_heading_and_skips_an_absent_speed() {
     let (_h, heading) = sub_on(subject::HEADING_TRUE_NORTH_DEG_SETPOINT);
     let (_s, speed) = sub_on(subject::SPEED_OVER_GROUND_KNOTS_SETPOINT);
 
-    let vessel = VesselEndpoint::new(session.clone(), BASE_PATH, ENTITY).unwrap();
+    let vessel = TelemetryPublisher::new(&session, BASE_PATH, ENTITY).unwrap();
     let near_zone = GuidanceReference {
         heading_rad: Some(-core::f64::consts::FRAC_PI_2),
         surge_mps: None,
