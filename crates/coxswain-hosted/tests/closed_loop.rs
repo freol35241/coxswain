@@ -326,6 +326,7 @@ fn reference_only_while_armed() {
         GuidanceReference {
             heading_rad: Some(0.0),
             surge_mps: Some(1.5),
+            yaw_rate_radps: None,
         }
     );
     h.core.disarm(TELEOP).unwrap();

@@ -17,7 +17,7 @@ use core::f64::consts::PI;
 
 use coxswain_contract::{
     ActuationCapability, ForceDemand, GeoPoint, GuidanceReference, ModelParams, Setpoint,
-    VesselConfig, VesselState,
+    Timestamp, VesselConfig, VesselState,
 };
 use coxswain_model::LocalFrame;
 
@@ -34,6 +34,15 @@ const MAX_YAW_NM: f64 = 150.0;
 /// damping.
 const WN_PSI_RADPS: f64 = 0.5;
 const ZETA_PSI: f64 = 1.0;
+
+/// A turn order's heading reference leads the heading by at most the error
+/// at which the yaw demand saturates, and never by a quarter turn or more:
+/// past half a turn the wrapped error flips sign (D-039).
+const MAX_TURN_LEAD_RAD: f64 = PI / 2.0;
+/// A previous tick's heading reference older than this is stale (guidance
+/// did not run, as while disarmed); a turn order then starts from the
+/// heading.
+const REFERENCE_GAP_S: f64 = 1.0;
 
 /// Surge speed-error time constant when Fossen coefficients are available.
 const TAU_U_S: f64 = 2.0;
@@ -109,6 +118,11 @@ pub struct Guidance {
     seg: usize,
     /// Station-keeping near zone: heading captured on zone entry and held.
     hold_heading: Option<f64>,
+    /// When guidance last ran, so a turn order can continue from the
+    /// heading reference of that tick.
+    last_tick: Option<Timestamp>,
+    /// How far a turn order's reference may lead the heading.
+    max_turn_lead_rad: f64,
     /// Drift-and-reapproach regime for a hull without sway authority: true
     /// once inside DRIFT_RADIUS_M, false once outside REAPPROACH_RADIUS_M,
     /// unchanged between the two (hysteresis).
@@ -151,12 +165,19 @@ impl Guidance {
                 ff_u: 0.0,
             },
         };
+        let saturating_error = if gains.kp_psi > 0.0 {
+            MAX_YAW_NM / gains.kp_psi
+        } else {
+            MAX_TURN_LEAD_RAD
+        };
         Self {
             gains,
             capability,
             last: None,
             seg: 0,
             hold_heading: None,
+            last_tick: None,
+            max_turn_lead_rad: saturating_error.min(MAX_TURN_LEAD_RAD),
             drifting: false,
             reference: GuidanceReference::default(),
         }
@@ -178,6 +199,19 @@ impl Guidance {
             self.hold_heading = None;
             self.drifting = false;
         }
+        // The previous tick's heading reference, if it is recent enough to
+        // continue from, with the time since.
+        let previous = match self.last_tick {
+            Some(t) => {
+                let dt = state.t.saturating_duration_since(t).as_secs_f64();
+                self.reference
+                    .heading_rad
+                    .filter(|_| dt <= REFERENCE_GAP_S)
+                    .map(|psi| (psi, dt))
+            }
+            None => None,
+        };
+        self.last_tick = Some(state.t);
         self.reference = GuidanceReference::default();
         let demand = match setpoint {
             Setpoint::Idle => ZERO_DEMAND,
@@ -189,6 +223,24 @@ impl Guidance {
                 sway_n: 0.0,
                 yaw_nm: self.yaw_demand(*heading_rad, state),
             },
+            Setpoint::TurnRateSpeed {
+                rate_radps,
+                speed_mps,
+            } => {
+                let psi = state.pose.heading_rad;
+                let advanced = match previous {
+                    Some((psi_ref, dt)) => psi_ref + rate_radps * dt,
+                    None => psi,
+                };
+                let lead =
+                    wrap_pi(advanced - psi).clamp(-self.max_turn_lead_rad, self.max_turn_lead_rad);
+                self.reference.yaw_rate_radps = Some(*rate_radps);
+                ForceDemand {
+                    surge_n: self.surge_demand(*speed_mps, state.velocity.surge_mps),
+                    sway_n: 0.0,
+                    yaw_nm: self.yaw_demand_at_rate(psi + lead, *rate_radps, state),
+                }
+            }
             Setpoint::StationKeep { position } => self.station_keep(*position, state),
             Setpoint::FollowPath { path, speed_mps } => {
                 self.follow_path(path.as_slice(), *speed_mps, state)
@@ -203,9 +255,15 @@ impl Guidance {
 
     /// PD on heading error against yaw rate; gains derived in `new`.
     fn yaw_demand(&mut self, psi_ref: f64, state: &VesselState) -> f64 {
+        self.yaw_demand_at_rate(psi_ref, 0.0, state)
+    }
+
+    /// The heading loop against a moving reference: the damping term acts
+    /// on the yaw rate's error from the reference's own rate (D-039).
+    fn yaw_demand_at_rate(&mut self, psi_ref: f64, rate_ref: f64, state: &VesselState) -> f64 {
         self.reference.heading_rad = Some(wrap_pi(psi_ref));
         self.gains.kp_psi * wrap_pi(psi_ref - state.pose.heading_rad)
-            - self.gains.kd_psi * state.velocity.yaw_rate_radps
+            - self.gains.kd_psi * (state.velocity.yaw_rate_radps - rate_ref)
     }
 
     /// P on speed error plus damping-balance feedforward (see `new`).
@@ -500,6 +558,7 @@ mod tests {
             GuidanceReference {
                 heading_rad: Some(1.0),
                 surge_mps: Some(2.0),
+                yaw_rate_radps: None,
             }
         );
 
@@ -531,8 +590,93 @@ mod tests {
             GuidanceReference {
                 heading_rad: Some(0.4),
                 surge_mps: None,
+                yaw_rate_radps: None,
             }
         );
+    }
+
+    fn state_at_t(t_s: f64, heading_rad: f64, r: f64) -> VesselState {
+        VesselState {
+            t: Timestamp::from_nanos((t_s * 1e9) as u64),
+            ..state(heading_rad, 0.0, r)
+        }
+    }
+
+    fn turn(rate_radps: f64) -> Setpoint {
+        Setpoint::TurnRateSpeed {
+            rate_radps,
+            speed_mps: 1.0,
+        }
+    }
+
+    // D-039: the reference starts at the heading and advances at the rate,
+    // and the damping term is relative to the rate.
+    #[test]
+    fn turn_order_advances_the_reference_at_the_rate() {
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
+        let d = g.tick(&turn(0.1), &state_at_t(0.0, 0.3, 0.0));
+        let r = g.reference();
+        assert_eq!(r.heading_rad, Some(0.3));
+        assert_eq!(r.yaw_rate_radps, Some(0.1));
+        assert_eq!(r.surge_mps, Some(1.0));
+        // Zero heading error, so the whole demand is the rate term.
+        assert!(
+            (d.yaw_nm - g.gains.kd_psi * 0.1).abs() < 1e-9,
+            "{}",
+            d.yaw_nm
+        );
+
+        g.tick(&turn(0.1), &state_at_t(0.5, 0.3, 0.1));
+        let psi_ref = g.reference().heading_rad.unwrap();
+        assert!((psi_ref - 0.35).abs() < 1e-12, "{psi_ref}");
+    }
+
+    #[test]
+    fn turn_order_continues_from_the_heading_reference_in_force() {
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
+        let hs = Setpoint::HeadingSpeed {
+            heading_rad: 1.0,
+            speed_mps: 1.0,
+        };
+        g.tick(&hs, &state_at_t(0.0, 0.9, 0.0));
+        g.tick(&turn(0.2), &state_at_t(0.1, 0.9, 0.0));
+        let psi_ref = g.reference().heading_rad.unwrap();
+        assert!((psi_ref - 1.02).abs() < 1e-12, "{psi_ref}");
+
+        // Changing the rate continues too.
+        g.tick(&turn(-0.2), &state_at_t(0.2, 0.9, 0.0));
+        let psi_ref = g.reference().heading_rad.unwrap();
+        assert!((psi_ref - 1.0).abs() < 1e-12, "{psi_ref}");
+    }
+
+    #[test]
+    fn stale_reference_restarts_from_the_heading() {
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
+        g.tick(&turn(0.2), &state_at_t(0.0, 0.0, 0.0));
+        // A gap longer than REFERENCE_GAP_S: guidance did not run.
+        g.tick(&turn(0.2), &state_at_t(5.0, 0.4, 0.0));
+        assert_eq!(g.reference().heading_rad, Some(0.4));
+    }
+
+    #[test]
+    fn turn_lead_is_bounded_and_never_flips() {
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
+        assert!(g.max_turn_lead_rad <= PI / 2.0);
+        // A hull that does not turn at all, ordered to turn fast: the
+        // reference runs ahead only to the bound and stays on the ordered
+        // side, and the demand keeps turning to starboard. The side is the
+        // check that matters: the rate term alone keeps the demand's sign
+        // for a while after the reference has flipped behind.
+        for i in 0..200 {
+            let t = i as f64 * 0.1;
+            let d = g.tick(&turn(1.0), &state_at_t(t, 0.0, 0.0));
+            let lead = wrap_pi(g.reference().heading_rad.unwrap());
+            assert!(
+                (0.0..=g.max_turn_lead_rad + 1e-12).contains(&lead),
+                "lead {lead} at {t}"
+            );
+            assert!(d.yaw_nm > 0.0, "yaw {} at {t}", d.yaw_nm);
+        }
     }
 
     #[test]

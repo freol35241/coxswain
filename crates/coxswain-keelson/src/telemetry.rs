@@ -74,7 +74,7 @@ fn failsafe_detail(f: pb::Failsafe) -> &'static str {
 /// Keelson 0.6 §5.2: a static-capability source declares a subject token for
 /// each at session open, whether or not this vessel will ever produce it.
 /// tests/conformance.rs checks it against what the `put` calls below reach.
-const PUBLISHED_SUBJECTS: [&str; 17] = [
+const PUBLISHED_SUBJECTS: [&str; 18] = [
     subject::LOCATION_FIX,
     subject::HEADING_TRUE_NORTH_DEG,
     subject::YAW_RATE_DEGPS,
@@ -92,6 +92,7 @@ const PUBLISHED_SUBJECTS: [&str; 17] = [
     subject::MANIFEST,
     subject::HEADING_TRUE_NORTH_DEG_SETPOINT,
     subject::SPEED_OVER_GROUND_KNOTS_SETPOINT,
+    subject::YAW_RATE_DEGPS_SETPOINT,
 ];
 
 pub struct TelemetryPublisher {
@@ -181,6 +182,14 @@ impl TelemetryPublisher {
             let msg = timestamped_float(t_wall, u * MPS_TO_KNOTS);
             self.put(
                 subject::SPEED_OVER_GROUND_KNOTS_SETPOINT,
+                &source_id,
+                seal(t_wall, &msg),
+            )?;
+        }
+        if let Some(rate) = r.yaw_rate_radps {
+            let msg = timestamped_float(t_wall, rate.to_degrees());
+            self.put(
+                subject::YAW_RATE_DEGPS_SETPOINT,
                 &source_id,
                 seal(t_wall, &msg),
             )?;

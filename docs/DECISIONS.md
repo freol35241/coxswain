@@ -961,22 +961,26 @@ Status: accepted. Prompted by keelson #399's decision record, R2 and coxswain
 item 8: Keelson's navigator streams `HeadingSpeed` and asks for a rate of
 turn beside it.
 
-`Setpoint::TurnRateSpeed { rate_radps, speed_mps }`. Guidance advances a
-heading reference at `rate_radps` and closes the heading loop it already
-has on it, with the rate as the damping term's reference:
-`kp_psi * (psi_ref - psi) - kd_psi * (r - rate)`. The reference starts from
-the heading reference in force on the previous tick if there was one, else
-from the current heading, so moving between `HeadingSpeed` and
-`TurnRateSpeed`, or changing the rate, does not step the heading. It
-advances by the state timestamps' difference, so guidance still reads no
-clock. A separate rate loop was rejected: it needs gains nothing has tuned,
-and the heading loop already tracks a moving reference. The rate is not
-capped, but the reference may lead the heading by no more than the error at
-which the yaw demand saturates, `MAX_YAW_NM / kp_psi`. Without that bound a
-rate the hull cannot follow lets the reference run away, and once it leads
-by more than half a turn the wrapped error flips sign and the vessel turns
-the wrong way. With it, an unreachable rate degrades to turning as fast as
-the yaw authority allows, and the bound needs no new knob.
+`Setpoint::TurnRateSpeed { rate_radps, speed_mps }`. Guidance advances a heading
+reference at `rate_radps` and closes the heading loop it already has on it, with
+the rate as the damping term's reference: `kp_psi * (psi_ref - psi) - kd_psi *
+(r - rate)`. The reference starts from the heading reference in force on the
+previous tick if there was one, else from the current heading, so moving between
+`HeadingSpeed` and `TurnRateSpeed`, or changing the rate, does not step the
+heading. It advances by the state timestamps' difference, so guidance still
+reads no clock. A previous reference more than a second old is stale (guidance
+did not run, as while disarmed) and the turn starts from the heading instead. A
+separate rate loop was rejected: it needs gains nothing has tuned, and the
+heading loop already tracks a moving reference. The rate is not capped, but the
+reference may lead the heading by no more than the error at which the yaw demand
+saturates, `MAX_YAW_NM / kp_psi`, and never by more than a quarter turn. Without
+a bound a rate the hull cannot follow lets the reference run away, and once it
+leads by more than half a turn the wrapped error flips sign. The saturation
+error alone is not enough: on the example vessel it is 3.4 rad, past half a
+turn. With both, an unreachable rate degrades to turning as fast as the yaw
+authority allows, and neither bound is a new knob. The damping term's rate
+reference hides a flipped reference for a while, so the tests check the
+reference's side of the heading, not only the demand's sign.
 
 On the wire, Coxswain's setpoint message gains `turn_rate_speed`, in radians
 per second like the rest of that message. Keelson's unit for rate of turn

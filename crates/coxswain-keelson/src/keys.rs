@@ -78,6 +78,11 @@ pub mod subject {
     /// closes on, which equals SOG only with no sway (D-036). Registered on
     /// Keelson dev after 0.6.0-pre.19.
     pub const SPEED_OVER_GROUND_KNOTS_SETPOINT: &str = "speed_over_ground_knots_setpoint";
+    /// keelson.TimestampedFloat, degrees per second, the rate of turn a turn
+    /// order advances the heading reference at (D-039). Named by Keelson's
+    /// `<measurement>_setpoint` rule but not registered, so coxswain-specific
+    /// until it is.
+    pub const YAW_RATE_DEGPS_SETPOINT: &str = "yaw_rate_degps_setpoint";
     /// keelson.EntityHealth.
     pub const ENTITY_HEALTH: &str = "entity_health";
     /// coxswain.SetpointMsg. Coxswain-specific; the stream doubles as the
@@ -207,6 +212,7 @@ mod tests {
         (subject::THRUST_NEWTON_SETPOINT, None),
         (subject::HEADING_TRUE_NORTH_DEG_SETPOINT, None),
         (subject::SPEED_OVER_GROUND_KNOTS_SETPOINT, None),
+        (subject::YAW_RATE_DEGPS_SETPOINT, None),
         (subject::SETPOINT, None),
         (subject::CONN_STATE, None),
         (subject::MANIFEST, None),

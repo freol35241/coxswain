@@ -174,6 +174,7 @@ fn reference_publishes_heading_and_skips_an_absent_speed() {
     let near_zone = GuidanceReference {
         heading_rad: Some(-core::f64::consts::FRAC_PI_2),
         surge_mps: None,
+        yaw_rate_radps: None,
     };
     vessel
         .publish_reference(SystemTime::now(), &near_zone)
@@ -185,6 +186,7 @@ fn reference_publishes_heading_and_skips_an_absent_speed() {
     let transit = GuidanceReference {
         heading_rad: Some(0.0),
         surge_mps: Some(1852.0 / 3600.0),
+        yaw_rate_radps: None,
     };
     vessel
         .publish_reference(SystemTime::now(), &transit)

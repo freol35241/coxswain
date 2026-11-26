@@ -48,6 +48,12 @@ message SetpointMsg {
     double speed_mps = 2;
   }
 
+  // A turn order (D-039): rate of turn, positive to starboard.
+  message TurnRateSpeed {
+    double rate_radps = 1;
+    double speed_mps = 2;
+  }
+
   message StationKeep {
     double lat_deg = 1;
     double lon_deg = 2;
@@ -78,6 +84,7 @@ message SetpointMsg {
     StationKeep station_keep = 4;
     FollowPath follow_path = 5;
     DirectEffort direct_effort = 6;
+    TurnRateSpeed turn_rate_speed = 7;
   }
 }
 
