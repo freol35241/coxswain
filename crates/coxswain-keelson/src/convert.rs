@@ -75,6 +75,13 @@ pub fn setpoint_to_proto(sp: &Setpoint) -> setpoint_msg::Setpoint {
             heading_rad,
             speed_mps,
         }),
+        Setpoint::TurnRateSpeed {
+            rate_radps,
+            speed_mps,
+        } => setpoint_msg::Setpoint::TurnRateSpeed(setpoint_msg::TurnRateSpeed {
+            rate_radps,
+            speed_mps,
+        }),
         Setpoint::StationKeep { position } => {
             setpoint_msg::Setpoint::StationKeep(setpoint_msg::StationKeep {
                 lat_deg: position.lat_rad.to_degrees(),
@@ -161,6 +168,14 @@ pub fn setpoint_from_proto(msg: &SetpointMsg) -> Result<Setpoint, Error> {
             )?,
             speed_mps: finite(speed_mps, "heading_speed.speed_mps")?,
         },
+        // Uncapped: guidance bounds how far the reference may lead (D-039).
+        setpoint_msg::Setpoint::TurnRateSpeed(setpoint_msg::TurnRateSpeed {
+            rate_radps,
+            speed_mps,
+        }) => Setpoint::TurnRateSpeed {
+            rate_radps: finite(rate_radps, "turn_rate_speed.rate_radps")?,
+            speed_mps: finite(speed_mps, "turn_rate_speed.speed_mps")?,
+        },
         setpoint_msg::Setpoint::StationKeep(setpoint_msg::StationKeep { lat_deg, lon_deg }) => {
             Setpoint::StationKeep {
                 position: GeoPoint {
@@ -239,6 +254,19 @@ mod tests {
                 assert_eq!(h1, h2);
                 assert_eq!(s1, s2);
             }
+            (
+                Setpoint::TurnRateSpeed {
+                    rate_radps: r1,
+                    speed_mps: s1,
+                },
+                Setpoint::TurnRateSpeed {
+                    rate_radps: r2,
+                    speed_mps: s2,
+                },
+            ) => {
+                assert_eq!(r1, r2);
+                assert_eq!(s1, s2);
+            }
             (Setpoint::StationKeep { position: p1 }, Setpoint::StationKeep { position: p2 }) => {
                 assert!((p1.lat_rad - p2.lat_rad).abs() < TOL);
                 assert!((p1.lon_rad - p2.lon_rad).abs() < TOL);
@@ -285,6 +313,10 @@ mod tests {
         roundtrip(Setpoint::HeadingSpeed {
             heading_rad: 1.234,
             speed_mps: 3.5,
+        });
+        roundtrip(Setpoint::TurnRateSpeed {
+            rate_radps: -0.05,
+            speed_mps: 2.0,
         });
         roundtrip(Setpoint::StationKeep {
             position: GeoPoint {

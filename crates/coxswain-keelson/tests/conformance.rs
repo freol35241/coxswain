@@ -87,6 +87,7 @@ fn publish_everything(t: &TelemetryPublisher) {
         &GuidanceReference {
             heading_rad: Some(1.0),
             surge_mps: Some(1.0),
+            yaw_rate_radps: Some(0.1),
         },
     )
     .unwrap();

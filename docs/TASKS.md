@@ -244,7 +244,8 @@ this before freezing far-end firmware.
 - [x] Claimants unregister, `conn_event` with the cause of each change, the
       failsafe cause in health, `[manifest] keelson_base_path`, schema v10
       (D-038).
-- [ ] Turn order `TurnRateSpeed` beside `HeadingSpeed` (D-039).
+- [x] Turn order `TurnRateSpeed` beside `HeadingSpeed` (D-039), with
+      `yaw_rate_degps_setpoint` under `coxswain/guidance`.
 - [ ] Keelson `safety_state` as an external stop source once keelson #332
       merges (D-037): adapter consumer, manifest declaration, and the
       compiler rule counting stop-on-silence on it against `self_sufficient`.

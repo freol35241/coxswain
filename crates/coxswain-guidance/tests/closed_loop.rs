@@ -193,6 +193,91 @@ fn speed_step() {
     }
 }
 
+/// D-039: a reachable turn order settles on the commanded rate.
+#[test]
+fn steady_turn() {
+    let mut bench = Bench::new(1);
+    bench.sim.set_truth(
+        0.0,
+        BodyVelocity {
+            surge_mps: 1.0,
+            sway_mps: 0.0,
+            yaw_rate_radps: 0.0,
+        },
+    );
+    let rate = 3_f64.to_radians();
+    let sp = Setpoint::TurnRateSpeed {
+        rate_radps: rate,
+        speed_mps: 1.0,
+    };
+    let mut rates = Vec::new();
+    for i in 0..600 {
+        let (state, _) = bench.tick(&sp);
+        if i as f64 * TICK_S >= 30.0 {
+            rates.push(state.velocity.yaw_rate_radps);
+            let lead =
+                wrap_pi(bench.guidance.reference().heading_rad.unwrap() - state.pose.heading_rad);
+            assert!(
+                lead.abs() < 5_f64.to_radians(),
+                "lead {:.2} deg",
+                lead.to_degrees()
+            );
+        }
+    }
+    let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+    println!(
+        "steady turn: {:.2} deg/s for {:.2} ordered",
+        mean.to_degrees(),
+        rate.to_degrees()
+    );
+    assert!((mean - rate).abs() < 0.05 * rate, "mean rate {mean}");
+}
+
+/// D-039: an order faster than the hull can turn still turns the ordered way,
+/// as fast as the yaw authority allows.
+#[test]
+fn unreachable_turn_rate_turns_the_ordered_way() {
+    let mut bench = Bench::new(1);
+    let sp = Setpoint::TurnRateSpeed {
+        rate_radps: -2.0,
+        speed_mps: 1.0,
+    };
+    let mut turned = 0.0;
+    let mut last = 0.0;
+    for i in 0..600 {
+        let (state, _) = bench.tick(&sp);
+        // The reference stays on the ordered side of the heading; past half
+        // a turn of lead it would flip behind it.
+        let lead =
+            wrap_pi(bench.guidance.reference().heading_rad.unwrap() - state.pose.heading_rad);
+        assert!(
+            lead <= 0.0,
+            "reference {:.0} deg to starboard",
+            lead.to_degrees()
+        );
+        if i > 0 {
+            turned += wrap_pi(state.pose.heading_rad - last);
+        }
+        last = state.pose.heading_rad;
+        if i as f64 * TICK_S >= 2.0 {
+            assert!(
+                state.velocity.yaw_rate_radps < 0.0,
+                "turning to starboard at {:.1} s",
+                i as f64 * TICK_S
+            );
+        }
+    }
+    println!(
+        "unreachable turn: {:.0} deg to port in 60 s",
+        -turned.to_degrees()
+    );
+    assert!(
+        turned < -2.0 * PI,
+        "turned only {:.0} deg",
+        turned.to_degrees()
+    );
+}
+
 #[test]
 fn station_keep_from_thirty_meters() {
     let mut bench = Bench::new(1);

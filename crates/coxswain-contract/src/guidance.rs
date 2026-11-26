@@ -15,6 +15,12 @@ pub enum Setpoint {
         heading_rad: f64,
         speed_mps: f64,
     },
+    /// A turn order (D-039): rate of turn, NED (positive to starboard), at a
+    /// speed. Guidance advances a heading reference at the rate.
+    TurnRateSpeed {
+        rate_radps: f64,
+        speed_mps: f64,
+    },
     StationKeep {
         position: GeoPoint,
     },
@@ -41,4 +47,7 @@ pub struct GuidanceReference {
     pub heading_rad: Option<f64>,
     /// Body surge over ground the speed loop closes on, m/s.
     pub surge_mps: Option<f64>,
+    /// Rate of turn the heading reference advances at, rad/s; only under a
+    /// turn order (D-039).
+    pub yaw_rate_radps: Option<f64>,
 }

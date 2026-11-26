@@ -253,6 +253,10 @@ fn setpoint_fields(sp: &Setpoint) -> (u8, [f64; 3]) {
         Setpoint::StationKeep { position } => (2, [position.lat_rad, position.lon_rad, 0.0]),
         Setpoint::FollowPath { .. } => (3, [0.0, 0.0, 0.0]),
         Setpoint::DirectEffort(tau) => (4, [tau.surge_n, tau.sway_n, tau.yaw_nm]),
+        Setpoint::TurnRateSpeed {
+            rate_radps,
+            speed_mps,
+        } => (5, [*rate_radps, *speed_mps, 0.0]),
     }
 }
 
