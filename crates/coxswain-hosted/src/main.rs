@@ -1746,7 +1746,11 @@ fn run() -> Result<(), String> {
 
         if let Some(state) = &out.state {
             publish(
-                endpoint.publish_state(wall, state, "estimator"),
+                endpoint.publish_state(
+                    wall,
+                    state,
+                    &coxswain_keelson::keys::device_source_id("estimator"),
+                ),
                 &mut publish_error_logged,
             );
         }
