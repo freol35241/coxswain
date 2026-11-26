@@ -223,6 +223,7 @@ fn config(seed: u64) -> VesselConfig {
                 priority: 100,
             }])
             .unwrap(),
+            stop_sources: BoundedList::new(),
         },
         effectors: BoundedList::new(),
     }

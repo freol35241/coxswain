@@ -51,6 +51,10 @@ in DECISIONS.md; this file only fixes the vocabulary.
   requests the conn, arms, and streams setpoints, the stream doubling as its
   heartbeat. RC, teleoperation, and autonomy are claimants. Losing one is a
   supervisor event.
+- **Stop source.** A declared input that can stop the vessel without holding
+  the conn: while engaged, the vessel is disarmed whoever holds it and arming
+  is refused (D-037). The RC kill channel is one; Keelson `safety_state` will
+  be another. Not a claimant.
 - **Telemetry receiver (observer).** Anything that reads what Coxswain
   publishes: state, raw streams, health, conn state, manifest info. No identity,
   no registration, no authority. Losing one changes nothing (D-035).

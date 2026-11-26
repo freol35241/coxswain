@@ -46,7 +46,7 @@ fn example_compiles_and_roundtrips() {
     assert_eq!(manifest.vessel_id.as_str(), "example-vessel-01");
     assert_eq!(manifest.name.as_str(), "Example");
     assert_eq!(manifest.revision, 7);
-    assert_eq!(manifest.schema_version, 8);
+    assert_eq!(manifest.schema_version, 9);
     assert_eq!(manifest.buses.len(), 6);
     assert_eq!(manifest.sensors.len(), 7);
     assert_eq!(manifest.actuator_nodes.len(), 3);
@@ -466,14 +466,14 @@ fn rejects_inner_loop_on_udp_bus_outside_conn_segment() {
     ));
 }
 
-// Rule 10: schema_version must be 8. A prior-version manifest (schema_version
-// 7) is rejected outright now, same doctrine as every prior bump.
+// Rule 10: schema_version must be 9. A prior-version manifest (schema_version
+// 8) is rejected outright now, same doctrine as every prior bump.
 #[test]
 fn rejects_unknown_schema_version() {
-    let src = patched("schema_version = 8", "schema_version = 7");
+    let src = patched("schema_version = 9", "schema_version = 8");
     assert_eq!(
         expect_invalid(&src),
-        ValidateError::UnsupportedSchemaVersion(7)
+        ValidateError::UnsupportedSchemaVersion(8)
     );
 }
 
@@ -552,10 +552,10 @@ fn wrong_magic_is_rejected() {
 #[test]
 fn wrong_header_version_is_rejected() {
     let mut blob = example_blob();
-    blob[4] = 9;
+    blob[4] = 10;
     assert_eq!(
         coxswain_manifest::read(&blob, &coxswain_manifest::public_key(&seed())),
-        Err(ReadError::BadVersion(9))
+        Err(ReadError::BadVersion(10))
     );
 }
 

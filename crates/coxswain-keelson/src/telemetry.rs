@@ -19,7 +19,7 @@ use crate::keys::{self, COXSWAIN, subject};
 use crate::proto::{coxswain as pb, foxglove, keelson};
 
 /// The I/O side of the health telemetry, bundled for the same reason as
-/// [`PowerHealth`]. `actuation` is one `(effector name, diverged)` pair per
+/// [`SupervisorHealth`]. `actuation` is one `(effector name, diverged)` pair per
 /// Cyphal effector (D-029); `std_sources` is one `(<sensor>/<quantity>,
 /// source)` pair per keelson bus quantity (D-034). Either may be empty.
 #[derive(Copy, Clone, Debug, Default)]
@@ -47,13 +47,16 @@ impl IoSource {
     }
 }
 
-/// The supervisor's report-only power flags for the health telemetry (D-024):
-/// bus voltage below the low-voltage bound, and the power report gone stale.
-/// Bundled so `publish_health` stays within a sane argument count.
+/// The supervisor's flags for the health telemetry: bus voltage below the
+/// low-voltage bound and the power report gone stale (D-024), a stop in
+/// force and a stop source gone silent (D-037). Bundled so `publish_health`
+/// stays within a sane argument count.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct PowerHealth {
+pub struct SupervisorHealth {
     pub low_voltage: bool,
     pub power_stale: bool,
+    pub stopped: bool,
+    pub stop_silent: bool,
 }
 
 /// Every subject this publisher can publish under the `coxswain` producer.
@@ -412,17 +415,19 @@ impl TelemetryPublisher {
         h: &EstimatorHealth,
         conn: &ConnState,
         arming: ArmingState,
-        power: PowerHealth,
+        flags: SupervisorHealth,
         io: IoHealth<'_>,
     ) -> Result<(), Error> {
         let IoHealth {
             actuation,
             std_sources,
         } = io;
-        let PowerHealth {
+        let SupervisorHealth {
             low_voltage,
             power_stale,
-        } = power;
+            stopped,
+            stop_silent,
+        } = flags;
         let estimator = keelson::SourceHealth {
             name: "estimator".to_string(),
             level: health_level(h.level) as i32,
@@ -467,6 +472,28 @@ impl TelemetryPublisher {
                 },
             ],
         };
+        let stop_level = if stopped || stop_silent {
+            degraded
+        } else {
+            nominal
+        };
+        let stop_subject = keelson::SubjectHealth {
+            name: "stop".to_string(),
+            level: stop_level,
+            measured_publication_rate_hz: 0.0,
+            checks: vec![
+                keelson::CheckResult {
+                    name: "stop".to_string(),
+                    level: if stopped { degraded } else { nominal },
+                    detail: if stopped { "engaged" } else { "released" }.to_string(),
+                },
+                keelson::CheckResult {
+                    name: "stop_source".to_string(),
+                    level: if stop_silent { degraded } else { nominal },
+                    detail: if stop_silent { "silent" } else { "heard" }.to_string(),
+                },
+            ],
+        };
         let supervisor = keelson::SourceHealth {
             name: "supervisor".to_string(),
             level: nominal,
@@ -489,6 +516,7 @@ impl TelemetryPublisher {
                     ],
                 },
                 power_subject,
+                stop_subject,
             ],
         };
         let mut sources = vec![estimator, supervisor];

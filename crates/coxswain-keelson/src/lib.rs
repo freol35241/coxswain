@@ -29,4 +29,4 @@ pub use convert::{ned_cov_to_enu, setpoint_from_proto, setpoint_to_proto};
 pub use error::Error;
 pub use observer::{HealthUpdate, Observer, StateUpdate};
 pub use proto::coxswain::conn_reply::Result as ConnReplyResult;
-pub use telemetry::{IoHealth, IoSource, PowerHealth, TelemetryPublisher};
+pub use telemetry::{IoHealth, IoSource, SupervisorHealth, TelemetryPublisher};

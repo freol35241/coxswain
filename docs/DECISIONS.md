@@ -232,6 +232,9 @@ and what first water trials actually need), RC as a conn-holding claimant
 second. Manual helm issues direct effort setpoints, a contract Setpoint
 addition; RC bypasses guidance, never the supervisor or arming.
 
+Amended by D-037: the kill channel is a stop source in the supervisor, not
+the RC claimant's `disarm`, and the claimant function is optional per vessel.
+
 ## D-026: Allocation at the conn node from a manifest-declared effector table
 
 Guidance keeps producing generalized tau; a new no_std allocation stage maps
@@ -823,6 +826,88 @@ throughout (Keelson 0.6 §5.2). No yaw-rate setpoint: the heading PD has no
 explicit rate reference. Both subjects are registered on Keelson dev but not
 at the pinned 0.6.0-pre.19, so they are coxswain-specific until the pin moves,
 like `thrust_newton_setpoint` (D-034).
+
+## D-037: A stop is a supervisor input, not a claimant verb; recovery is a declared claimant
+
+Status: accepted. Prompted by keelson #399's decision record (R3, R5, C1, and
+coxswain item 3), and by a defect it names: the RC kill maps to `disarm`,
+which is holder-only, so while any other claimant holds the conn the kill
+switch does nothing.
+
+A stop is a new supervisor input from a declared stop source. While any stop
+source is engaged, the vessel is disarmed whoever holds the conn, `arm` is
+refused, and the failsafe matrix reports `Stop` above every other cause.
+Releasing a stop re-arms nothing: arming is the holder's call afterwards, as
+after critical voltage. The conn is untouched. A stop is not a claim, never
+takes the conn, and the holder keeps it through the stop. This is the
+semantics of Keelson's `safety_state` (keelson #332): not CLEAR means stopped
+and arming refused, and CLEAR permits arming without performing it.
+
+A stop is accepted from any declared source, external ones included, because
+it only removes actuation. Invariant 1 forbids depending on something above
+the conn node, not being stopped by it. Conn-process death is already covered:
+D-027 gives every effector a failsafe path that stops actuation when the
+process dies. So the supervisor's stop covers the live process and D-027 the
+dead one, which is what Keelson's R3 asks of a kill.
+
+Sources, declared in the manifest:
+
+- The RC kill channel, conn-terminated. This replaces today's kill-as-disarm.
+- Keelson `safety_state`, external, through the adapter, once Keelson merges
+  it. Until then the input exists and only RC drives it.
+
+Silence. A stop source that goes silent raises a health warning and stops
+nothing, unless the manifest declares that source stop-on-silence. On an
+external source that declaration makes the control path depend on the bus,
+so the compiler counts it against `self_sufficient` (D-034). Only a manifest
+declaring `self_sufficient = false` may set it there, and release builds
+refuse those. On RC, which is conn-terminated, it is allowed on any manifest:
+stopping on RC link loss is the usual setup for first water trials. The
+declaration is required, never defaulted, as trust is declared.
+
+A source reports its state on every frame it delivers, and the supervisor
+judges silence from that stream. The window is `claimant_heartbeat`, the one
+that already says a link is gone, so there is no new knob. A source never
+heard from counts as silent, so a stop-on-silence source must be heard
+before the vessel can arm. An engaged stop holds until the source reports a
+release: going silent while engaged releases nothing. A `--sim` run opens no
+RC link, so it drops the RC stop source rather than read the missing
+transmitter as a dead one.
+
+RC is a bus with two functions, and this amends D-025. The kill channel is a
+stop source. The claimant function (takeover, manual helm through
+`DirectEffort`) becomes optional per vessel and moves to an `[rc.claimant]`
+sub-table: an `[rc]` table without one is kill only. While kill is engaged
+the RC claimant's effort stream runs zeroed rather than stopping, so a stop
+does not cost RC the conn it holds. Keelson's R3 and R4 (RC never a claimant,
+no remote direct effort) are Keelson's fleet policy. Coxswain keeps the RC
+claimant available because it is the human takeover path that works with
+nothing above the conn node alive, which is D-025's reason and still holds.
+Loss of an RC claimant that holds the conn stays `ClaimantLost`.
+
+Recovery (Keelson's R5) needs no new mechanism. Keelson's safety supervisor
+reaches Coxswain as an ordinary claimant. Its manifest-declared priority ranks
+it above every station (D-025), so it preempts with `request_conn` and streams
+`StationKeep` or `Idle`. Losing it is `ClaimantLost`, like any holder. It
+cannot stop the vessel; a stop goes through `safety_state`. Coxswain's
+in-loop reflexes (critical voltage, position degraded, geofence, claimant
+lost) stay in the supervisor and outrank every claimant, because they must
+work with the bus gone.
+
+Code consequence:
+
+- **Contract and supervisor (no_std).** `StopSource` and its declarations in
+  `SupervisorConfig`, `stop_report`, `FailsafeCause::Stop`, `ArmError::Stopped`
+  (`REFUSED_STOP` on the wire), and `Directive::stop_silent`, which health
+  telemetry carries.
+- **Manifest.** `[rc] stop_on_silence`, required, and the optional
+  `[rc.claimant]`. Schema 9.
+- **Hosted.** The RC kill drives the stop input, and the kill-as-disarm
+  dead-man re-issue is gone.
+- **Later, with keelson #332.** The `safety_state` source: its consumer in
+  the adapter, its manifest declaration, and the compiler rule that counts
+  stop-on-silence on it against `self_sufficient`. The rule has nothing to
+  check until an external stop source exists.
 
 ## Open questions (not yet decided)
 

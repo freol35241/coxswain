@@ -1,66 +1,57 @@
-//! RC claimant adapter: parsed CRSF frames in, typed events out (D-025
-//! Phase 6 backlog: RC kill channel, RC claimant adapter).
+//! RC adapter: parsed CRSF frames in, typed events out (D-025, D-037).
 //!
-//! Pure and stateless apart from the two switch readings needed for edge
-//! detection: no I/O, no clock, no allocation. `coxswain-crsf` only parses
-//! bytes into frames (its own doc comment says so); this module is where a
-//! transmitter switch position turns into a claimant verb and a stick
-//! position turns into a setpoint, per CLAUDE.md invariant 3 (interfaces are
-//! adapters, never the internal truth).
+//! Pure and stateless apart from the two switch readings needed for
+//! hysteresis and edge detection: no I/O, no clock, no allocation.
+//! `coxswain-crsf` only parses bytes into frames; this module is where a
+//! transmitter switch turns into a stop or a claimant verb and a stick turns
+//! into a setpoint, per CLAUDE.md invariant 3.
 //!
-//! Semantics, decided in D-025 but enforced by the caller, not here:
-//! - Kill maps to the supervisor's `disarm`. `KillEngaged` is the edge the
-//!   caller reacts to; while the switch stays high the caller may keep
-//!   re-issuing `disarm` on every frame (cheap, idempotent) or not, its call.
-//!   This module only ever hands over the edge.
-//! - Takeover maps to `request_conn` on `KillReleased`->`KillEngaged`...
-//!   rather, on `TakeoverEngaged`/`TakeoverReleased`, calling
-//!   `request_conn`/`release_conn` for the RC claimant id. The manifest-
-//!   declared priority (D-025) that lets RC preempt autonomy is supervisor
-//!   and manifest business, never read or assumed here.
-//! - `Effort` is emitted every frame while takeover is engaged, standing in
-//!   for a heartbeat: the caller forwards it as the `DirectEffort` setpoint
-//!   stream, and the supervisor's existing heartbeat staleness already
-//!   models a silent claimant if frames stop arriving. This module tracks no
-//!   frame age of its own (no clock reads, per the crate's no-I/O rule).
+//! RC has two functions (D-037):
+//! - The kill channel is a stop source. Every channel frame yields
+//!   `Kill(engaged)`, a level rather than an edge, so the supervisor can
+//!   judge the source's silence from the report stream.
+//! - The claimant function is optional. With it, the takeover switch yields
+//!   `TakeoverEngaged`/`TakeoverReleased` edges for `request_conn` and
+//!   `release_conn`, and every frame while takeover is engaged yields
+//!   `Effort`, the `DirectEffort` stream that doubles as the claimant
+//!   heartbeat. While kill is engaged the effort is zero, not withheld: the
+//!   supervisor's stop already disarms, and a withheld stream would lose the
+//!   RC claimant its conn. Priority is manifest and supervisor business.
 //!
-//! `process` takes only the parsed frame, no timestamp: nothing here ever
-//! reads or stamps a clock, and neither `Event` carries one (`ForceDemand`,
-//! like the `DirectEffort` setpoint it feeds, has none). A timestamp
-//! parameter with nothing to do would be exactly the unused "flexibility"
-//! CLAUDE.md asks to avoid.
+//! `process` takes no timestamp: nothing here reads a clock, and the caller
+//! stamps each report when it hands it to the supervisor.
 
 use coxswain_contract::{BoundedList, ForceDemand};
 use coxswain_crsf::{Frame, channel_to_us};
 
-/// Every `process` call emits at most one kill edge, one takeover edge, and
+/// Every `process` call emits at most one kill level, one takeover edge, and
 /// one `Effort`.
 pub const MAX_EVENTS_PER_FRAME: usize = 3;
 
-/// Events `process` can hand back. Edges fire once per transition; `Effort`
-/// is emitted every frame while takeover is engaged and kill is not (see
-/// module doc comment). The dead tail of a `BoundedList<Event, _>` needs a
-/// default; `KillEngaged` is picked arbitrarily and carries no meaning there.
-#[derive(Copy, Clone, Debug, PartialEq, Default)]
+/// Events `process` can hand back. The dead tail of a `BoundedList<Event, _>`
+/// needs a default; `Kill(true)` is picked as the safe one and carries no
+/// meaning there.
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Event {
-    #[default]
-    KillEngaged,
-    KillReleased,
+    Kill(bool),
     TakeoverEngaged,
     TakeoverReleased,
     Effort(ForceDemand),
 }
 
+impl Default for Event {
+    fn default() -> Self {
+        Self::Kill(true)
+    }
+}
+
 /// Plain, hand-buildable config (D-022 pattern, same as `gnss0183::Config`):
 /// channel indices index into `RcChannelsFrame::channels` (must be < 16, the
 /// array length; a manifest-derived config is trusted the same way every
-/// other driver config is, D-004's trust-is-declared).
+/// other driver config is).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Config {
     pub kill_channel: usize,
-    pub takeover_channel: usize,
-    pub surge_channel: usize,
-    pub yaw_channel: usize,
     /// A switch reads high once its microsecond value climbs strictly above
     /// this, shared by the kill and takeover channels.
     pub switch_high_us: u16,
@@ -69,6 +60,15 @@ pub struct Config {
     /// ends) the previous reading holds: hysteresis, so a value dithering on
     /// one edge cannot chatter.
     pub switch_low_us: u16,
+    /// The claimant function; `None` is kill only (D-037).
+    pub claimant: Option<ClaimantConfig>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ClaimantConfig {
+    pub takeover_channel: usize,
+    pub surge_channel: usize,
+    pub yaw_channel: usize,
     /// Stick deadband, in microseconds either side of the 1500us center.
     /// Shared by the surge and yaw sticks; there is no sway stick on this
     /// vessel (D-025), so `Effort.sway_n` is always zero.
@@ -125,7 +125,7 @@ fn stick_to_effort(us: u16, deadband_us: u16, max: f64) -> f64 {
 }
 
 /// Frame-in, events-out adapter. Holds nothing but the last kill/takeover
-/// switch reading, needed to detect the edge; no I/O, no clock, no alloc.
+/// switch reading; no I/O, no clock, no alloc.
 pub struct RcAdapter {
     config: Config,
     kill_engaged: bool,
@@ -133,8 +133,9 @@ pub struct RcAdapter {
 }
 
 impl RcAdapter {
-    /// Both switches start not-engaged: the safe default before the first
-    /// frame arrives.
+    /// Both switches start not-engaged. Kill reads not-engaged until a frame
+    /// says otherwise; the supervisor's silence judgment, not this default,
+    /// covers the time before the first frame.
     pub fn new(config: Config) -> Self {
         Self {
             config,
@@ -144,38 +145,32 @@ impl RcAdapter {
     }
 
     /// Processes one parsed frame, returning the events it produced.
-    /// `LinkStatisticsFrame`s carry no channel data and produce nothing;
-    /// link-loss inference is the caller's job (module doc comment).
+    /// `LinkStatisticsFrame`s carry no channel data and produce nothing, so
+    /// they do not count as stop-source reports either.
     pub fn process(&mut self, frame: Frame) -> BoundedList<Event, MAX_EVENTS_PER_FRAME> {
         let mut events = BoundedList::new();
         let Frame::RcChannels(rc) = frame else {
             return events;
         };
 
-        let kill_us = channel_to_us(rc.channels[self.config.kill_channel]);
-        let kill_now = switch_engaged(
+        self.kill_engaged = switch_engaged(
             self.kill_engaged,
-            kill_us,
+            channel_to_us(rc.channels[self.config.kill_channel]),
             self.config.switch_low_us,
             self.config.switch_high_us,
         );
-        if kill_now != self.kill_engaged {
-            let event = if kill_now {
-                Event::KillEngaged
-            } else {
-                Event::KillReleased
-            };
-            // Capacity is MAX_EVENTS_PER_FRAME (3): at most one kill edge,
-            // one takeover edge, and one Effort per call, so this never hits
-            // CapacityError.
-            let _ = events.push(event);
-        }
-        self.kill_engaged = kill_now;
+        // Capacity is MAX_EVENTS_PER_FRAME (3): one kill level, at most one
+        // takeover edge, and at most one Effort per call, so pushes never
+        // hit CapacityError.
+        let _ = events.push(Event::Kill(self.kill_engaged));
 
-        let takeover_us = channel_to_us(rc.channels[self.config.takeover_channel]);
+        let Some(claimant) = self.config.claimant else {
+            return events;
+        };
+
         let takeover_now = switch_engaged(
             self.takeover_engaged,
-            takeover_us,
+            channel_to_us(rc.channels[claimant.takeover_channel]),
             self.config.switch_low_us,
             self.config.switch_high_us,
         );
@@ -189,25 +184,29 @@ impl RcAdapter {
         }
         self.takeover_engaged = takeover_now;
 
-        // Kill dominates: Effort is withheld while the kill switch reads
-        // engaged, regardless of takeover state, and takeover state is
-        // preserved underneath so releasing kill resumes Effort without a
-        // new TakeoverEngaged edge.
-        if self.takeover_engaged && !self.kill_engaged {
-            let surge_us = channel_to_us(rc.channels[self.config.surge_channel]);
-            let yaw_us = channel_to_us(rc.channels[self.config.yaw_channel]);
-            let demand = ForceDemand {
-                surge_n: stick_to_effort(
-                    surge_us,
-                    self.config.stick_deadband_us,
-                    self.config.max_surge_n,
-                ),
-                sway_n: 0.0,
-                yaw_nm: stick_to_effort(
-                    yaw_us,
-                    self.config.stick_deadband_us,
-                    self.config.max_yaw_nm,
-                ),
+        if self.takeover_engaged {
+            let demand = if self.kill_engaged {
+                ForceDemand {
+                    surge_n: 0.0,
+                    sway_n: 0.0,
+                    yaw_nm: 0.0,
+                }
+            } else {
+                let surge_us = channel_to_us(rc.channels[claimant.surge_channel]);
+                let yaw_us = channel_to_us(rc.channels[claimant.yaw_channel]);
+                ForceDemand {
+                    surge_n: stick_to_effort(
+                        surge_us,
+                        claimant.stick_deadband_us,
+                        claimant.max_surge_n,
+                    ),
+                    sway_n: 0.0,
+                    yaw_nm: stick_to_effort(
+                        yaw_us,
+                        claimant.stick_deadband_us,
+                        claimant.max_yaw_nm,
+                    ),
+                }
             };
             let _ = events.push(Event::Effort(demand));
         }
@@ -233,26 +232,35 @@ mod tests {
     fn config() -> Config {
         Config {
             kill_channel: 4,
-            takeover_channel: 5,
-            surge_channel: 2,
-            yaw_channel: 3,
             switch_low_us: 1300,
             switch_high_us: 1700,
-            stick_deadband_us: 12,
-            max_surge_n: 100.0,
-            max_yaw_nm: 50.0,
+            claimant: Some(ClaimantConfig {
+                takeover_channel: 5,
+                surge_channel: 2,
+                yaw_channel: 3,
+                stick_deadband_us: 12,
+                max_surge_n: 100.0,
+                max_yaw_nm: 50.0,
+            }),
         }
     }
+
+    const ZERO: ForceDemand = ForceDemand {
+        surge_n: 0.0,
+        sway_n: 0.0,
+        yaw_nm: 0.0,
+    };
 
     /// Builds an `RcChannels` frame with every channel at `RAW_CENTER`
     /// except the ones named, so a test only has to state what it cares
     /// about.
     fn frame(cfg: &Config, kill: u16, takeover: u16, surge: u16, yaw: u16) -> Frame {
         let mut channels = [RAW_CENTER; 16];
+        let c = cfg.claimant.unwrap();
         channels[cfg.kill_channel] = kill;
-        channels[cfg.takeover_channel] = takeover;
-        channels[cfg.surge_channel] = surge;
-        channels[cfg.yaw_channel] = yaw;
+        channels[c.takeover_channel] = takeover;
+        channels[c.surge_channel] = surge;
+        channels[c.yaw_channel] = yaw;
         Frame::RcChannels(RcChannelsFrame { channels })
     }
 
@@ -267,19 +275,34 @@ mod tests {
     }
 
     #[test]
-    fn kill_engages_once_then_releases() {
+    fn kill_is_reported_on_every_channel_frame() {
         let cfg = config();
         let mut adapter = RcAdapter::new(cfg);
 
         let engaged = adapter.process(frame(&cfg, RAW_HIGH, RAW_LOW, RAW_CENTER, RAW_CENTER));
-        assert_eq!(engaged.as_slice(), &[Event::KillEngaged]);
+        assert_eq!(engaged.as_slice(), &[Event::Kill(true)]);
 
-        // Identical frame again: already engaged, no new event.
+        // Identical frame again: reported again, a level, not an edge.
         let repeat = adapter.process(frame(&cfg, RAW_HIGH, RAW_LOW, RAW_CENTER, RAW_CENTER));
-        assert!(repeat.is_empty());
+        assert_eq!(repeat.as_slice(), &[Event::Kill(true)]);
 
         let released = adapter.process(frame(&cfg, RAW_LOW, RAW_LOW, RAW_CENTER, RAW_CENTER));
-        assert_eq!(released.as_slice(), &[Event::KillReleased]);
+        assert_eq!(released.as_slice(), &[Event::Kill(false)]);
+    }
+
+    #[test]
+    fn kill_only_without_a_claimant() {
+        let cfg = Config {
+            claimant: None,
+            ..config()
+        };
+        let mut adapter = RcAdapter::new(cfg);
+        // Takeover channel high and sticks deflected: no claimant, so none
+        // of it means anything.
+        let mut channels = [RAW_HIGH; 16];
+        channels[cfg.kill_channel] = RAW_LOW;
+        let events = adapter.process(Frame::RcChannels(RcChannelsFrame { channels }));
+        assert_eq!(events.as_slice(), &[Event::Kill(false)]);
     }
 
     #[test]
@@ -289,13 +312,13 @@ mod tests {
 
         // Dead zone before any engagement: previous is the false default.
         let mid = adapter.process(frame(&cfg, RAW_CENTER, RAW_LOW, RAW_CENTER, RAW_CENTER));
-        assert!(mid.is_empty());
+        assert_eq!(mid.as_slice(), &[Event::Kill(false)]);
 
         // Engage, then read the dead zone again: previous is now true.
         let engaged = adapter.process(frame(&cfg, RAW_HIGH, RAW_LOW, RAW_CENTER, RAW_CENTER));
-        assert_eq!(engaged.as_slice(), &[Event::KillEngaged]);
+        assert_eq!(engaged.as_slice(), &[Event::Kill(true)]);
         let mid_again = adapter.process(frame(&cfg, RAW_CENTER, RAW_LOW, RAW_CENTER, RAW_CENTER));
-        assert!(mid_again.is_empty());
+        assert_eq!(mid_again.as_slice(), &[Event::Kill(true)]);
     }
 
     #[test]
@@ -307,23 +330,16 @@ mod tests {
         assert_eq!(
             engaged.as_slice(),
             &[
+                Event::Kill(false),
                 Event::TakeoverEngaged,
-                Event::Effort(ForceDemand {
-                    surge_n: 0.0,
-                    sway_n: 0.0,
-                    yaw_nm: 0.0,
-                })
+                Event::Effort(ZERO)
             ]
         );
 
         let still_on = adapter.process(frame(&cfg, RAW_LOW, RAW_HIGH, RAW_CENTER, RAW_CENTER));
         assert_eq!(
             still_on.as_slice(),
-            &[Event::Effort(ForceDemand {
-                surge_n: 0.0,
-                sway_n: 0.0,
-                yaw_nm: 0.0,
-            })]
+            &[Event::Kill(false), Event::Effort(ZERO)]
         );
     }
 
@@ -336,21 +352,27 @@ mod tests {
         let high = adapter.process(frame(&cfg, RAW_LOW, RAW_HIGH, RAW_HIGH, RAW_HIGH));
         assert_eq!(
             high.as_slice(),
-            &[Event::Effort(ForceDemand {
-                surge_n: 100.0,
-                sway_n: 0.0,
-                yaw_nm: 50.0,
-            })]
+            &[
+                Event::Kill(false),
+                Event::Effort(ForceDemand {
+                    surge_n: 100.0,
+                    sway_n: 0.0,
+                    yaw_nm: 50.0,
+                })
+            ]
         );
 
         let low = adapter.process(frame(&cfg, RAW_LOW, RAW_HIGH, RAW_LOW, RAW_LOW));
         assert_eq!(
             low.as_slice(),
-            &[Event::Effort(ForceDemand {
-                surge_n: -100.0,
-                sway_n: 0.0,
-                yaw_nm: -50.0,
-            })]
+            &[
+                Event::Kill(false),
+                Event::Effort(ForceDemand {
+                    surge_n: -100.0,
+                    sway_n: 0.0,
+                    yaw_nm: -50.0,
+                })
+            ]
         );
     }
 
@@ -370,7 +392,7 @@ mod tests {
         adapter.process(frame(&cfg, RAW_LOW, RAW_HIGH, RAW_CENTER, RAW_CENTER));
 
         let mid_deflection = adapter.process(frame(&cfg, RAW_LOW, RAW_HIGH, 1200, 1200));
-        let [Event::Effort(demand)] = mid_deflection.as_slice() else {
+        let [Event::Kill(false), Event::Effort(demand)] = mid_deflection.as_slice() else {
             panic!("expected exactly one Effort event, got {mid_deflection:?}");
         };
         assert!((demand.surge_n - 23.6).abs() < 1e-9);
@@ -379,39 +401,24 @@ mod tests {
     }
 
     #[test]
-    fn kill_while_takeover_active_stops_effort_and_preserves_takeover() {
+    fn kill_while_takeover_active_zeroes_effort_and_preserves_takeover() {
         let cfg = config();
         let mut adapter = RcAdapter::new(cfg);
+        adapter.process(frame(&cfg, RAW_LOW, RAW_HIGH, RAW_CENTER, RAW_CENTER));
 
-        let engaged = adapter.process(frame(&cfg, RAW_LOW, RAW_HIGH, RAW_CENTER, RAW_CENTER));
-        assert_eq!(
-            engaged.as_slice(),
-            &[
-                Event::TakeoverEngaged,
-                Event::Effort(ForceDemand {
-                    surge_n: 0.0,
-                    sway_n: 0.0,
-                    yaw_nm: 0.0,
-                })
-            ]
-        );
+        // Kill engages mid-takeover with the stick forward: the effort
+        // stream continues, zeroed, so the claimant keeps heartbeating.
+        let killed = adapter.process(frame(&cfg, RAW_HIGH, RAW_HIGH, RAW_HIGH, RAW_CENTER));
+        assert_eq!(killed.as_slice(), &[Event::Kill(true), Event::Effort(ZERO)]);
 
-        // Kill engages mid-takeover: kill edge only, no Effort.
-        let killed = adapter.process(frame(&cfg, RAW_HIGH, RAW_HIGH, RAW_CENTER, RAW_CENTER));
-        assert_eq!(killed.as_slice(), &[Event::KillEngaged]);
-
-        // Kill still engaged, nothing changes: no events at all.
-        let still_killed = adapter.process(frame(&cfg, RAW_HIGH, RAW_HIGH, RAW_CENTER, RAW_CENTER));
-        assert!(still_killed.is_empty());
-
-        // Kill releases: Effort resumes, no new TakeoverEngaged edge.
-        let released = adapter.process(frame(&cfg, RAW_LOW, RAW_HIGH, RAW_CENTER, RAW_CENTER));
+        // Kill releases: the stick counts again, no new TakeoverEngaged edge.
+        let released = adapter.process(frame(&cfg, RAW_LOW, RAW_HIGH, RAW_HIGH, RAW_CENTER));
         assert_eq!(
             released.as_slice(),
             &[
-                Event::KillReleased,
+                Event::Kill(false),
                 Event::Effort(ForceDemand {
-                    surge_n: 0.0,
+                    surge_n: 100.0,
                     sway_n: 0.0,
                     yaw_nm: 0.0,
                 })

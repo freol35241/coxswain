@@ -135,6 +135,8 @@ Bring-up transports per D-021. Chosen for time-to-water, superseded in Phase 7.
 - [x] RC receiver driver crate: CRSF frame parser (SBUS fallback if the
       hardware dictates), strict, fuzzed like the 0183 parser (D-025).
 - [x] RC kill channel: switch position mapped to disarm at the conn node.
+      (Superseded by D-037: the kill is a stop, not the RC claimant's
+      disarm.)
       Lands before RC can hold the conn (D-025 sequencing).
 - [x] Claimant priority and preemption in the supervisor; priority declared
       per claimant in the manifest (v0.3). Direct-effort Setpoint variant in
@@ -234,6 +236,12 @@ this before freezing far-end firmware.
       calling station's claimant operations (D-035).
 - [ ] `coxswain-manifest` subcommand deriving a SIL manifest from a vessel
       manifest, if hand-kept variants turn out to drift (D-034).
+- [x] Stops as a supervisor input (D-037): the RC kill disarms whoever holds
+      the conn, `REFUSED_STOP` while engaged, declared `stop_on_silence`,
+      optional `[rc.claimant]`, schema v9.
+- [ ] Keelson `safety_state` as an external stop source once keelson #332
+      merges (D-037): adapter consumer, manifest declaration, and the
+      compiler rule counting stop-on-silence on it against `self_sufficient`.
 
 ## Phase 8: Conn node firmware (reference deployment)
 

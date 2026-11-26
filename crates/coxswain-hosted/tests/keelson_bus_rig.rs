@@ -48,7 +48,7 @@ const SEED: &[u8] = include_bytes!("../../coxswain-manifest/tests/test_key.seed"
 /// keelson bus, plus an enrichment GNSS the estimator must ignore.
 const MANIFEST: &str = r#"
 [manifest]
-schema_version = 8
+schema_version = 9
 vessel_id      = "cx-sil-rig-01"
 name           = "Keelson Bus Rig"
 revision       = 1

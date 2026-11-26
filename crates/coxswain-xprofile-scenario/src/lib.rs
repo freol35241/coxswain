@@ -176,6 +176,7 @@ fn config() -> VesselConfig {
                 ring: BoundedList::new(),
             },
             claimant_priorities: BoundedList::new(),
+            stop_sources: BoundedList::new(),
         },
         effectors: BoundedList::new(),
     }
@@ -402,6 +403,7 @@ pub fn run<F: FnMut(usize, &Record)>(mut emit: F) {
                 Some(coxswain_supervisor::FailsafeCause::PositionDegraded) => 2,
                 Some(coxswain_supervisor::FailsafeCause::GeofenceBreach) => 3,
                 Some(coxswain_supervisor::FailsafeCause::ClaimantLost) => 4,
+                Some(coxswain_supervisor::FailsafeCause::Stop) => 5,
             },
             low_voltage: directive.low_voltage,
             power_stale: directive.power_stale,

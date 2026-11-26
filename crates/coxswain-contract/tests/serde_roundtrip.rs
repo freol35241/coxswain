@@ -80,6 +80,7 @@ fn example_config() -> VesselConfig {
                 priority: 100,
             }])
             .unwrap(),
+            stop_sources: BoundedList::new(),
         },
         effectors: BoundedList::from_slice(&[
             EffectorConfig {

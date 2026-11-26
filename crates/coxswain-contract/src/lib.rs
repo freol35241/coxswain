@@ -21,8 +21,8 @@ pub use actuator::{ActuatorCommand, ActuatorFeedback, ForceDemand};
 pub use bounded::{BoundedList, CapacityError};
 pub use config::{
     ClaimantPriority, ConnGrantDefault, EstimatorConfig, Fossen3DofParams, GeofenceAction,
-    GeofenceConfig, License, ModelParams, SensorConfig, SensorId, SensorRole, SupervisorConfig,
-    VesselConfig,
+    GeofenceConfig, License, MAX_STOP_SOURCES, ModelParams, SensorConfig, SensorId, SensorRole,
+    StopSource, StopSourceConfig, SupervisorConfig, VesselConfig,
 };
 pub use conn::{AUTONOMY, ArmingState, ClaimantId, ConnState};
 pub use effector::{

@@ -1,15 +1,15 @@
-# Coxswain Vessel Manifest: Schema Draft v0.9
+# Coxswain Vessel Manifest: Schema Draft v0.10
 
 The manifest is the per-vessel statement of what exists, where it terminates, and what
 the estimator is licensed to trust. It is authored as TOML, validated and compiled
 host-side to a signed, CRC-protected binary blob (postcard), and written to an A/B flash
 region on the conn node during commissioning. The firmware treats it as pure data.
 
-Doc revision is v0.9. The wire-facing `manifest.schema_version` bumps 7 -> 8 for
-the `keelson` bus kind and the declared `[conn_node] self_sufficient` promise
-(D-034). Unlike the last few bumps the compiled blob layout changes too. A
-schema_version 7 reader rejects a schema_version 8 blob outright rather than
-mis-parsing it, same doctrine as every prior bump.
+Doc revision is v0.10. The wire-facing `manifest.schema_version` bumps 8 -> 9:
+the RC kill becomes a declared stop source with a required `stop_on_silence`,
+and the RC claimant moves to an optional `[rc.claimant]` (D-037). The compiled
+blob layout changes too. A schema_version 8 reader rejects a schema_version 9
+blob outright rather than mis-parsing it, same doctrine as every prior bump.
 
 Design rules encoded in this schema:
 
@@ -41,7 +41,7 @@ Design rules encoded in this schema:
 # ============================================================
 
 [manifest]
-schema_version = 7          # firmware refuses unknown major versions
+schema_version = 9          # firmware refuses unknown major versions
 vessel_id      = "example-vessel-01"
 name           = "Example"
 revision       = 7          # monotonically increasing per vessel
@@ -376,30 +376,40 @@ On a `cyphal_can` output bus, the `[[bus]]` entry carries the conn node's own
 `node_id`, and the power node's voltage subject rides on the role=power `[[sensor]]`
 as a `subject` field (D-029).
 
-**`[rc]` is the vessel's RC hand controller (D-025).** Optional, and at most one:
-a single table, not an array-of-tables. `bus` references a declared `crsf_uart`
-bus; `claimant` is the runtime `ClaimantId` the RC adapter registers as, authored
-directly like `[[claimant]].id` (manifest and adapter must agree on it out of
-band). The remaining fields match `coxswain-drivers::rc::Config` field for field:
-`kill_channel`/`takeover_channel`/`surge_channel`/`yaw_channel` index into the 16
-CRSF channels, `switch_low_us`/`switch_high_us` set the kill/takeover switch
-hysteresis, `stick_deadband_us` is shared by the surge and yaw sticks (there is
+**`[rc]` is the vessel's RC hand controller (D-025, D-037).** Optional, and at
+most one: a single table, not an array-of-tables. `bus` references a declared
+`crsf_uart` bus. The kill channel is a stop source: while engaged the vessel is
+disarmed whoever holds the conn and arming is refused. `stop_on_silence` is
+required and says whether the RC link going silent (no channel frame within
+`claimant_heartbeat`) stops the vessel or only raises a health warning; it
+compiles into `supervisor.stop_sources`. `switch_low_us`/`switch_high_us` set
+the kill/takeover switch hysteresis.
+
+`[rc.claimant]` is the optional claimant function: takeover and manual helm.
+Without it the RC is kill only. `id` is the runtime `ClaimantId` the RC adapter
+registers as, authored directly like `[[claimant]].id` (manifest and adapter
+must agree on it out of band). The channel fields index into the 16 CRSF
+channels, `stick_deadband_us` is shared by the surge and yaw sticks (there is
 no sway stick), and `max_surge_n`/`max_yaw_nm` are the force/moment at full
-stick deflection. Compiled into `CompiledManifest` as a typed `RcEntry`,
-hosted-profile data like `[[effector]]`'s render table rather than part of
-`VesselConfig`: the supervisor never knows RC from any other claimant (D-025).
-An absent `[rc]` compiles to `rc = None`, no hand controller declared.
+stick deflection. The fields match `coxswain-drivers::rc::Config` field for
+field. Compiled into `CompiledManifest` as a typed `RcEntry`, hosted-profile
+data like `[[effector]]`'s render table rather than part of `VesselConfig`: the
+supervisor never knows RC from any other claimant (D-025). An absent `[rc]`
+compiles to `rc = None`, no hand controller declared.
 
 ```toml
 [rc]
 bus                = "rc_link"       # references a crsf_uart bus
-claimant           = 1
 kill_channel       = 4
+switch_low_us      = 1300
+switch_high_us     = 1700
+stop_on_silence    = true            # required: RC link loss stops the vessel
+
+[rc.claimant]                        # optional: absent means kill only
+id                 = 1
 takeover_channel   = 5
 surge_channel      = 2
 yaw_channel        = 3
-switch_low_us      = 1300
-switch_high_us     = 1700
 stick_deadband_us  = 12
 max_surge_n        = 150.0
 max_yaw_nm         = 60.0
@@ -460,12 +470,13 @@ max_yaw_nm         = 60.0
 - Per serial output bus, `[[effector]]` channels are exactly `0..n`, no gaps:
   they are positional on the wire (Cyphal effectors are addressed by subject,
   not channel, so they do not participate)
-- `[rc].bus` references a declared `crsf_uart` bus; `[rc].claimant` names a
+- `[rc].bus` references a declared `crsf_uart` bus; `[rc.claimant].id` names a
   declared `[[claimant]]` id (else the RC would silently run at the default
-  priority 0, not its intended preemption priority); `kill_channel`,
-  `takeover_channel`, `surge_channel`, and `yaw_channel` are distinct and each
-  below 16 (CRSF's channel count); `switch_low_us < switch_high_us`;
-  `max_surge_n` and `max_yaw_nm` are finite and strictly positive (D-025)
+  priority 0, not its intended preemption priority); `kill_channel` and, with
+  a claimant, `takeover_channel`, `surge_channel`, and `yaw_channel` are
+  distinct and each below 16 (CRSF's channel count);
+  `switch_low_us < switch_high_us`; `max_surge_n` and `max_yaw_nm` are finite
+  and strictly positive (D-025, D-037)
 
 **Boot-time checks (firmware):**
 - Signature + CRC + schema version on the active bank, else fall back / safe mode
