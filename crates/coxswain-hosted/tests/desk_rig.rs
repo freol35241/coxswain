@@ -55,12 +55,15 @@
 //! `rudderboat_direct_effort_rig` (same as integration_zenoh.rs);
 //! `gnss_fusion_rig` needs no router at all, since it drives no claimant.
 
+mod common;
+use common::Reaped;
+
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -749,7 +752,7 @@ fn spawn_vessel(
     pubkey_hex: &str,
     endpoint: Option<&str>,
     extra: &[String],
-) -> (Child, Receiver<Status>) {
+) -> (Reaped, Receiver<Status>) {
     let mut args = vec![
         "--manifest".to_string(),
         blob_path.to_str().unwrap().to_string(),
@@ -766,6 +769,7 @@ fn spawn_vessel(
         .args(&args)
         .stdout(Stdio::piped())
         .spawn()
+        .map(Reaped)
         .expect("spawn coxswain-hosted");
     let stdout = vessel.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
@@ -1081,7 +1085,7 @@ fn gnss_fusion_rig() {
     // slave the vessel is holding open.
     let (_rc_master, rc_slave) = open_pty_pair();
 
-    let (mut vessel, status_rx) = spawn_vessel(
+    let (_vessel, status_rx) = spawn_vessel(
         &blob_path,
         &pubkey_hex,
         None,
@@ -1127,9 +1131,6 @@ fn gnss_fusion_rig() {
         max_interval <= 500.0,
         "tick interval reached {max_interval:.0} ms"
     );
-
-    let _ = vessel.kill();
-    let _ = vessel.wait();
 }
 
 /// The RC/actuator half: takeover preemption, effort driving the plant
@@ -1150,11 +1151,12 @@ fn rc_authority_rig() {
 
     let port = free_port();
     let endpoint = format!("tcp/127.0.0.1:{port}");
-    let mut zenohd = Command::new("zenohd")
+    let _zenohd = Command::new("zenohd")
         .args(["--listen", &endpoint, "--no-multicast-scouting"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .map(Reaped)
         .expect("zenohd on PATH (see .devcontainer/postCreate.sh)");
     {
         // Readiness: client-mode open fails fast while the router is still
@@ -1175,7 +1177,7 @@ fn rc_authority_rig() {
         }
     }
 
-    let (mut vessel, status_rx) = spawn_vessel(
+    let (_vessel, status_rx) = spawn_vessel(
         &blob_path,
         &pubkey_hex,
         Some(&endpoint),
@@ -1341,11 +1343,6 @@ fn rc_authority_rig() {
         !last.armed,
         "kill is a one-way latch; nothing re-armed the vessel"
     );
-
-    let _ = vessel.kill();
-    let _ = vessel.wait();
-    let _ = zenohd.kill();
-    let _ = zenohd.wait();
 }
 
 /// One control tick, matching `coxswain-hosted`'s own `TICK` constant
@@ -1396,11 +1393,12 @@ fn power_report_rig() {
 
     let port = free_port();
     let endpoint = format!("tcp/127.0.0.1:{port}");
-    let mut zenohd = Command::new("zenohd")
+    let _zenohd = Command::new("zenohd")
         .args(["--listen", &endpoint, "--no-multicast-scouting"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .map(Reaped)
         .expect("zenohd on PATH (see .devcontainer/postCreate.sh)");
     {
         let deadline = Instant::now() + BRING_UP;
@@ -1418,7 +1416,7 @@ fn power_report_rig() {
         }
     }
 
-    let (mut vessel, status_rx) = spawn_vessel(
+    let (_vessel, status_rx) = spawn_vessel(
         &blob_path,
         &pubkey_hex,
         Some(&endpoint),
@@ -1524,11 +1522,6 @@ fn power_report_rig() {
         truth_pos.lat_rad.to_degrees(),
         truth_pos.lon_rad.to_degrees(),
     );
-
-    let _ = vessel.kill();
-    let _ = vessel.wait();
-    let _ = zenohd.kill();
-    let _ = zenohd.wait();
 }
 
 // ------------------------------------------------------------ boot errors
@@ -1662,11 +1655,12 @@ fn rudderboat_direct_effort_rig() {
 
     let port = free_port();
     let endpoint = format!("tcp/127.0.0.1:{port}");
-    let mut zenohd = Command::new("zenohd")
+    let _zenohd = Command::new("zenohd")
         .args(["--listen", &endpoint, "--no-multicast-scouting"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .map(Reaped)
         .expect("zenohd on PATH (see .devcontainer/postCreate.sh)");
     {
         let deadline = Instant::now() + BRING_UP;
@@ -1684,7 +1678,7 @@ fn rudderboat_direct_effort_rig() {
         }
     }
 
-    let (mut vessel, status_rx) = spawn_vessel(
+    let (_vessel, status_rx) = spawn_vessel(
         &blob_path,
         &pubkey_hex,
         Some(&endpoint),
@@ -1756,11 +1750,6 @@ fn rudderboat_direct_effort_rig() {
         |esc, rudder| esc == PWM_US_CENTER && rudder == PWM_US_CENTER,
     );
     println!("rudderboat direct effort: zero demand centers both ({esc_us}, {rudder_us})");
-
-    let _ = vessel.kill();
-    let _ = vessel.wait();
-    let _ = zenohd.kill();
-    let _ = zenohd.wait();
 }
 
 /// Republishes `demand` as a teleop `DirectEffort` setpoint every 300 ms
