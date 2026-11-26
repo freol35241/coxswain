@@ -5,15 +5,17 @@
 //! tokens per producer and per subject (§5).
 //!
 //! RPC keys are `{base_path}/@v0/{entity_id}/@rpc/{procedure}/{responder_id}`.
-//! That predates 0.6's `@rpc/{interface}/{version}/...` shape and is kept
-//! deliberately until the D-035 command-interface split; for the same reason
-//! no RPC interface liveliness token is declared, since its key is defined by
+//! That predates 0.6's `@rpc/{interface}/{version}/...` shape and stays until
+//! Keelson standardizes a conn interface (D-035); for the same reason no RPC
+//! interface liveliness token is declared, since its key is defined by
 //! interface and version.
 
 use coxswain_contract::ClaimantId;
 
-/// Producer id for everything the vessel side publishes and serves. Fused
-/// streams use it alone; raw pass-through extends it with the sensor name.
+/// Producer id for everything the vessel side publishes and serves. Vessel-
+/// level streams (health, conn state, manifest) use it alone; per-device
+/// streams extend it ([`device_source_id`]): `coxswain/estimator`,
+/// `coxswain/guidance`, `coxswain/<sensor>`.
 pub const COXSWAIN: &str = "coxswain";
 
 /// Well-known Keelson subjects (messages/subjects.yaml) used here, plus the
@@ -166,6 +168,96 @@ mod tests {
             source_token_key("keelson", "vessel", COXSWAIN),
             "keelson/@v0/vessel/*/coxswain"
         );
+    }
+
+    /// Keelson's subject registry at the pinned release, vendored unmodified.
+    const REGISTRY: &str = include_str!("../protos/subjects.yaml");
+
+    const FLOAT: &str = "keelson.TimestampedFloat";
+
+    /// Every subject const here, with the type Coxswain puts on it: either
+    /// Keelson's registered type, or coxswain-specific (`None`). A new const
+    /// fails `every_subject_is_classified` until it is listed.
+    const CLASSIFIED: &[(&str, Option<&str>)] = &[
+        (subject::LOCATION_FIX, Some("foxglove.LocationFix")),
+        (subject::HEADING_TRUE_NORTH_DEG, Some(FLOAT)),
+        (subject::YAW_RATE_DEGPS, Some(FLOAT)),
+        (subject::HEADING_MAGNETIC_DEG, Some(FLOAT)),
+        (subject::COURSE_OVER_GROUND_DEG, Some(FLOAT)),
+        (subject::SPEED_OVER_GROUND_KNOTS, Some(FLOAT)),
+        (subject::TRUE_WIND_SPEED_MPS, Some(FLOAT)),
+        (subject::TRUE_WIND_ANGLE_DEG, Some(FLOAT)),
+        (subject::APPARENT_WIND_SPEED_MPS, Some(FLOAT)),
+        (subject::APPARENT_WIND_ANGLE_DEG, Some(FLOAT)),
+        (subject::DEPTH_BELOW_TRANSDUCER_M, Some(FLOAT)),
+        (
+            subject::LOCATION_FIX_QUALITY,
+            Some("keelson.LocationFixQuality"),
+        ),
+        (subject::HEADING_ACCURACY_DEG, Some(FLOAT)),
+        (subject::BATTERY_VOLTAGE_V, Some(FLOAT)),
+        (subject::ENTITY_HEALTH, Some("keelson.EntityHealth")),
+        (subject::YAW_RATE_ACCURACY_DEGPS, None),
+        (subject::SPEED_OVER_GROUND_ACCURACY_KNOTS, None),
+        (subject::COURSE_OVER_GROUND_ACCURACY_DEG, None),
+        (subject::RUDDER_ANGLE_DEG_SETPOINT, None),
+        (subject::THRUST_NEWTON_SETPOINT, None),
+        (subject::HEADING_TRUE_NORTH_DEG_SETPOINT, None),
+        (subject::SPEED_OVER_GROUND_KNOTS_SETPOINT, None),
+        (subject::SETPOINT, None),
+        (subject::CONN_STATE, None),
+        (subject::MANIFEST, None),
+    ];
+
+    /// `name: type` lines; comments and blank lines skipped.
+    fn registered_type(name: &str) -> Option<&'static str> {
+        REGISTRY
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.starts_with(' '))
+            .filter_map(|l| l.split_once(':'))
+            .find(|(n, _)| *n == name)
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+    }
+
+    #[test]
+    fn subjects_conform_to_the_pinned_registry() {
+        for &(name, ours) in CLASSIFIED {
+            match ours {
+                Some(ty) => assert_eq!(
+                    registered_type(name),
+                    Some(ty),
+                    "{name}: not registered with the type Coxswain puts on it"
+                ),
+                // Coxswain-specific until Keelson registers it; once the pin
+                // moves to a release that does, this fails and the subject
+                // moves to the registered list.
+                None => assert_eq!(
+                    registered_type(name),
+                    None,
+                    "{name} is registered at the pinned release: retire the coxswain-specific note"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn every_subject_is_classified() {
+        let src = include_str!("keys.rs");
+        let body = src
+            .split_once("pub mod subject {")
+            .and_then(|(_, rest)| rest.split_once("\n}"))
+            .map(|(body, _)| body)
+            .expect("subject module");
+        for line in body.lines().map(str::trim) {
+            let Some(decl) = line.strip_prefix("pub const ") else {
+                continue;
+            };
+            let value = decl.split('"').nth(1).expect("string const");
+            assert!(
+                CLASSIFIED.iter().any(|(n, _)| *n == value),
+                "subject {value} is not classified in CLASSIFIED"
+            );
+        }
     }
 
     #[test]

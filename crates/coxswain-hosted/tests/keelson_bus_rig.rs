@@ -29,7 +29,8 @@ use coxswain_contract::{
     Timestamp,
 };
 use coxswain_keelson::{
-    BusEffectorKind, BusSensorKind, ClaimantClient, ConnReplyResult, KeelsonBusPeer, StdSource,
+    BusEffectorKind, BusSensorKind, ClaimantClient, ConnReplyResult, KeelsonBusPeer, Observer,
+    StdSource,
 };
 use coxswain_manifest::CompiledManifest;
 use coxswain_model::LocalFrame;
@@ -562,7 +563,7 @@ fn external_plant_over_a_keelson_bus() {
         .position()
         .unwrap();
     let session = h.session();
-    let mut observer = ClaimantClient::new(session.clone(), BASE_PATH, VESSEL_ID, ClaimantId(99));
+    let mut observer = Observer::new(session.clone(), BASE_PATH, VESSEL_ID);
     let health = observer.subscribe_health().unwrap();
     wait_std(&health, "heading_main/heading", StdSource::Defaulted);
     wait_std(&health, "gnss_main/position", StdSource::Measured);

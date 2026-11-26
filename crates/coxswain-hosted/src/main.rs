@@ -30,7 +30,7 @@ use coxswain_drivers::gnss0183::{self, Gnss0183Driver};
 use coxswain_drivers::output::{ActuatorSink, OutputBackend, OutputFrame};
 use coxswain_drivers::rc::{self, RcAdapter};
 use coxswain_hosted::{ArmError, ClaimError, Core, TickOutput};
-use coxswain_keelson::{ConnEvent, ConnReplyResult, VesselEndpoint};
+use coxswain_keelson::{CommandServer, ConnEvent, ConnReplyResult, TelemetryPublisher};
 use coxswain_manifest::{BusKind, ChecksumMode, EffectorOutput, Nmea0183Quirks, SensorEntry};
 use coxswain_n2k::{DecodeError, FastPacketAssembler, Outcome};
 use coxswain_nmea0183::Quirks as Nmea0183ParserQuirks;
@@ -1378,8 +1378,13 @@ fn run() -> Result<(), String> {
     }
     let mut rc_kill_engaged = false;
 
-    let mut endpoint = VesselEndpoint::new(session.clone(), "keelson", manifest.vessel_id.as_str())
-        .map_err(|e| format!("keelson endpoint: {e}"))?;
+    // Two interfaces (D-035), both always opened here: telemetry carries no
+    // authority; the command server is the only path from above to
+    // actuation.
+    let telemetry = TelemetryPublisher::new(&session, "keelson", manifest.vessel_id.as_str())
+        .map_err(|e| format!("keelson telemetry: {e}"))?;
+    let mut command = CommandServer::new(&session, "keelson", manifest.vessel_id.as_str())
+        .map_err(|e| format!("keelson command interface: {e}"))?;
 
     let raw_sources = raw_source_ids(manifest.sensors.as_slice());
 
@@ -1454,7 +1459,7 @@ fn run() -> Result<(), String> {
 
         // Claimant events first, so a setpoint sent before this tick steers
         // this tick.
-        for (event, handle) in endpoint.poll() {
+        for (event, handle) in command.poll() {
             let result = match event {
                 ConnEvent::Register(id) => claim_reply(core.register(id, now)),
                 ConnEvent::RequestConn(id) => claim_reply(core.request_conn(id, now)),
@@ -1470,7 +1475,7 @@ fn run() -> Result<(), String> {
                 }
             };
             if let Some(handle) = handle {
-                endpoint.reply(handle, result);
+                command.reply(handle, result);
             }
         }
 
@@ -1483,7 +1488,7 @@ fn run() -> Result<(), String> {
             for m in sim.step(dt) {
                 ingest_measurement(&mut core, &mut ingest_error_logged, &m);
                 publish(
-                    endpoint.publish_raw(wall, &m, raw_source_id(&raw_sources, m.sensor)),
+                    telemetry.publish_raw(wall, &m, raw_source_id(&raw_sources, m.sensor)),
                     &mut publish_error_logged,
                 );
             }
@@ -1502,7 +1507,7 @@ fn run() -> Result<(), String> {
                     coxswain_keelson::BusInput::Measurement(m) => {
                         ingest_measurement(&mut core, &mut ingest_error_logged, &m);
                         publish(
-                            endpoint.publish_raw(wall, &m, raw_source_id(&raw_sources, m.sensor)),
+                            telemetry.publish_raw(wall, &m, raw_source_id(&raw_sources, m.sensor)),
                             &mut publish_error_logged,
                         );
                     }
@@ -1540,7 +1545,7 @@ fn run() -> Result<(), String> {
                         for m in batch.iter() {
                             ingest_measurement(&mut core, &mut ingest_error_logged, m);
                             publish(
-                                endpoint.publish_raw(
+                                telemetry.publish_raw(
                                     wall,
                                     m,
                                     raw_source_id(&raw_sources, m.sensor),
@@ -1678,7 +1683,7 @@ fn run() -> Result<(), String> {
                         for sensor in &link.sensors {
                             if sensor.matches(pgn, decoded.source_address) {
                                 publish(
-                                    endpoint.publish_n2k(wall, message, &sensor.source_id),
+                                    telemetry.publish_n2k(wall, message, &sensor.source_id),
                                     &mut publish_error_logged,
                                 );
                             }
@@ -1746,7 +1751,7 @@ fn run() -> Result<(), String> {
 
         if let Some(state) = &out.state {
             publish(
-                endpoint.publish_state(
+                telemetry.publish_state(
                     wall,
                     state,
                     &coxswain_keelson::keys::device_source_id("estimator"),
@@ -1755,7 +1760,7 @@ fn run() -> Result<(), String> {
             );
         }
         publish(
-            endpoint.publish_reference(wall, &out.reference),
+            telemetry.publish_reference(wall, &out.reference),
             &mut publish_error_logged,
         );
 
@@ -1774,7 +1779,7 @@ fn run() -> Result<(), String> {
                 .map(|(i, name)| (name.as_str(), actuation_diverged[*i]))
                 .collect();
             publish(
-                endpoint.publish_health(
+                telemetry.publish_health(
                     wall,
                     &out.health,
                     &out.directive.conn,
@@ -1791,11 +1796,11 @@ fn run() -> Result<(), String> {
                 &mut publish_error_logged,
             );
             publish(
-                endpoint.publish_conn_state(wall, &out.directive.conn, out.directive.arming),
+                telemetry.publish_conn_state(wall, &out.directive.conn, out.directive.arming),
                 &mut publish_error_logged,
             );
             publish(
-                endpoint.publish_manifest_info(
+                telemetry.publish_manifest_info(
                     wall,
                     hash,
                     manifest.revision,

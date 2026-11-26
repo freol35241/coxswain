@@ -785,7 +785,8 @@ Code consequence, once accepted: `VesselEndpoint` splits into a telemetry
 publisher and a command server, opened separately; an observer client stands
 beside `ClaimantClient` and cannot register or claim; the adapter gets
 conformance tests against the vendored Keelson protos. Serving a Keelson conn
-interface waits for Keelson to merge one.
+interface waits for Keelson to merge one. Hosted opens both; neither has a
+switch until a deployment needs one.
 
 ## D-036: The vessel publishes its guidance references as Keelson setpoints
 

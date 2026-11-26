@@ -189,7 +189,7 @@ this before freezing far-end firmware.
       the CyphalActuatorBackend, and the hosted integration. Schema v4->5 gave
       effectors a per-bus-kind output; hosted `can.rs` gained a write path
       (D-011's transmit exception); divergence and bus voltage reach the
-      published health, observed via `ClaimantClient::subscribe_health`;
+      published health, observed via `ClaimantClient::subscribe_health`, now `Observer`;
       vcan-tested in CI (`cyphal_can_rig.rs`). Node-local failsafe/heartbeat
       for a Cyphal effector waits for the actuator firmware, Phase 9.)
 - [x] GNSS covariance and fix status over NMEA 0183 (the vendor-neutral path):
@@ -226,9 +226,9 @@ this before freezing far-end firmware.
       the three accuracy subjects (proposed in keelson #449) and
       `rudder_angle_deg_setpoint` (asked for on keelson #328). Move the pin
       past 0.6.0-pre.19 when a release has `thrust_newton_setpoint`.
-- [ ] D-035 code split: telemetry publisher and command server from
-      `VesselEndpoint`, opened separately; an observer client beside
-      `ClaimantClient`; conformance tests against the vendored Keelson protos.
+- [x] D-035 code split: `TelemetryPublisher` and `CommandServer` from
+      `VesselEndpoint`, opened separately; `Observer` beside `ClaimantClient`;
+      conformance tests against the vendored Keelson registry and keyspace.
 - [ ] Serve Keelson's conn interface once Keelson merges one (#399), with its
       RPC keys; `vehicle_navigation/v1` and `vehicle_lifecycle/v1` as the
       calling station's claimant operations (D-035).
