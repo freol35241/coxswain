@@ -29,8 +29,13 @@ use coxswain_drivers::cyphal_actuator::{CyphalActuatorBackend, CyphalEffector, C
 use coxswain_drivers::gnss0183::{self, Gnss0183Driver};
 use coxswain_drivers::output::{ActuatorSink, OutputBackend, OutputFrame};
 use coxswain_drivers::rc::{self, RcAdapter};
-use coxswain_hosted::{ArmError, ClaimError, Core, FailsafeCause, TickOutput};
-use coxswain_keelson::{CommandServer, ConnEvent, ConnReplyResult, TelemetryPublisher};
+use coxswain_hosted::{
+    ArmError, ClaimError, ConnCause, ConnChange, ConnWatch, Core, FailsafeCause, TickOutput,
+    Trigger,
+};
+use coxswain_keelson::{
+    CommandServer, ConnEvent, ConnEventCause, ConnReplyResult, Failsafe, TelemetryPublisher,
+};
 use coxswain_manifest::{BusKind, ChecksumMode, EffectorOutput, Nmea0183Quirks, SensorEntry};
 use coxswain_n2k::{DecodeError, FastPacketAssembler, Outcome};
 use coxswain_nmea0183::Quirks as Nmea0183ParserQuirks;
@@ -204,6 +209,32 @@ fn claim_reply(result: Result<(), ClaimError>) -> ConnReplyResult {
         Err(ClaimError::Unregistered) => ConnReplyResult::Unregistered,
         Err(ClaimError::ConnHeld) => ConnReplyResult::ConnHeld,
         Err(ClaimError::NotHolder) => ConnReplyResult::NotHolder,
+        Err(ClaimError::Permanent) => ConnReplyResult::Permanent,
+    }
+}
+
+fn failsafe_wire(f: Option<FailsafeCause>) -> Failsafe {
+    match f {
+        None => Failsafe::None,
+        Some(FailsafeCause::Stop) => Failsafe::Stop,
+        Some(FailsafeCause::CriticalVoltage) => Failsafe::CriticalVoltage,
+        Some(FailsafeCause::PositionDegraded) => Failsafe::PositionDegraded,
+        Some(FailsafeCause::GeofenceBreach) => Failsafe::GeofenceBreach,
+        Some(FailsafeCause::ClaimantLost) => Failsafe::ClaimantLost,
+    }
+}
+
+fn cause_wire(c: ConnCause) -> ConnEventCause {
+    match c {
+        ConnCause::Granted => ConnEventCause::Granted,
+        ConnCause::Preempted => ConnEventCause::Preempted,
+        ConnCause::Released => ConnEventCause::Released,
+        ConnCause::Unregistered => ConnEventCause::Unregistered,
+        ConnCause::HolderLost => ConnEventCause::HolderLost,
+        ConnCause::Armed => ConnEventCause::Armed,
+        ConnCause::Disarmed => ConnEventCause::Disarmed,
+        ConnCause::Stopped => ConnEventCause::Stopped,
+        ConnCause::Failsafe => ConnEventCause::Failsafe,
     }
 }
 
@@ -788,23 +819,36 @@ fn apply_rc_events(
     rc_id: Option<ClaimantId>,
     now: Timestamp,
     events: &[rc::Event],
+    watch: &mut ConnWatch,
+    changes: &mut Vec<ConnChange>,
 ) {
     for event in events {
-        match (*event, rc_id) {
-            (rc::Event::Kill(engaged), _) => core.stop_report(StopSource::Rc, engaged, now),
+        let trigger = match (*event, rc_id) {
+            (rc::Event::Kill(engaged), _) => {
+                core.stop_report(StopSource::Rc, engaged, now);
+                Some(Trigger::Stop)
+            }
             (rc::Event::TakeoverEngaged, Some(id)) => {
                 let _ = core.request_conn(id, now);
+                Some(Trigger::Request)
             }
             (rc::Event::TakeoverReleased, Some(id)) => {
                 let _ = core.release_conn(id);
+                Some(Trigger::Release)
             }
             (rc::Event::Effort(demand), Some(id)) => {
                 core.set_setpoint(id, Setpoint::DirectEffort(demand));
                 // The Effort stream doubles as the RC claimant's heartbeat,
                 // same convention as a Keelson setpoint stream.
                 let _ = core.heartbeat(id, now);
+                None
             }
-            (_, None) => {}
+            (_, None) => None,
+        };
+        if let Some(trigger) = trigger
+            && let Some(change) = watch.after(trigger, core.conn(), core.arming())
+        {
+            changes.push(change);
         }
     }
 }
@@ -1383,13 +1427,15 @@ fn run() -> Result<(), String> {
         core.register(*rc_id, now_ts(&boot))
             .map_err(|e| format!("rc claimant {}: {e:?}", rc_id.0))?;
     }
+    let mut conn_watch = ConnWatch::new(core.conn(), core.arming());
 
     // Two interfaces (D-035), both always opened here: telemetry carries no
     // authority; the command server is the only path from above to
     // actuation.
-    let telemetry = TelemetryPublisher::new(&session, "keelson", manifest.vessel_id.as_str())
+    let base_path = manifest.keelson_base_path.as_str();
+    let telemetry = TelemetryPublisher::new(&session, base_path, manifest.vessel_id.as_str())
         .map_err(|e| format!("keelson telemetry: {e}"))?;
-    let mut command = CommandServer::new(&session, "keelson", manifest.vessel_id.as_str())
+    let mut command = CommandServer::new(&session, base_path, manifest.vessel_id.as_str())
         .map_err(|e| format!("keelson command interface: {e}"))?;
 
     let raw_sources = raw_source_ids(manifest.sensors.as_slice());
@@ -1465,21 +1511,35 @@ fn run() -> Result<(), String> {
 
         // Claimant events first, so a setpoint sent before this tick steers
         // this tick.
+        let mut conn_changes = Vec::new();
         for (event, handle) in command.poll() {
-            let result = match event {
-                ConnEvent::Register(id) => claim_reply(core.register(id, now)),
-                ConnEvent::RequestConn(id) => claim_reply(core.request_conn(id, now)),
-                ConnEvent::ReleaseConn(id) => claim_reply(core.release_conn(id)),
-                ConnEvent::Arm(id) => arm_reply(core.arm(id)),
-                ConnEvent::Disarm(id) => arm_reply(core.disarm(id)),
+            let (result, trigger) = match event {
+                ConnEvent::Register(id) => (claim_reply(core.register(id, now)), None),
+                ConnEvent::RequestConn(id) => (
+                    claim_reply(core.request_conn(id, now)),
+                    Some(Trigger::Request),
+                ),
+                ConnEvent::ReleaseConn(id) => {
+                    (claim_reply(core.release_conn(id)), Some(Trigger::Release))
+                }
+                ConnEvent::Unregister(id) => {
+                    (claim_reply(core.unregister(id)), Some(Trigger::Unregister))
+                }
+                ConnEvent::Arm(id) => (arm_reply(core.arm(id)), Some(Trigger::Arm)),
+                ConnEvent::Disarm(id) => (arm_reply(core.disarm(id)), Some(Trigger::Disarm)),
                 ConnEvent::Setpoint(id, sp) => {
                     core.set_setpoint(id, sp);
                     // The setpoint stream doubles as the claimant heartbeat;
                     // an unregistered sender's beat carries no authority.
                     let _ = core.heartbeat(id, now);
-                    ConnReplyResult::Ok
+                    (ConnReplyResult::Ok, None)
                 }
             };
+            if let Some(trigger) = trigger
+                && let Some(change) = conn_watch.after(trigger, core.conn(), core.arming())
+            {
+                conn_changes.push(change);
+            }
             if let Some(handle) = handle {
                 command.reply(handle, result);
             }
@@ -1576,7 +1636,14 @@ fn run() -> Result<(), String> {
                 match reader.push(byte) {
                     Some(Ok(ParseOutcome::Frame(frame))) => {
                         let events = adapter.process(frame);
-                        apply_rc_events(&mut core, *rc_id, now, events.as_slice());
+                        apply_rc_events(
+                            &mut core,
+                            *rc_id,
+                            now,
+                            events.as_slice(),
+                            &mut conn_watch,
+                            &mut conn_changes,
+                        );
                     }
                     Some(Err(e)) if !driver_error_logged => {
                         eprintln!("coxswain-hosted: CRSF frame rejected (continuing): {e:?}");
@@ -1695,6 +1762,22 @@ fn run() -> Result<(), String> {
         }
 
         let out = core.tick(now);
+        if let Some(change) = conn_watch.after_tick(&out.directive) {
+            conn_changes.push(change);
+        }
+        for c in &conn_changes {
+            publish(
+                telemetry.publish_conn_event(
+                    wall,
+                    &c.conn,
+                    c.arming,
+                    c.previous_holder,
+                    cause_wire(c.cause),
+                    failsafe_wire(c.failsafe),
+                ),
+                &mut publish_error_logged,
+            );
+        }
         if let Some(sim) = sim.as_mut() {
             // Effectors present -> the plant is driven by what the
             // allocator actually rendered (D-026/D-020); no effector table
@@ -1786,7 +1869,7 @@ fn run() -> Result<(), String> {
                     coxswain_keelson::SupervisorHealth {
                         low_voltage: out.directive.low_voltage,
                         power_stale: out.directive.power_stale,
-                        stopped: out.directive.failsafe == Some(FailsafeCause::Stop),
+                        failsafe: failsafe_wire(out.directive.failsafe),
                         stop_silent: out.directive.stop_silent,
                     },
                     coxswain_keelson::IoHealth {

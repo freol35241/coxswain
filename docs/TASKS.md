@@ -233,12 +233,18 @@ this before freezing far-end firmware.
       conformance tests against the vendored Keelson registry and keyspace.
 - [ ] Serve Keelson's conn interface once Keelson merges one (#399), with its
       RPC keys; `vehicle_navigation/v1` and `vehicle_lifecycle/v1` as the
-      calling station's claimant operations (D-035).
+      calling station's claimant operations (D-035). The adapter unregisters
+      a station whose liveliness token goes, else after ten
+      `claimant_heartbeat`s of silence (D-038).
 - [ ] `coxswain-manifest` subcommand deriving a SIL manifest from a vessel
       manifest, if hand-kept variants turn out to drift (D-034).
 - [x] Stops as a supervisor input (D-037): the RC kill disarms whoever holds
       the conn, `REFUSED_STOP` while engaged, declared `stop_on_silence`,
       optional `[rc.claimant]`, schema v9.
+- [x] Claimants unregister, `conn_event` with the cause of each change, the
+      failsafe cause in health, `[manifest] keelson_base_path`, schema v10
+      (D-038).
+- [ ] Turn order `TurnRateSpeed` beside `HeadingSpeed` (D-039).
 - [ ] Keelson `safety_state` as an external stop source once keelson #332
       merges (D-037): adapter consumer, manifest declaration, and the
       compiler rule counting stop-on-silence on it against `self_sufficient`.

@@ -9,7 +9,7 @@ import "google/protobuf/timestamp.proto";
 package coxswain;
 
 // Body of every conn RPC (conn_register, conn_request, conn_release,
-// vehicle_arm, vehicle_disarm). Claimant ids are u16 on the vessel side;
+// conn_unregister, vehicle_arm, vehicle_disarm). Claimant ids are u16 on the vessel side;
 // values above 65535 are rejected at the adapter.
 message ConnRequest {
   uint32 claimant_id = 1;
@@ -30,6 +30,8 @@ message ConnReply {
     REFUSED_POWER_STALE = 10;
     // A stop source is engaged (D-037).
     REFUSED_STOP = 11;
+    // The claimant is pre-registered and cannot unregister (D-038).
+    PERMANENT = 12;
   }
   Result result = 1;
 }
@@ -83,6 +85,42 @@ message ConnStateMsg {
   bool held = 1;
   uint32 holder = 2;
   bool armed = 3;
+}
+
+// The failsafe cause in force (D-008, D-037), highest priority first.
+enum Failsafe {
+  FAILSAFE_NONE = 0;
+  FAILSAFE_STOP = 1;
+  FAILSAFE_CRITICAL_VOLTAGE = 2;
+  FAILSAFE_POSITION_DEGRADED = 3;
+  FAILSAFE_GEOFENCE_BREACH = 4;
+  FAILSAFE_CLAIMANT_LOST = 5;
+}
+
+// One change of holder, arming or failsafe cause (D-038). conn_state stays
+// the periodic snapshot; this says what changed between two of them, and
+// why.
+message ConnEventMsg {
+  enum Cause {
+    GRANTED = 0;
+    PREEMPTED = 1;
+    RELEASED = 2;
+    UNREGISTERED = 3;
+    HOLDER_LOST = 4;
+    ARMED = 5;
+    DISARMED = 6;
+    STOPPED = 7;
+    // A failsafe cause appeared, changed or cleared; `failsafe` says which
+    // is now in force.
+    FAILSAFE = 8;
+  }
+  bool held = 1;
+  uint32 holder = 2;
+  bool armed = 3;
+  bool had_holder = 4;
+  uint32 previous_holder = 5;
+  Cause cause = 6;
+  Failsafe failsafe = 7;
 }
 
 // Manifest identity, published so it is in telemetry from the first

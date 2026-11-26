@@ -909,6 +909,83 @@ Code consequence:
   stop-on-silence on it against `self_sufficient`. The rule has nothing to
   check until an external stop source exists.
 
+## D-038: Claimants unregister; conn changes are events; the base path is manifest data
+
+Status: accepted. Prompted by keelson #399's decision record, coxswain items
+2, 4 and 5.
+
+**Unregister.** Registry slots are freed only by an explicit `unregister` from
+the claimant itself; there is no eviction. A claimant that holds the conn and
+unregisters releases it first, with release's semantics: an armed vessel holds
+station on its own authority (D-008). `AUTONOMY` is pre-registered and cannot
+unregister (`PERMANENT` on the wire). A full registry still refuses with
+`RegistryFull`. Eviction of silent claimants was considered and rejected: it
+frees nothing when every registered claimant is alive, and it takes a slot from
+a claimant that is quiet by design. Coxswain's conn protocol gains
+`conn_unregister`, same request and reply as the other conn calls.
+
+Keelson's conn interface has no unregister, so the adapter infers one. It
+unregisters a station when the station's Keelson liveliness token goes, if
+the interface gives stations one, and otherwise after the station has sent
+nothing (no setpoint, no call) for ten times `claimant_heartbeat`. Either
+way it only removes authority, which D-035 permits; it never grants or
+renews any. This lands with serving Keelson's conn interface; until then the
+only path is Coxswain's own `conn_unregister`.
+
+**Conn events.** `conn_state` is a 1 Hz snapshot, so a preemption or a loss
+between two samples is invisible, and the failsafe cause is not published at
+all. A coxswain-specific `conn_event` subject carries one message per change
+of holder, arming, or failsafe cause: the new state, the previous holder, and
+the cause. Causes: granted, preempted, released, unregistered, holder lost,
+armed, disarmed, stopped (D-037), and failsafe, with the failsafe cause
+attached. The supervisor is unchanged. The hosted loop compares the
+supervisor's conn, arming and failsafe before and after each claimant call
+and each tick; a change after a call takes the call's cause, a change in a
+tick takes the tick's (holder lost, a failsafe, a stop). `conn_state` stays
+the snapshot late joiners read, and health gains the failsafe cause.
+
+**Base path.** The Keelson base path is hard-coded `keelson`. It joins
+`vessel_id` in the manifest as `[manifest] keelson_base_path`, optional,
+defaulting to `keelson`. It is the other half of the vessel's key prefix,
+`vessel_id` being the entity, so it is per-vessel naming, not deployment
+plumbing. A hosted flag would not reach the H7, which has no command line,
+and a compile-time constant would mean one firmware image per fleet. It has
+no control-path effect, so signing it costs nothing. The router endpoint is
+different: it says where the vessel's network is, not what the vessel is
+called, and stays out of the manifest (`--connect` on hosted). Keelson buses
+(D-034) use the same base path: one vessel, one Keelson network. Schema 10.
+
+## D-039: A turn order beside `HeadingSpeed`
+
+Status: accepted. Prompted by keelson #399's decision record, R2 and coxswain
+item 8: Keelson's navigator streams `HeadingSpeed` and asks for a rate of
+turn beside it.
+
+`Setpoint::TurnRateSpeed { rate_radps, speed_mps }`. Guidance advances a
+heading reference at `rate_radps` and closes the heading loop it already
+has on it, with the rate as the damping term's reference:
+`kp_psi * (psi_ref - psi) - kd_psi * (r - rate)`. The reference starts from
+the heading reference in force on the previous tick if there was one, else
+from the current heading, so moving between `HeadingSpeed` and
+`TurnRateSpeed`, or changing the rate, does not step the heading. It
+advances by the state timestamps' difference, so guidance still reads no
+clock. A separate rate loop was rejected: it needs gains nothing has tuned,
+and the heading loop already tracks a moving reference. The rate is not
+capped, but the reference may lead the heading by no more than the error at
+which the yaw demand saturates, `MAX_YAW_NM / kp_psi`. Without that bound a
+rate the hull cannot follow lets the reference run away, and once it leads
+by more than half a turn the wrapped error flips sign and the vessel turns
+the wrong way. With it, an unreachable rate degrades to turning as fast as
+the yaw authority allows, and the bound needs no new knob.
+
+On the wire, Coxswain's setpoint message gains `turn_rate_speed`, in radians
+per second like the rest of that message. Keelson's unit for rate of turn
+is degrees per second; the adapter converts when Keelson's setpoint carries
+one. Telemetry follows D-036: the advancing heading reference is published
+as the heading setpoint, and the rate as `yaw_rate_degps_setpoint` under
+`coxswain/guidance`. That subject is not registered at the pinned
+0.6.0-pre.19, so it is coxswain-specific until it is.
+
 ## Open questions (not yet decided)
 
 - Fusion priority list vs explicit per-sensor noise parameters in the manifest

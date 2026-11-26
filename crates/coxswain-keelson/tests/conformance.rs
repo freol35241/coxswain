@@ -12,7 +12,9 @@ use coxswain_contract::{
     GuidanceReference, HealthLevel, Measurement, MeasurementKind, Pose, SensorId, Timestamp,
     VesselState,
 };
-use coxswain_keelson::{IoHealth, IoSource, SupervisorHealth, TelemetryPublisher};
+use coxswain_keelson::{
+    ConnEventCause, Failsafe, IoHealth, IoSource, SupervisorHealth, TelemetryPublisher,
+};
 use coxswain_n2k::{
     CogSogRapidUpdate, DirectionReference, Message, PositionRapidUpdate, RateOfTurn, VesselHeading,
     WaterDepth, WindData, WindReference,
@@ -188,7 +190,7 @@ fn publish_everything(t: &TelemetryPublisher) {
         SupervisorHealth {
             low_voltage: false,
             power_stale: false,
-            stopped: false,
+            failsafe: Failsafe::None,
             stop_silent: false,
         },
         IoHealth::default(),
@@ -196,6 +198,15 @@ fn publish_everything(t: &TelemetryPublisher) {
     .unwrap();
     t.publish_conn_state(now, &conn, ArmingState::Armed)
         .unwrap();
+    t.publish_conn_event(
+        now,
+        &conn,
+        ArmingState::Armed,
+        None,
+        ConnEventCause::Granted,
+        Failsafe::None,
+    )
+    .unwrap();
     t.publish_manifest_info(now, [0; 32], 1, true, IoSource::Buses)
         .unwrap();
 }

@@ -1,15 +1,16 @@
-# Coxswain Vessel Manifest: Schema Draft v0.10
+# Coxswain Vessel Manifest: Schema Draft v0.11
 
 The manifest is the per-vessel statement of what exists, where it terminates, and what
 the estimator is licensed to trust. It is authored as TOML, validated and compiled
 host-side to a signed, CRC-protected binary blob (postcard), and written to an A/B flash
 region on the conn node during commissioning. The firmware treats it as pure data.
 
-Doc revision is v0.10. The wire-facing `manifest.schema_version` bumps 8 -> 9:
-the RC kill becomes a declared stop source with a required `stop_on_silence`,
-and the RC claimant moves to an optional `[rc.claimant]` (D-037). The compiled
-blob layout changes too. A schema_version 8 reader rejects a schema_version 9
-blob outright rather than mis-parsing it, same doctrine as every prior bump.
+Doc revision is v0.11. The wire-facing `manifest.schema_version` bumps 9 -> 10
+for `[manifest] keelson_base_path` (D-038). Version 9 made the RC kill a
+declared stop source with a required `stop_on_silence` and moved the RC
+claimant to an optional `[rc.claimant]` (D-037). Both change the compiled blob
+layout. A reader rejects a blob of any other schema_version outright rather
+than mis-parsing it, same doctrine as every prior bump.
 
 Design rules encoded in this schema:
 
@@ -41,8 +42,10 @@ Design rules encoded in this schema:
 # ============================================================
 
 [manifest]
-schema_version = 9          # firmware refuses unknown major versions
+schema_version = 10         # firmware refuses unknown major versions
 vessel_id      = "example-vessel-01"
+# keelson_base_path = "keelson"  # optional; the vessel's Keelson key prefix
+                                 # with vessel_id as the entity (D-038)
 name           = "Example"
 revision       = 7          # monotonically increasing per vessel
 author         = "freol"

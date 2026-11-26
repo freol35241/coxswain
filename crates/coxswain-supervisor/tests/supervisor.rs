@@ -1560,3 +1560,56 @@ fn engaged_stop_holds_through_silence() {
     assert_eq!(d.failsafe, Some(FailsafeCause::Stop));
     assert_eq!(sup.arm(AUTONOMY), Err(ArmError::Stopped));
 }
+
+// -------------------------------------------------------------- unregister
+
+#[test]
+fn unregister_frees_the_slot() {
+    let mut sup = Supervisor::new(&config(ConnGrantDefault::None, GeofenceAction::Hold));
+    for i in 1..MAX_CLAIMANTS {
+        sup.register(ClaimantId(i as u16), ts(0)).unwrap();
+    }
+    let late = ClaimantId(MAX_CLAIMANTS as u16);
+    assert_eq!(sup.register(late, ts(0)), Err(ClaimError::RegistryFull));
+    sup.unregister(OTHER).unwrap();
+    sup.register(late, ts(1)).unwrap();
+    // Gone means gone: the next call from it is an unregistered one.
+    assert_eq!(
+        sup.request_conn(OTHER, ts(2)),
+        Err(ClaimError::Unregistered)
+    );
+    assert_eq!(sup.unregister(OTHER), Err(ClaimError::Unregistered));
+}
+
+#[test]
+fn autonomy_cannot_unregister() {
+    let mut sup = Supervisor::new(&config(ConnGrantDefault::Autonomy, GeofenceAction::Hold));
+    assert_eq!(sup.unregister(AUTONOMY), Err(ClaimError::Permanent));
+    assert_eq!(sup.conn(), ConnState::Held(AUTONOMY));
+}
+
+#[test]
+fn holder_unregistering_while_armed_releases_and_holds_station() {
+    let mut sup = Supervisor::new(&config(ConnGrantDefault::None, GeofenceAction::Hold));
+    sup.register(OTHER, ts(0)).unwrap();
+    sup.request_conn(OTHER, ts(0)).unwrap();
+    nominal_tick(&mut sup, ts(0));
+    sup.arm(OTHER).unwrap();
+
+    sup.unregister(OTHER).unwrap();
+    assert_eq!(sup.conn(), ConnState::Unheld);
+    let d = nominal_tick(&mut sup, ts(10));
+    assert_eq!(d.failsafe, Some(FailsafeCause::ClaimantLost));
+    assert_eq!(d.setpoint, Setpoint::StationKeep { position: inside() });
+}
+
+#[test]
+fn holder_unregistering_while_disarmed_just_releases() {
+    let mut sup = Supervisor::new(&config(ConnGrantDefault::None, GeofenceAction::Hold));
+    sup.register(OTHER, ts(0)).unwrap();
+    sup.request_conn(OTHER, ts(0)).unwrap();
+    sup.unregister(OTHER).unwrap();
+    assert_eq!(sup.conn(), ConnState::Unheld);
+    let d = nominal_tick(&mut sup, ts(10));
+    assert_eq!(d.failsafe, None);
+}

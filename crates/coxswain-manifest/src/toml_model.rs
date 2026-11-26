@@ -37,6 +37,9 @@ pub struct ManifestToml {
 pub struct MetaToml {
     pub schema_version: u16,
     pub vessel_id: String,
+    /// Keelson base path, the first chunks of every key (D-038); defaults
+    /// to `keelson`.
+    pub keelson_base_path: Option<String>,
     pub name: String,
     pub revision: u32,
     // Audit-trail fields; not compiled into the blob.

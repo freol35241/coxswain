@@ -87,6 +87,9 @@ pub mod subject {
     pub const CONN_STATE: &str = "conn_state";
     /// coxswain.ManifestInfo. Coxswain-specific.
     pub const MANIFEST: &str = "manifest";
+    /// coxswain.ConnEventMsg, one per change of holder, arming or failsafe
+    /// cause (D-038). Coxswain-specific.
+    pub const CONN_EVENT: &str = "conn_event";
 }
 
 pub fn pubsub_key(base_path: &str, entity_id: &str, subject: &str, source_id: &str) -> String {
@@ -207,6 +210,7 @@ mod tests {
         (subject::SETPOINT, None),
         (subject::CONN_STATE, None),
         (subject::MANIFEST, None),
+        (subject::CONN_EVENT, None),
     ];
 
     /// `name: type` lines; comments and blank lines skipped.

@@ -13,7 +13,8 @@ use crate::bus::StdSource;
 use crate::convert::open;
 use crate::error::Error;
 use crate::keys::{self, COXSWAIN, subject};
-use crate::proto::{foxglove, keelson};
+use crate::proto::{coxswain as pb, foxglove, keelson};
+use coxswain_contract::{ClaimantId, ConnState};
 
 /// Enough vessel state for a teleoperation display or a test assertion.
 /// Position and heading ride separate Keelson subjects, so they arrive as
@@ -48,6 +49,17 @@ pub struct HealthUpdate {
     /// Per keelson bus quantity (`<sensor>/<quantity>`), whether its last
     /// std was measured or a driver default (D-034). Empty without one.
     pub keelson_std: Vec<(String, StdSource)>,
+}
+
+/// One `conn_event` (D-038): the conn after a change, and why it changed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConnEventUpdate {
+    pub enclosed_at: SystemTime,
+    pub conn: ConnState,
+    pub armed: bool,
+    pub previous_holder: Option<ClaimantId>,
+    pub cause: pb::conn_event_msg::Cause,
+    pub failsafe: pb::Failsafe,
 }
 
 pub struct Observer {
@@ -131,6 +143,57 @@ impl Observer {
     /// Subscribe to the vessel's `entity_health` stream, distilled to arming
     /// and Cyphal actuation divergence (`HealthUpdate`). Updates arrive for as
     /// long as the client lives; malformed samples are dropped.
+    /// Subscribe to the vessel's `conn_event` stream (D-038). Ids that do
+    /// not fit a `ClaimantId` and unknown enum values drop the sample.
+    pub fn subscribe_conn_events(&mut self) -> Result<Receiver<ConnEventUpdate>, Error> {
+        let (tx, rx) = mpsc::channel();
+        let key = keys::pubsub_key(
+            &self.base_path,
+            &self.entity_id,
+            subject::CONN_EVENT,
+            COXSWAIN,
+        );
+        let sub = self
+            .session
+            .declare_subscriber(key)
+            .callback(move |sample| {
+                let Ok((enclosed_at, inner)) = open(&sample.payload().to_bytes()) else {
+                    return;
+                };
+                let Ok(msg) = pb::ConnEventMsg::decode(inner.as_slice()) else {
+                    return;
+                };
+                let id = |v: u32| u16::try_from(v).ok().map(ClaimantId);
+                let conn = match (msg.held, id(msg.holder)) {
+                    (false, _) => ConnState::Unheld,
+                    (true, Some(h)) => ConnState::Held(h),
+                    (true, None) => return,
+                };
+                let previous_holder = match (msg.had_holder, id(msg.previous_holder)) {
+                    (false, _) => None,
+                    (true, Some(h)) => Some(h),
+                    (true, None) => return,
+                };
+                let (Ok(cause), Ok(failsafe)) = (
+                    pb::conn_event_msg::Cause::try_from(msg.cause),
+                    pb::Failsafe::try_from(msg.failsafe),
+                ) else {
+                    return;
+                };
+                let _ = tx.send(ConnEventUpdate {
+                    enclosed_at,
+                    conn,
+                    armed: msg.armed,
+                    previous_holder,
+                    cause,
+                    failsafe,
+                });
+            })
+            .wait()?;
+        self.subscribers.push(sub);
+        Ok(rx)
+    }
+
     pub fn subscribe_health(&mut self) -> Result<Receiver<HealthUpdate>, Error> {
         let (tx, rx) = mpsc::channel();
         let key = keys::pubsub_key(

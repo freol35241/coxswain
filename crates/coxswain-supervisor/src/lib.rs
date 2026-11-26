@@ -25,6 +25,8 @@ pub enum ClaimError {
     Unregistered,
     ConnHeld,
     NotHolder,
+    /// `AUTONOMY` is pre-registered and cannot unregister (D-038).
+    Permanent,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -250,6 +252,27 @@ impl Supervisor {
         // the conn to Unheld.
         if self.arming == ArmingState::Armed {
             self.claimant_lost = Some(self.hold_setpoint());
+        }
+        Ok(())
+    }
+
+    /// Frees the claimant's registry slot (D-038), the only way a slot is
+    /// freed. A holder releases the conn first, with `release_conn`'s
+    /// semantics: an armed vessel holds station on its own authority.
+    pub fn unregister(&mut self, id: ClaimantId) -> Result<(), ClaimError> {
+        if id == AUTONOMY {
+            return Err(ClaimError::Permanent);
+        }
+        let Some(slot) = self
+            .claimants
+            .iter_mut()
+            .find(|s| s.is_some_and(|c| c.id == id))
+        else {
+            return Err(ClaimError::Unregistered);
+        };
+        *slot = None;
+        if self.conn == ConnState::Held(id) {
+            self.release_conn(id)?;
         }
         Ok(())
     }

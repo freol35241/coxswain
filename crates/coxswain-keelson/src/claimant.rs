@@ -80,6 +80,12 @@ impl ClaimantClient {
         self.call("conn_release")
     }
 
+    /// Frees this claimant's registry slot, releasing the conn first if it
+    /// holds it (D-038).
+    pub fn unregister(&self) -> Result<ConnReplyResult, Error> {
+        self.call("conn_unregister")
+    }
+
     pub fn arm(&self) -> Result<ConnReplyResult, Error> {
         self.call("vehicle_arm")
     }
