@@ -8,7 +8,9 @@
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
-use coxswain_contract::{GeoPoint, GnssFixMode, Measurement, MeasurementKind, SensorId, Timestamp};
+use coxswain_contract::{
+    GeoPoint, GnssFixMode, GuidanceReference, Measurement, MeasurementKind, SensorId, Timestamp,
+};
 use coxswain_keelson::VesselEndpoint;
 use coxswain_keelson::keys::{self, subject};
 use coxswain_keelson::proto::{core::Envelope, foxglove, keelson};
@@ -142,4 +144,51 @@ fn gnss_position_cov_publishes_location_fix_with_known_covariance() {
     // e-variance 0.0009 -> ee (axis swap, see cov_ne_to_enu).
     assert!((fix.position_covariance[0] - 0.0009).abs() < 1e-9);
     assert!((fix.position_covariance[4] - 0.0004).abs() < 1e-9);
+}
+
+// D-036: a reference in force goes out on its `_setpoint` subject under
+// `coxswain/guidance`; one not in force is silent.
+#[test]
+fn reference_publishes_heading_and_skips_an_absent_speed() {
+    let session = isolated_session();
+    let source = keys::device_source_id("guidance");
+    let sub_on = |subj: &str| {
+        let key = keys::pubsub_key(BASE_PATH, ENTITY, subj, &source);
+        let (tx, rx) = mpsc::channel();
+        let sub = session
+            .declare_subscriber(key)
+            .callback(move |sample| {
+                let bytes = payload_of(&sample.payload().to_bytes());
+                if let Ok(msg) = keelson::TimestampedFloat::decode(bytes.as_slice()) {
+                    let _ = tx.send(msg.value);
+                }
+            })
+            .wait()
+            .unwrap();
+        (sub, rx)
+    };
+    let (_h, heading) = sub_on(subject::HEADING_TRUE_NORTH_DEG_SETPOINT);
+    let (_s, speed) = sub_on(subject::SPEED_OVER_GROUND_KNOTS_SETPOINT);
+
+    let vessel = VesselEndpoint::new(session.clone(), BASE_PATH, ENTITY).unwrap();
+    let near_zone = GuidanceReference {
+        heading_rad: Some(-core::f64::consts::FRAC_PI_2),
+        surge_mps: None,
+    };
+    vessel
+        .publish_reference(SystemTime::now(), &near_zone)
+        .unwrap();
+    let deg = heading.recv_timeout(RECV_TIMEOUT).unwrap();
+    assert!((deg - 270.0).abs() < 1e-3, "heading {deg}");
+    assert!(speed.recv_timeout(Duration::from_millis(300)).is_err());
+
+    let transit = GuidanceReference {
+        heading_rad: Some(0.0),
+        surge_mps: Some(1852.0 / 3600.0),
+    };
+    vessel
+        .publish_reference(SystemTime::now(), &transit)
+        .unwrap();
+    let kn = speed.recv_timeout(RECV_TIMEOUT).unwrap();
+    assert!((kn - 1.0).abs() < 1e-4, "speed {kn}");
 }

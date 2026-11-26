@@ -1750,6 +1750,10 @@ fn run() -> Result<(), String> {
                 &mut publish_error_logged,
             );
         }
+        publish(
+            endpoint.publish_reference(wall, &out.reference),
+            &mut publish_error_logged,
+        );
 
         let elapsed = boot.elapsed();
         tick_max = tick_max.max(tick_start.elapsed());

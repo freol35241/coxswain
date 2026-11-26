@@ -219,6 +219,9 @@ this before freezing far-end firmware.
       schema v8, compiler check, `keelson-bus` feature, release-build
       refusal, rig test with an external plant over zenoh, SIL image and
       compose file.
+- [x] Guidance references published as Keelson setpoints (D-036):
+      `heading_true_north_deg_setpoint`, `speed_over_ground_knots_setpoint`
+      under `coxswain/guidance`, silent when none is in force.
 - [ ] Retire coxswain-specific subjects as Keelson registers them (D-034):
       the three accuracy subjects (proposed in keelson #449) and
       `rudder_angle_deg_setpoint` (asked for on keelson #328). Move the pin

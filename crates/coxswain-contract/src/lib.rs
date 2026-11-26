@@ -29,7 +29,7 @@ pub use effector::{
     ActuationCapability, ActuatorOutputs, EffectorConfig, EffectorId, EffectorKind, MAX_EFFECTORS,
 };
 pub use geo::GeoPoint;
-pub use guidance::Setpoint;
+pub use guidance::{GuidanceReference, Setpoint};
 pub use health::{EstimatorHealth, HealthLevel};
 pub use measurement::{GnssFixMode, Measurement, MeasurementKind};
 pub use power::PowerStatus;

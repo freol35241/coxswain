@@ -16,7 +16,8 @@
 use core::f64::consts::PI;
 
 use coxswain_contract::{
-    ActuationCapability, ForceDemand, GeoPoint, ModelParams, Setpoint, VesselConfig, VesselState,
+    ActuationCapability, ForceDemand, GeoPoint, GuidanceReference, ModelParams, Setpoint,
+    VesselConfig, VesselState,
 };
 use coxswain_model::LocalFrame;
 
@@ -112,6 +113,9 @@ pub struct Guidance {
     /// once inside DRIFT_RADIUS_M, false once outside REAPPROACH_RADIUS_M,
     /// unchanged between the two (hysteresis).
     drifting: bool,
+    /// What the loops closed on in the last tick (D-036). Rewritten every
+    /// tick, recorded where the heading and speed laws run.
+    reference: GuidanceReference,
 }
 
 impl Guidance {
@@ -154,7 +158,15 @@ impl Guidance {
             seg: 0,
             hold_heading: None,
             drifting: false,
+            reference: GuidanceReference::default(),
         }
+    }
+
+    /// The heading and surge references closed on in the last tick (D-036).
+    /// Says nothing about ticks guidance did not run, such as while
+    /// disarmed; the caller owns that.
+    pub fn reference(&self) -> GuidanceReference {
+        self.reference
     }
 
     /// One control tick: the effective setpoint plus the current state
@@ -166,6 +178,7 @@ impl Guidance {
             self.hold_heading = None;
             self.drifting = false;
         }
+        self.reference = GuidanceReference::default();
         let demand = match setpoint {
             Setpoint::Idle => ZERO_DEMAND,
             Setpoint::HeadingSpeed {
@@ -189,13 +202,15 @@ impl Guidance {
     }
 
     /// PD on heading error against yaw rate; gains derived in `new`.
-    fn yaw_demand(&self, psi_ref: f64, state: &VesselState) -> f64 {
+    fn yaw_demand(&mut self, psi_ref: f64, state: &VesselState) -> f64 {
+        self.reference.heading_rad = Some(wrap_pi(psi_ref));
         self.gains.kp_psi * wrap_pi(psi_ref - state.pose.heading_rad)
             - self.gains.kd_psi * state.velocity.yaw_rate_radps
     }
 
     /// P on speed error plus damping-balance feedforward (see `new`).
-    fn surge_demand(&self, u_ref: f64, u: f64) -> f64 {
+    fn surge_demand(&mut self, u_ref: f64, u: f64) -> f64 {
+        self.reference.surge_mps = Some(u_ref);
         self.gains.kp_u * (u_ref - u) + self.gains.ff_u * u_ref
     }
 
@@ -467,6 +482,85 @@ mod tests {
         // Short way from -170 to +170 deg is -20 deg, a turn to port.
         let expected = FALLBACK_KP_PSI * (-20_f64).to_radians();
         assert!((d.yaw_nm - expected).abs() < 1e-9, "yaw {}", d.yaw_nm);
+    }
+
+    // D-036: the reference is what the loops closed on this tick, and
+    // nothing where no loop holds one.
+    #[test]
+    fn reference_follows_the_mode() {
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
+        let hs = Setpoint::HeadingSpeed {
+            heading_rad: 1.0,
+            speed_mps: 2.0,
+        };
+        g.tick(&hs, &state(0.0, 0.0, 0.0));
+        assert_eq!(
+            g.reference(),
+            GuidanceReference {
+                heading_rad: Some(1.0),
+                surge_mps: Some(2.0),
+            }
+        );
+
+        // A setpoint with no loop clears the previous tick's reference.
+        g.tick(&Setpoint::Idle, &state(0.0, 0.0, 0.0));
+        assert_eq!(g.reference(), GuidanceReference::default());
+        g.tick(
+            &Setpoint::DirectEffort(ForceDemand {
+                surge_n: 10.0,
+                sway_n: 0.0,
+                yaw_nm: 0.0,
+            }),
+            &state(0.0, 0.0, 0.0),
+        );
+        assert_eq!(g.reference(), GuidanceReference::default());
+
+        // Far zone: bearing to the target (due south) and the approach speed.
+        let keep = Setpoint::StationKeep { position: origin() };
+        g.tick(&keep, &state_at_distance(50.0, 0.0, 0.0));
+        let r = g.reference();
+        assert!((r.heading_rad.unwrap().abs() - PI).abs() < 1e-6, "{r:?}");
+        assert_eq!(r.surge_mps, Some(APPROACH_MAX_MPS));
+
+        // Near zone: the hold heading, and no speed reference.
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
+        g.tick(&keep, &state(0.4, 0.0, 0.0));
+        assert_eq!(
+            g.reference(),
+            GuidanceReference {
+                heading_rad: Some(0.4),
+                surge_mps: None,
+            }
+        );
+    }
+
+    #[test]
+    fn reference_is_empty_while_drifting_and_set_on_reapproach() {
+        let mut g = Guidance::new(&config(), NO_SWAY);
+        let keep = Setpoint::StationKeep { position: origin() };
+        g.tick(&keep, &state_at_distance(1.0, 0.0, 0.0));
+        assert_eq!(g.reference(), GuidanceReference::default());
+        g.tick(&keep, &state_at_distance(50.0, 0.0, 0.0));
+        let r = g.reference();
+        assert!(r.heading_rad.is_some() && r.surge_mps.is_some(), "{r:?}");
+    }
+
+    #[test]
+    fn reference_on_a_path_is_the_los_course_and_the_path_speed() {
+        let mut g = Guidance::new(&config(), ActuationCapability::FULL);
+        let frame = LocalFrame::new(origin());
+        let mut path = BoundedList::new();
+        path.push(origin()).unwrap();
+        path.push(frame.to_geo(0.0, 200.0)).unwrap();
+        let sp = Setpoint::FollowPath {
+            path,
+            speed_mps: 1.2,
+        };
+        // On the segment start, heading east: LOS course is due east.
+        g.tick(&sp, &state(0.0, 0.0, 0.0));
+        let r = g.reference();
+        assert!((r.heading_rad.unwrap() - PI / 2.0).abs() < 1e-6, "{r:?}");
+        assert_eq!(r.surge_mps, Some(1.2));
     }
 
     #[test]

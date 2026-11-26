@@ -30,3 +30,15 @@ pub enum Setpoint {
     /// force shape the actuator command already carries.
     DirectEffort(ForceDemand),
 }
+
+/// The references guidance closed on in its last tick (D-036), for telemetry.
+/// `None` where no loop holds one: Idle, DirectEffort, the drift regime, and
+/// the station-keep near zone's speed.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GuidanceReference {
+    /// True heading the yaw loop closes on, NED, radians.
+    pub heading_rad: Option<f64>,
+    /// Body surge over ground the speed loop closes on, m/s.
+    pub surge_mps: Option<f64>,
+}

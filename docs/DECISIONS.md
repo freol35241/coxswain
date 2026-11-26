@@ -798,7 +798,7 @@ Guidance records the reference it closes on each tick and exposes it through a
 getter: an optional heading and an optional speed, in a small type in
 `coxswain-contract`, so guidance stays no_std and `tick` keeps its signature.
 `Core` carries it in `TickOutput`, empty when disarmed or without a state
-estimate. The adapter publishes it at the tick rate under source id `guidance`:
+estimate. The adapter publishes it at the tick rate under `coxswain/guidance`:
 
 - `heading_true_north_deg_setpoint`: the heading the yaw loop closes on, in
   every mode that has one. HeadingSpeed's commanded heading, the near zone's
