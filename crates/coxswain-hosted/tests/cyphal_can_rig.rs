@@ -12,10 +12,13 @@
 //! detection is the same runtime probe as `can_rig.rs` (`require_vcan`). The
 //! byte-level napkin tests below run everywhere.
 
+mod common;
+use common::Reaped;
+
 use std::ffi::CString;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -468,11 +471,12 @@ fn commands_out_and_feedback_and_power_reach_health() {
 
     let port = free_port();
     let endpoint = format!("tcp/127.0.0.1:{port}");
-    let mut zenohd = Command::new("zenohd")
+    let _zenohd = Command::new("zenohd")
         .args(["--listen", &endpoint, "--no-multicast-scouting"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .map(Reaped)
         .expect("zenohd on PATH (see .devcontainer/postCreate.sh)");
 
     let deadline = Instant::now() + BRING_UP;
@@ -490,7 +494,7 @@ fn commands_out_and_feedback_and_power_reach_health() {
     }
 
     let port_map = format!("ctrl={}", vcan.iface);
-    let mut vessel: Child = Command::new(env!("CARGO_BIN_EXE_coxswain-hosted"))
+    let mut vessel = Command::new(env!("CARGO_BIN_EXE_coxswain-hosted"))
         .args([
             "--manifest",
             blob_path.to_str().unwrap(),
@@ -503,6 +507,7 @@ fn commands_out_and_feedback_and_power_reach_health() {
         ])
         .stdout(Stdio::piped())
         .spawn()
+        .map(Reaped)
         .expect("spawn coxswain-hosted");
     wait_for_boot(vessel.stdout.take().unwrap());
 
@@ -606,9 +611,4 @@ fn commands_out_and_feedback_and_power_reach_health() {
     wait_for_health(&health_rx, "voltage recovered", |h| !h.low_voltage);
     drop(nominal_sender);
     println!("cyphal_can_rig: bus voltage reached health, low and recovered");
-
-    let _ = vessel.kill();
-    let _ = vessel.wait();
-    let _ = zenohd.kill();
-    let _ = zenohd.wait();
 }

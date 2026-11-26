@@ -19,6 +19,9 @@
 //! carries an inner_loop GNSS sensor, so self-sufficiency (D-009) demands
 //! this fail the boot rather than come up silently degraded.
 
+mod common;
+use common::Reaped;
+
 use std::io::{BufRead, BufReader};
 use std::net::UdpSocket;
 use std::path::PathBuf;
@@ -249,7 +252,7 @@ fn parse_status(line: &str) -> Option<Status> {
     })
 }
 
-fn spawn_vessel(blob_path: &std::path::Path, pubkey_hex: &str) -> (Child, Receiver<Status>) {
+fn spawn_vessel(blob_path: &std::path::Path, pubkey_hex: &str) -> (Reaped, Receiver<Status>) {
     let mut vessel = Command::new(env!("CARGO_BIN_EXE_coxswain-hosted"))
         .args([
             "--manifest",
@@ -259,6 +262,7 @@ fn spawn_vessel(blob_path: &std::path::Path, pubkey_hex: &str) -> (Child, Receiv
         ])
         .stdout(Stdio::piped())
         .spawn()
+        .map(Reaped)
         .expect("spawn coxswain-hosted");
     let stdout = vessel.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
@@ -397,7 +401,7 @@ fn source_ip_pinning_drops_the_spoofed_sender() {
         Duration::from_millis(50),
     );
 
-    let (mut vessel, status_rx) = spawn_vessel(&blob_path, &pubkey_hex);
+    let (_vessel, status_rx) = spawn_vessel(&blob_path, &pubkey_hex);
 
     let first = wait_for(&status_rx, BRING_UP, "a fused position", |s| {
         s.position().is_some()
@@ -430,9 +434,6 @@ fn source_ip_pinning_drops_the_spoofed_sender() {
         "estimate {error_spoof_m:.0} m from the spoofed fix (expected ~400 km): the spoofed \
          sender was not fully dropped"
     );
-
-    let _ = vessel.kill();
-    let _ = vessel.wait();
 }
 
 /// The bus carries an inner_loop GNSS sensor, so a bind failure must fail
@@ -459,6 +460,7 @@ fn bind_failure_on_a_pinned_inner_loop_bus_is_a_boot_error() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
+        .map(Reaped)
         .expect("spawn coxswain-hosted");
 
     let status = wait_exit(&mut vessel, Duration::from_secs(10));

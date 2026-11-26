@@ -4,6 +4,9 @@
 //! manifests.
 #![cfg(not(feature = "keelson-bus"))]
 
+mod common;
+use common::Reaped;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -88,6 +91,7 @@ fn release_build_refuses_a_manifest_that_is_not_self_sufficient() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
+        .map(Reaped)
         .expect("spawn coxswain-hosted");
 
     let deadline = Instant::now() + Duration::from_secs(10);
